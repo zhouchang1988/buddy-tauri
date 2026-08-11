@@ -1,0 +1,20 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+release/
+
+# Tauri / Rust
+src-tauri/target/
+src-tauri/gen/
+
+# Test artifacts
+test-results/
+playwright-report/
+coverage/
+
+# Misc
+.DS_Store
+*.log
+~/.tauri/

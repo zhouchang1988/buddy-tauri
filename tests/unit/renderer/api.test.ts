@@ -1,0 +1,38 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+
+describe('renderer api', () => {
+  beforeEach(() => {
+    vi.resetModules()
+    vi.stubGlobal('window', {
+      buddy: {
+        checkHealth: vi.fn().mockResolvedValue(true),
+        bootstrap: vi.fn().mockResolvedValue({ version: 'native', tasks: [] }),
+        getTasks: vi.fn().mockResolvedValue([]),
+        getTaskDetail: vi.fn(),
+        createTask: vi.fn(),
+        deleteTask: vi.fn(),
+        startTask: vi.fn(),
+        sendMessage: vi.fn(),
+        skipCountdown: vi.fn(),
+        pauseCountdown: vi.fn(),
+        interrupt: vi.fn(),
+        getEvents: vi.fn(),
+        updateGlobalSettings: vi.fn()
+      }
+    })
+  })
+
+  it('uses the preload buddy API for health checks', async () => {
+    const { api } = await import('../../../src/lib/api')
+
+    await expect(api.checkHealth()).resolves.toBe(true)
+    expect(window.buddy.checkHealth).toHaveBeenCalled()
+  })
+
+  it('uses the preload buddy API for bootstrap', async () => {
+    const { api } = await import('../../../src/lib/api')
+
+    await expect(api.bootstrap()).resolves.toEqual({ version: 'native', tasks: [] })
+    expect(window.buddy.bootstrap).toHaveBeenCalled()
+  })
+})
