@@ -51,7 +51,7 @@
       "dialog": false,
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDcxRUI4QzA4NkNDOTU0NTQKUldSVVZNbHNDSXpyY2VDRWVKTlNBaGJUYjBJcjY4eWtkZkJpOUdnK1hwWjdFUFRTRjdNeXdJdTYK",
       "endpoints": [
-        "https://github.com/davidhoo/buddy-tauri/releases/latest/download/latest.json"
+        "https://github.com/zhouchang1988/buddy-tauri/releases/latest/download/latest.json"
       ]
     }
   }

@@ -15,7 +15,7 @@
 | IPC | `buddy:xxx` channel | Tauri command `buddy_xxx`（40 个，与 bridge 逐一核对一致）；事件名不变（`buddy:event` / `menu:action` / `updater:event` / `window:fullScreenChange`） |
 | 数据目录 | `~/Library/Application Support/buddy/` | 完全兼容，JSON 逐字节一致 |
 | PTY (opencode) | node-pty | `portable-pty` |
-| 更新器 | electron-updater | tauri-plugin-updater（密钥对已生成于 `~/.tauri/buddy-tauri.key`，pubkey 已写入 tauri.conf.json；endpoint 指向 davidhoo/buddy-tauri 占位仓库，发布前需调整） |
+| 更新器 | electron-updater | tauri-plugin-updater（密钥对已生成于 `~/.tauri/buddy-tauri.key`，pubkey 已写入 tauri.conf.json；endpoint 指向 zhouchang1988/buddy-tauri） |
 
 ## 2. 当前状态：全部验证项
 

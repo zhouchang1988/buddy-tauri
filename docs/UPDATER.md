@@ -13,7 +13,7 @@ Buddy Tauri 版的自动更新基于 **tauri-plugin-updater**，替代 Electron 
     "dialog": false,
     "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDcxRUI4QzA4NkNDOTU0NTQKUldSVVZNbHNDSXpyY2VDRWVKTlNBaGJUYjBJcjY4eWtkZkJpOUdnK1hwWjdFUFRTRjdNeXdJdTYK",
     "endpoints": [
-      "https://github.com/davidhoo/buddy-tauri/releases/latest/download/latest.json"
+      "https://github.com/zhouchang1988/buddy-tauri/releases/latest/download/latest.json"
     ]
   }
 }
@@ -21,7 +21,7 @@ Buddy Tauri 版的自动更新基于 **tauri-plugin-updater**，替代 Electron 
 
 - `dialog: false` — 更新 UI 由应用内实现（与 Electron 版一致），不用插件自带对话框
 - `pubkey` — minisign 公钥，用于校验更新包签名
-- `endpoints` — 指向 GitHub Releases 的 `latest.json`。**当前是 `davidhoo/buddy-tauri` 占位，发布前需按实际仓库调整**
+- `endpoints` — 指向 GitHub Releases 的 `latest.json`，已配置为 `zhouchang1988/buddy-tauri`。注意：该仓库为 **private**，tauri-plugin-updater 默认无法匿名拉取私有仓库的 release 资产，启用自动更新前需改为 public 或自建更新服务
 
 Rust 端实现见 `src-tauri/src/updater.rs`：启动 5 秒后首次检查，之后每 30 分钟检查一次；发现更新后自动下载（对齐 electron-updater 的 `autoDownload = true`）；所有状态经 `updater:event` 推送给前端 `useUpdater` hook。前端通过 `window.api.checkForUpdates() / downloadUpdate() / installUpdate()` 触发对应 command。
 

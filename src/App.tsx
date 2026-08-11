@@ -540,11 +540,11 @@ export default function App() {
       } else if (action === 'checkForUpdates') {
         updater.checkForUpdates()
       } else if (action === 'openDocumentation') {
-        window.open('https://github.com/davidhoo/buddy#readme', '_blank')
+        window.open('https://github.com/zhouchang1988/buddy-tauri#readme', '_blank')
       } else if (action === 'openWhatsNew') {
-        window.open('https://github.com/davidhoo/buddy/releases', '_blank')
+        window.open('https://github.com/zhouchang1988/buddy-tauri/releases', '_blank')
       } else if (action === 'sendFeedback') {
-        window.open('https://github.com/davidhoo/buddy/issues/new', '_blank')
+        window.open('https://github.com/zhouchang1988/buddy-tauri/issues/new', '_blank')
       } else if (action === 'showKeyboardShortcuts') {
         setView('settings')
         setSettingsTab('keyboard')
