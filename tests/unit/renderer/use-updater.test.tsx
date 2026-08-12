@@ -18,7 +18,8 @@ describe('useUpdater', () => {
       }),
       checkForUpdates: vi.fn(),
       downloadUpdate: vi.fn(),
-      installUpdate: vi.fn()
+      installUpdate: vi.fn(),
+      dismissUpdateError: vi.fn()
     }
   })
 
@@ -143,5 +144,36 @@ describe('useUpdater', () => {
       updaterCallback?.({ type: 'error', phase: 'install', message: 'Signature failed' })
     })
     expect(ref.current.status).toBe('error')
+  })
+
+  it('dismissing an error hides it and stops backend auto-retry', async () => {
+    const { useUpdater } = await import('../../../src/hooks/useUpdater')
+    const ref = renderHook(useUpdater)
+
+    act(() => {
+      updaterCallback?.({ type: 'error', phase: 'download', message: 'Network error' })
+    })
+    expect(ref.current.status).toBe('error')
+    expect(ref.current.dismissed).toBe(false)
+
+    act(() => {
+      ref.current.dismissNotification()
+    })
+    expect(ref.current.dismissed).toBe(true)
+    expect((window as any).api.dismissUpdateError).toHaveBeenCalledTimes(1)
+  })
+
+  it('dismissing a non-error notification does not stop auto-retry', async () => {
+    const { useUpdater } = await import('../../../src/hooks/useUpdater')
+    const ref = renderHook(useUpdater)
+
+    act(() => {
+      updaterCallback?.({ type: 'downloaded', info: { version: '1.2.13' } })
+    })
+    act(() => {
+      ref.current.dismissNotification()
+    })
+    expect(ref.current.dismissed).toBe(true)
+    expect((window as any).api.dismissUpdateError).not.toHaveBeenCalled()
   })
 })

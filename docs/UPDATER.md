@@ -9,7 +9,7 @@ Buddy Tauri 版的自动更新基于 **tauri-plugin-updater**，替代 Electron 
 ```json
 "plugins": {
   "updater": {
-    "active": true,
+    "active": false,
     "dialog": false,
     "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDcxRUI4QzA4NkNDOTU0NTQKUldSVVZNbHNDSXpyY2VDRWVKTlNBaGJUYjBJcjY4eWtkZkJpOUdnK1hwWjdFUFRTRjdNeXdJdTYK",
     "endpoints": [
@@ -19,6 +19,7 @@ Buddy Tauri 版的自动更新基于 **tauri-plugin-updater**，替代 Electron 
 }
 ```
 
+- `active: false` — **当前已禁用自动更新**。原因：`zhouchang1988/buddy-tauri` 是 private 仓库，GitHub 对匿名请求一律返回 404，且仓库尚未发布任何 release（`latest.json` 不存在），每次检查都会以 'Could not fetch a valid release JSON from the remote' 失败。注意：tauri-plugin-updater 2.x 的插件 `Config` 结构并不识别 `active` 字段，该开关由 `src-tauri/src/updater.rs` 自行读取——禁用后不再启动周期检查，菜单中的「检查更新…」入口也会随之隐藏（`menu.rs`），若通过其他途径触发检查命令则返回明确的禁用提示而非网络错误。重新启用：把仓库改为 public（或自建公开更新清单托管并改 `endpoints`）、按 §三 发布首个 release，然后把 `active` 改回 `true`。
 - `dialog: false` — 更新 UI 由应用内实现（与 Electron 版一致），不用插件自带对话框
 - `pubkey` — minisign 公钥，用于校验更新包签名
 - `endpoints` — 指向 GitHub Releases 的 `latest.json`，已配置为 `zhouchang1988/buddy-tauri`。注意：该仓库为 **private**，tauri-plugin-updater 默认无法匿名拉取私有仓库的 release 资产，启用自动更新前需改为 public 或自建更新服务

@@ -116,4 +116,13 @@ describe('UpdateNotification', () => {
     )
     expect(html).toBe('')
   })
+
+  it('dismissed error notification stays closed', () => {
+    const html = renderToStaticMarkup(
+      <UpdateNotification
+        {...defaultProps({ status: 'error', errorMessage: 'Failed', dismissed: true })}
+      />
+    )
+    expect(html).toBe('')
+  })
 })

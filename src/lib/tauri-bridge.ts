@@ -140,6 +140,9 @@ const api = {
     invoke('updater_download').then(() => undefined).catch((e) => ({ error: String(e) })),
   installUpdate: (): Promise<{ error?: string } | void> =>
     invoke('updater_install').then(() => undefined).catch((e) => ({ error: String(e) })),
+  dismissUpdateError: (): void => {
+    void invoke('updater_dismiss_error')
+  },
   onUpdaterEvent: (callback: (event: unknown) => void): (() => void) => {
     const unlisten = listen<unknown>('updater:event', (event) => callback(event.payload))
     return () => { unlisten.then((fn) => fn()) }

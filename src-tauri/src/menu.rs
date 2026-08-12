@@ -257,12 +257,19 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     let sep3 = PredefinedMenuItem::separator(app)?;
     let sep4 = PredefinedMenuItem::separator(app)?;
     let sep5 = PredefinedMenuItem::separator(app)?;
-    let app_menu = SubmenuBuilder::new(app, &app_name)
+    let mut app_menu = SubmenuBuilder::new(app, &app_name)
         .item(&PredefinedMenuItem::about(app, Some(t.about), Some(AboutMetadata::default()))?)
         .item(&sep)
-        .item(&action_item(app, actions::OPEN_SETTINGS, t.preferences, Some("CmdOrCtrl+,"))?)
-        .item(&sep2)
-        .item(&action_item(app, actions::CHECK_FOR_UPDATES, t.check_for_updates, None)?)
+        .item(&action_item(app, actions::OPEN_SETTINGS, t.preferences, Some("CmdOrCtrl+,"))?);
+    if crate::updater::updater_active(app) {
+        // Updater disabled in tauri.conf.json — no update server exists yet,
+        // so a 'Check for Updates' entry would only report a guaranteed
+        // failure. Hide it until updates are re-enabled.
+        app_menu = app_menu
+            .item(&sep2)
+            .item(&action_item(app, actions::CHECK_FOR_UPDATES, t.check_for_updates, None)?);
+    }
+    let app_menu = app_menu
         .item(&sep3)
         .item(&PredefinedMenuItem::services(app, Some(t.services))?)
         .item(&sep4)

@@ -179,6 +179,7 @@ pub fn run() {
             commands::updater_check,
             commands::updater_download,
             commands::updater_install,
+            commands::updater_dismiss_error,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Buddy application");

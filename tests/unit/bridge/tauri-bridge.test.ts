@@ -96,6 +96,8 @@ describe('tauri-bridge', () => {
     expect(invokeMock).toHaveBeenCalledWith('updater_download')
     window.api.installUpdate()
     expect(invokeMock).toHaveBeenCalledWith('updater_install')
+    window.api.dismissUpdateError()
+    expect(invokeMock).toHaveBeenCalledWith('updater_dismiss_error')
   })
 
   it('subscribes to buddy:event and forwards only the payload', async () => {

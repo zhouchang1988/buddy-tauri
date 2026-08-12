@@ -516,6 +516,13 @@ pub async fn updater_install(app: AppHandle) -> CmdResult<()> {
     updater::install_update(&app).await
 }
 
+/// Dismissing the update-error notification: stop the periodic re-check
+/// loop so the failed update is not retried automatically.
+#[tauri::command]
+pub fn updater_dismiss_error(app: AppHandle) {
+    updater::stop_auto_retry(&app);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

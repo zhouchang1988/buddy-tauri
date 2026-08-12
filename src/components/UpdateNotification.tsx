@@ -26,7 +26,7 @@ export function UpdateNotification({
   const t = useT()
 
   if (status === 'idle' || status === 'checking' || status === 'available') return null
-  if (dismissed && status !== 'installing' && status !== 'error') return null
+  if (dismissed && status !== 'installing') return null
 
   return (
     <div className="fixed bottom-4 right-4 z-50 w-80 bg-bg-elevated border border-border rounded-xl shadow-lg overflow-hidden">

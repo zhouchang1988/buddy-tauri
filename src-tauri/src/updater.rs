@@ -77,6 +77,10 @@ pub struct UpdaterState {
     /// Tracks the current updater phase so failures can report which
     /// operation failed (TS module-level `currentPhase`).
     current_phase: Mutex<UpdaterPhase>,
+    /// Set to `false` when the user dismisses an update error — the periodic
+    /// re-check loop then stops so a failed update is not retried (and the
+    /// error notification does not pop up again). Manual checks still work.
+    auto_retry: AtomicBool,
 }
 
 impl UpdaterState {
@@ -87,6 +91,7 @@ impl UpdaterState {
             downloaded_info: Mutex::new(None),
             downloading: AtomicBool::new(false),
             current_phase: Mutex::new(UpdaterPhase::Check),
+            auto_retry: AtomicBool::new(true),
         }
     }
 }
@@ -139,11 +144,37 @@ fn update_info(update: &Update) -> UpdateInfo {
     }
 }
 
+/// Whether auto-update is enabled. tauri-plugin-updater 2.x ignores the
+/// `active` key in the plugin config (its `Config` struct has no such
+/// field), so we read it ourselves as our own on/off switch. Defaults to
+/// `true` when the key is absent, keeping older configs working.
+fn updater_active_from(plugin_config: Option<&serde_json::Value>) -> bool {
+    plugin_config
+        .and_then(|config| config.get("active"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true)
+}
+
+pub(crate) fn updater_active(app: &AppHandle) -> bool {
+    updater_active_from(app.config().plugins.0.get("updater"))
+}
+
 /// Run one check cycle: emits `checking`, then `available` (and kicks off the
 /// auto-download, like `autoDownload = true`) or `not-available`. Check
 /// failures emit an `error` event with phase `check` (v1.2.14: they used to
 /// be reported as `not-available`) and are returned as `Err`.
 async fn run_check(app: AppHandle) -> Result<(), String> {
+    if !updater_active(&app) {
+        // Updater disabled in tauri.conf.json (`active: false`) — no update
+        // server is configured yet, so every check would 404. Manual checks
+        // get a clear message instead of a network error.
+        let message = send_error(
+            &app,
+            UpdaterPhase::Check,
+            "Auto-update is disabled in this build (no update server configured yet).",
+        );
+        return Err(message);
+    }
     set_phase(&app, UpdaterPhase::Check);
     send_to_renderer(&app, UpdaterEvent::Checking);
     let updater = match app.updater() {
@@ -184,22 +215,42 @@ async fn run_check(app: AppHandle) -> Result<(), String> {
 }
 
 /// TS: `initUpdater` — registers state, then checks after a 5s startup delay
-/// and every 30 minutes thereafter.
+/// and every 30 minutes thereafter. When the updater is disabled in
+/// `tauri.conf.json` (`active: false`), only the state is registered (so the
+/// commands keep working) and no automatic checks are scheduled.
 pub fn init_updater(app: &AppHandle) {
     if app.try_state::<Arc<UpdaterState>>().is_some() {
         return; // initialized
     }
     app.manage(Arc::new(UpdaterState::new()));
 
+    if !updater_active(app) {
+        return; // updater disabled — no periodic checks
+    }
+
     let app_handle = app.clone();
     tauri::async_runtime::spawn(async move {
         // Delay first check to avoid impacting startup.
         tokio::time::sleep(Duration::from_secs(5)).await;
         loop {
+            if !state(&app_handle).auto_retry.load(Ordering::SeqCst) {
+                // User dismissed an update error — stop the periodic loop so
+                // the failure is not retried automatically. Checked before
+                // each check so a dismissal during the 30-minute sleep also
+                // prevents the next run.
+                break;
+            }
             let _ = run_check(app_handle.clone()).await;
             tokio::time::sleep(Duration::from_secs(30 * 60)).await;
         }
     });
+}
+
+/// TS: dismissing the update-error notification. Stops the periodic
+/// re-check loop so a failed update is not retried until the next manual
+/// check or app restart.
+pub fn stop_auto_retry(app: &AppHandle) {
+    state(app).auto_retry.store(false, Ordering::SeqCst);
 }
 
 /// TS: `checkForUpdates`. Emits `checking`/`available`/`not-available` as
@@ -415,6 +466,18 @@ mod tests {
                 "message": "network down",
             })
         );
+    }
+
+    #[test]
+    fn updater_active_defaults_true_and_reads_flag() {
+        // No updater plugin config at all -> enabled (backwards compatible).
+        assert!(updater_active_from(None));
+        // Config present but no `active` key -> enabled.
+        assert!(updater_active_from(Some(&serde_json::json!({
+            "endpoints": ["https://example.com/latest.json"]
+        }))));
+        assert!(updater_active_from(Some(&serde_json::json!({ "active": true }))));
+        assert!(!updater_active_from(Some(&serde_json::json!({ "active": false }))));
     }
 
     #[test]

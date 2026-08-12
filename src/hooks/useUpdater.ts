@@ -64,6 +64,7 @@ export function useUpdater() {
         case 'error':
           setStatus('error')
           setErrorMessage(e.message)
+          setDismissed(false)
           break
       }
     })
@@ -89,7 +90,12 @@ export function useUpdater() {
 
   const dismissNotification = useCallback(() => {
     setDismissed(true)
-  }, [])
+    // Dismissing an update error also tells the backend to stop the
+    // periodic re-check loop, so the failed update is not retried.
+    if (status === 'error') {
+      window.api?.dismissUpdateError?.()
+    }
+  }, [status])
 
   return { status, version, progress, mandatory, dismissed, errorMessage, checkForUpdates, downloadUpdate, installUpdate, retryUpdate, dismissNotification }
 }
