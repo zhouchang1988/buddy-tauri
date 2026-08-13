@@ -13,12 +13,11 @@ use serde::Serialize;
 use tauri::{AppHandle, State};
 
 use crate::buddy::commit_message::GenerateCommitMessageInput;
-use crate::buddy::git::GitCommitResult;
 use crate::buddy::service::{BuddyCoreService, EventsResponse};
 use crate::buddy::types::{
     AttachmentMeta, BootstrapResponse, CountdownInput, CreateTaskInput, CreateTaskResult,
-    GlobalSettings, GitStatusResult, InstructionQueueItem, RoundEventSummary, SendMessageInput,
-    StartTaskInput, Task, TaskDetail, TaskStats, TestLauncherResult,
+    GitCommitPushResult, GlobalSettings, GitStatusResult, InstructionQueueItem, RoundEventSummary,
+    SendMessageInput, StartTaskInput, Task, TaskDetail, TaskStats, TestLauncherResult,
 };
 use crate::{menu, updater};
 
@@ -266,9 +265,10 @@ pub async fn buddy_git_commit_and_push(
     message: String,
     remote: String,
     push: Option<bool>,
-) -> CmdResult<GitCommitResult> {
+) -> CmdResult<GitCommitPushResult> {
     service
-        .git_commit_and_push(&repo_root, &message, &remote, push.unwrap_or(false))
+        // Default matches the Electron edition's `push: boolean = true`.
+        .git_commit_and_push(&repo_root, &message, &remote, push.unwrap_or(true))
         .await
         .map_err(err)
 }

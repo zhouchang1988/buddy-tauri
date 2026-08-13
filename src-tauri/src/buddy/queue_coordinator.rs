@@ -460,6 +460,11 @@ impl QueueCoordinator {
                 task: Task {
                     task_id: task_id.to_string(),
                     workspace_key: workspace_key.to_string(),
+                    task_dir: self
+                        .store
+                        .task_directory(task_id, workspace_key)
+                        .to_string_lossy()
+                        .to_string(),
                     status: state.status.clone(),
                     updated_at: String::new(),
                     repo_root: String::new(),

@@ -21,4 +21,5 @@ pub mod service;
 pub mod session_insight;
 pub mod shell_path;
 pub mod store;
+pub mod task_id;
 pub mod types;

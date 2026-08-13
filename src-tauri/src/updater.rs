@@ -65,6 +65,14 @@ pub struct DownloadProgress {
     pub total: u64,
 }
 
+/// Who initiated the current check — controls whether the `checking` state and
+/// a check-phase failure are user-visible (port of TS `UpdateCheckOrigin`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckOrigin {
+    Background,
+    Manual,
+}
+
 /// Managed updater state (TS module-level `mainWindow`/`initialized`).
 pub struct UpdaterState {
     /// Update found by the latest check but not yet downloaded.
@@ -81,6 +89,18 @@ pub struct UpdaterState {
     /// re-check loop then stops so a failed update is not retried (and the
     /// error notification does not pop up again). Manual checks still work.
     auto_retry: AtomicBool,
+    /// Origin of the in-flight check (TS `currentCheckOrigin`). `None` means
+    /// no check is in flight; a background check is silent about the
+    /// `checking` state and check-phase errors unless promoted to manual.
+    current_check_origin: Mutex<Option<CheckOrigin>>,
+    /// Single-flight guard so overlapping checks don't stack
+    /// (TS `checkInProgress`).
+    check_in_progress: AtomicBool,
+    /// Suppresses duplicate error dispatch for one failure (same phase +
+    /// redacted message within a single operation). Reset at the start of
+    /// every check/download so a repeated identical failure across separate
+    /// operations is still surfaced (TS `lastDispatchedError`).
+    last_dispatched_error: Mutex<Option<(UpdaterPhase, String)>>,
 }
 
 impl UpdaterState {
@@ -92,7 +112,51 @@ impl UpdaterState {
             downloading: AtomicBool::new(false),
             current_phase: Mutex::new(UpdaterPhase::Check),
             auto_retry: AtomicBool::new(true),
+            current_check_origin: Mutex::new(None),
+            check_in_progress: AtomicBool::new(false),
+            last_dispatched_error: Mutex::new(None),
         }
+    }
+
+    /// Single-flight entry point. Returns `true` when this call owns the
+    /// check; `false` when one is already in flight — a manual request then
+    /// promotes an in-flight background check so its failure becomes visible.
+    fn begin_check(&self, origin: CheckOrigin) -> bool {
+        if self.check_in_progress.swap(true, Ordering::SeqCst) {
+            if origin == CheckOrigin::Manual {
+                let mut current = self.current_check_origin.lock();
+                if *current == Some(CheckOrigin::Background) {
+                    *current = Some(CheckOrigin::Manual);
+                }
+            }
+            return false;
+        }
+        *self.current_check_origin.lock() = Some(origin);
+        true
+    }
+
+    fn end_check(&self) {
+        *self.current_check_origin.lock() = None;
+        self.check_in_progress.store(false, Ordering::SeqCst);
+    }
+
+    fn check_origin(&self) -> Option<CheckOrigin> {
+        *self.current_check_origin.lock()
+    }
+
+    /// Records (phase, message); returns `false` when it exactly repeats the
+    /// previous dispatch within this operation (drop the duplicate).
+    fn should_dispatch_error(&self, phase: UpdaterPhase, message: &str) -> bool {
+        let mut last = self.last_dispatched_error.lock();
+        if last.as_ref() == Some(&(phase, message.to_string())) {
+            return false;
+        }
+        *last = Some((phase, message.to_string()));
+        true
+    }
+
+    fn reset_error_dedup(&self) {
+        *self.last_dispatched_error.lock() = None;
     }
 }
 
@@ -105,7 +169,8 @@ fn set_phase(app: &AppHandle, phase: UpdaterPhase) {
 }
 
 /// TS `sendError`: redact secrets from the raw message before it reaches the
-/// renderer, with a fallback for empty messages.
+/// renderer, with a fallback for empty messages. Dedups an exact repeat
+/// (same phase + redacted message) within one operation.
 fn send_error(app: &AppHandle, phase: UpdaterPhase, error: &str) -> String {
     let redacted = redact_sensitive_text(error);
     let message = if redacted.is_empty() {
@@ -113,6 +178,9 @@ fn send_error(app: &AppHandle, phase: UpdaterPhase, error: &str) -> String {
     } else {
         redacted
     };
+    if !state(app).should_dispatch_error(phase, &message) {
+        return message;
+    }
     send_to_renderer(app, UpdaterEvent::Error {
         phase,
         message: message.clone(),
@@ -159,35 +227,61 @@ pub(crate) fn updater_active(app: &AppHandle) -> bool {
     updater_active_from(app.config().plugins.0.get("updater"))
 }
 
-/// Run one check cycle: emits `checking`, then `available` (and kicks off the
-/// auto-download, like `autoDownload = true`) or `not-available`. Check
-/// failures emit an `error` event with phase `check` (v1.2.14: they used to
-/// be reported as `not-available`) and are returned as `Err`.
-async fn run_check(app: AppHandle) -> Result<(), String> {
-    if !updater_active(&app) {
+/// TS `runCheck`: single-flight check runner with origin promotion.
+/// - background checks that overlap an in-flight check are skipped;
+/// - manual checks that overlap a background check promote it to manual, so a
+///   failure becomes user-visible.
+async fn run_check(app: AppHandle, origin: CheckOrigin) -> Result<(), String> {
+    let st = state(&app);
+    if !st.begin_check(origin) {
+        return Ok(());
+    }
+    st.reset_error_dedup();
+    drop(st);
+    let result = run_check_inner(&app).await;
+    state(&app).end_check();
+    result
+}
+
+/// Run one check cycle: emits `checking` (manual checks only), then
+/// `available` (and kicks off the auto-download, like `autoDownload = true`)
+/// or `not-available`. Check failures emit an `error` event with phase
+/// `check` only for manual checks (background checks stay silent) and are
+/// returned as `Err` either way.
+async fn run_check_inner(app: &AppHandle) -> Result<(), String> {
+    let is_manual = state(app).check_origin() == Some(CheckOrigin::Manual);
+    if !updater_active(app) {
         // Updater disabled in tauri.conf.json (`active: false`) — no update
         // server is configured yet, so every check would 404. Manual checks
         // get a clear message instead of a network error.
-        let message = send_error(
-            &app,
-            UpdaterPhase::Check,
-            "Auto-update is disabled in this build (no update server configured yet).",
-        );
+        let message = "Auto-update is disabled in this build (no update server configured yet).";
+        let message = if is_manual {
+            send_error(app, UpdaterPhase::Check, message)
+        } else {
+            message.to_string()
+        };
         return Err(message);
     }
-    set_phase(&app, UpdaterPhase::Check);
-    send_to_renderer(&app, UpdaterEvent::Checking);
+    set_phase(app, UpdaterPhase::Check);
+    if is_manual {
+        send_to_renderer(app, UpdaterEvent::Checking);
+    }
     let updater = match app.updater() {
         Ok(updater) => updater,
         Err(error) => {
-            let message = send_error(&app, UpdaterPhase::Check, &error.to_string());
+            let message = error.to_string();
+            let message = if is_manual {
+                send_error(app, UpdaterPhase::Check, &message)
+            } else {
+                redact_sensitive_text(&message)
+            };
             return Err(message);
         }
     };
     match updater.check().await {
         Ok(Some(update)) => {
             let info = update_info(&update);
-            let st = state(&app);
+            let st = state(app);
             {
                 let mut downloaded = st.downloaded.lock();
                 *downloaded = None;
@@ -196,19 +290,24 @@ async fn run_check(app: AppHandle) -> Result<(), String> {
             *st.latest.lock() = Some(update);
             drop(st);
             // autoDownload=true: the download starts immediately.
-            set_phase(&app, UpdaterPhase::Download);
-            send_to_renderer(&app, UpdaterEvent::Available { info });
+            set_phase(app, UpdaterPhase::Download);
+            send_to_renderer(app, UpdaterEvent::Available { info });
             // autoDownload parity: start downloading right away. A failure
             // emits its own `error` event inside `download_update`.
-            let _ = download_update(&app).await;
+            let _ = download_update(app).await;
             Ok(())
         }
         Ok(None) => {
-            send_to_renderer(&app, UpdaterEvent::NotAvailable);
+            send_to_renderer(app, UpdaterEvent::NotAvailable);
             Ok(())
         }
         Err(error) => {
-            let message = send_error(&app, UpdaterPhase::Check, &error.to_string());
+            let message = error.to_string();
+            let message = if is_manual {
+                send_error(app, UpdaterPhase::Check, &message)
+            } else {
+                redact_sensitive_text(&message)
+            };
             Err(message)
         }
     }
@@ -240,7 +339,7 @@ pub fn init_updater(app: &AppHandle) {
                 // prevents the next run.
                 break;
             }
-            let _ = run_check(app_handle.clone()).await;
+            let _ = run_check(app_handle.clone(), CheckOrigin::Background).await;
             tokio::time::sleep(Duration::from_secs(30 * 60)).await;
         }
     });
@@ -253,11 +352,12 @@ pub fn stop_auto_retry(app: &AppHandle) {
     state(app).auto_retry.store(false, Ordering::SeqCst);
 }
 
-/// TS: `checkForUpdates`. Emits `checking`/`available`/`not-available` as
-/// before; on failure emits `error` with phase `check` and returns the
-/// (redacted) message so the command can reject.
+/// TS: `checkForUpdates` — a manual check. Emits `checking`/
+/// `available`/`not-available` as before; on failure emits `error` with phase
+/// `check` and returns the (redacted) message so the command can reject.
+/// Overlapping an in-flight background check promotes it instead of stacking.
 pub async fn check_for_updates(app: &AppHandle) -> Result<(), String> {
-    run_check(app.clone()).await
+    run_check(app.clone(), CheckOrigin::Manual).await
 }
 
 /// TS: `downloadUpdate`. With auto-download already running this is usually
@@ -266,6 +366,9 @@ pub async fn check_for_updates(app: &AppHandle) -> Result<(), String> {
 /// phase `download` and returns the (redacted) message.
 pub async fn download_update(app: &AppHandle) -> Result<(), String> {
     set_phase(app, UpdaterPhase::Download);
+    // Reset per-operation dedup so a repeated identical download error across
+    // separate downloads is still surfaced.
+    state(app).reset_error_dedup();
     let st = state(app);
     if st.downloaded.lock().is_some() {
         // Already downloaded — re-announce so late listeners catch up.
@@ -504,5 +607,43 @@ mod tests {
                 serde_json::to_value(phase).unwrap()
             );
         }
+    }
+
+    // -------------------------------------------------------------------
+    // v1.2.15: manual/background origin, single-flight, per-operation dedup
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn begin_check_is_single_flight_and_manual_promotes_background() {
+        let st = UpdaterState::new();
+        assert!(st.begin_check(CheckOrigin::Background));
+        assert_eq!(st.check_origin(), Some(CheckOrigin::Background));
+        // Overlapping background check is skipped.
+        assert!(!st.begin_check(CheckOrigin::Background));
+        assert_eq!(st.check_origin(), Some(CheckOrigin::Background));
+        // A manual check overlapping a background check promotes the origin.
+        assert!(!st.begin_check(CheckOrigin::Manual));
+        assert_eq!(st.check_origin(), Some(CheckOrigin::Manual));
+        st.end_check();
+        assert_eq!(st.check_origin(), None);
+        // The next check can start fresh.
+        assert!(st.begin_check(CheckOrigin::Manual));
+        assert_eq!(st.check_origin(), Some(CheckOrigin::Manual));
+        st.end_check();
+    }
+
+    #[test]
+    fn error_dedup_suppresses_exact_repeat_within_one_operation() {
+        let st = UpdaterState::new();
+        assert!(st.should_dispatch_error(UpdaterPhase::Check, "network down"));
+        // Same phase + message → duplicate, dropped.
+        assert!(!st.should_dispatch_error(UpdaterPhase::Check, "network down"));
+        // Different phase or message still dispatches.
+        assert!(st.should_dispatch_error(UpdaterPhase::Download, "network down"));
+        assert!(st.should_dispatch_error(UpdaterPhase::Download, "other failure"));
+        // Dedup is per-operation: after a reset the identical error surfaces
+        // again (e.g. retry after a network failure).
+        st.reset_error_dedup();
+        assert!(st.should_dispatch_error(UpdaterPhase::Download, "other failure"));
     }
 }

@@ -24,7 +24,7 @@ pnpm dist:intel             # x86_64 (Intel) DMG
 pnpm dist:universal         # Universal DMG (both arches; needs rustup targets aarch64/x86_64-apple-darwin)
 ```
 
-Both test suites must stay green: `cargo test` (266 tests) **and** `pnpm test` (96 tests).
+Both test suites must stay green: `cargo test` (327 tests) **and** `pnpm test` (200 tests).
 
 ## Architecture
 
@@ -55,6 +55,7 @@ When adding a command: implement `#[tauri::command]` in `src-tauri/src/commands.
 | `defaults.rs` | Default settings/values |
 | `paths.rs` | Data root / workspace / task path resolution (workspace key = slug + sha256(path)[:12]) |
 | `locks.rs` | File-based write/run locks |
+| `task_id.rs` | `validate_task_id` — shared task-ID policy (mirrors `src/shared/task-id.ts`) |
 | `schemas.rs` | Read-time validation with default filling (Zod-on-read equivalent) |
 | `store.rs` | `BuddyStore`: atomic writes, `events.jsonl`/`transcript.jsonl`, instruction queue, `get_round_events`, `get_task_stats` |
 | `events.rs` | `BuddyEventBus` (tokio broadcast) |

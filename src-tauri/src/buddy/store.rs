@@ -19,6 +19,7 @@ use crate::buddy::redact::redact_json_value;
 use crate::buddy::schemas::{
     parse_event_line, parse_global_settings, parse_task_settings, parse_task_state, SchemaError,
 };
+use crate::buddy::task_id::validate_task_id;
 use crate::buddy::types::{
     AttachmentMeta, CreateTaskInput, CreateTaskResult, Event, ExecutionMode, GlobalSettings,
     InstructionQueueItem, Launcher, RoundEventEntry, RoundEventSummary, Task, TaskActorStats,
@@ -111,6 +112,10 @@ impl BuddyStore {
                 // detail load (same as the Electron edition).
                 if let Ok(state) = self.read_task_state(&task_id, &workspace_key).await {
                     tasks.push(Task {
+                        task_dir: self
+                            .task_directory(&task_id, &workspace_key)
+                            .to_string_lossy()
+                            .to_string(),
                         task_id,
                         workspace_key: workspace_key.clone(),
                         status: state.status.clone(),
@@ -169,14 +174,19 @@ impl BuddyStore {
     }
 
     pub async fn create_task(&self, input: CreateTaskInput) -> Result<CreateTaskResult, StoreError> {
+        let validation = validate_task_id(&input.task_id);
+        if let Some(reason) = validation.reason {
+            return Err(StoreError::Invalid(format!("Invalid task ID: {reason}")));
+        }
+        let requested_task_id = validation.value;
         let repo_root = canonical_repo_root(input.repo_root.as_deref().unwrap_or(""));
         let repo_root = repo_root.to_string_lossy().to_string();
         let workspace_key = workspace_key_for_repo(if repo_root.is_empty() {
-            &input.task_id
+            &requested_task_id
         } else {
             &repo_root
         });
-        let task_id = self.deduplicate_task_id(&input.task_id, &workspace_key).await?;
+        let task_id = self.deduplicate_task_id(&requested_task_id, &workspace_key).await?;
         let dir = self.task_directory(&task_id, &workspace_key);
         let now = utc_now();
         let task_text = task_markdown_content(input.task_text.as_deref().unwrap_or(""));
@@ -828,10 +838,19 @@ impl BuddyStore {
 
             if event_type == Some("result") {
                 if let Some(usage) = event.get("usage").and_then(Value::as_object) {
-                    input_tokens = json_u64(usage.get("input_tokens")).unwrap_or(input_tokens);
-                    output_tokens = json_u64(usage.get("output_tokens")).unwrap_or(output_tokens);
-                    cache_read_tokens =
-                        json_u64(usage.get("cache_read_input_tokens")).unwrap_or(cache_read_tokens);
+                    // Claude uses snake_case while Cursor uses camelCase in its
+                    // final result event. Keep the cache column aligned with
+                    // the existing cache-read-only semantics used for Claude,
+                    // OpenCode, and Kimi.
+                    input_tokens = json_u64(usage.get("input_tokens"))
+                        .or_else(|| json_u64(usage.get("inputTokens")))
+                        .unwrap_or(input_tokens);
+                    output_tokens = json_u64(usage.get("output_tokens"))
+                        .or_else(|| json_u64(usage.get("outputTokens")))
+                        .unwrap_or(output_tokens);
+                    cache_read_tokens = json_u64(usage.get("cache_read_input_tokens"))
+                        .or_else(|| json_u64(usage.get("cacheReadTokens")))
+                        .unwrap_or(cache_read_tokens);
                 }
                 if let Some(value) = event.get("duration_ms").filter(|v| !v.is_null()) {
                     duration_ms = value.as_f64().or(duration_ms);
@@ -2353,6 +2372,7 @@ mod tests {
         assert_eq!(task.workspace_key, "abc123def456");
         assert_eq!(task.status, TaskStatus::Ready);
         assert_eq!(task.repo_root, "/tmp/repo");
+        assert_eq!(task.task_dir, task_dir.to_string_lossy().to_string());
 
         let detail = store.get_task_detail("demo", "abc123def456").await.unwrap();
         assert_eq!(detail.task_id, "demo");
@@ -3064,5 +3084,249 @@ mod tests {
 
         assert_eq!(stats.actors[0].input_tokens, 0);
         assert_eq!(stats.actors[0].output_tokens, 0);
+    }
+
+    // --- buddy-store-write.test.ts (v1.2.15): task ID validation -------------
+
+    #[tokio::test]
+    async fn accepts_broad_unicode_punctuation_task_id_literally() {
+        let root = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        let store = store(&root);
+
+        let requested = "feat: \u{201C}任务名称\u{201D} (v2) [macOS + Linux] #42";
+        let result = store
+            .create_task(CreateTaskInput {
+                task_id: requested.to_string(),
+                repo_root: Some(repo.path().to_string_lossy().to_string()),
+                task_text: None,
+                context_text: None,
+                settings: None,
+                execution_mode: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.task, requested);
+        // The exact requested ID — punctuation and spaces intact — is the
+        // directory name.
+        let task_dir = root
+            .path()
+            .join("workspaces")
+            .join(&result.workspace_key)
+            .join("tasks")
+            .join(requested);
+        assert_eq!(result.path, task_dir.to_string_lossy().to_string());
+        assert!(task_dir.join("settings.json").exists());
+        assert!(task_dir.join("state.json").exists());
+    }
+
+    #[tokio::test]
+    async fn rejects_unsafe_task_ids_before_creating_any_files() {
+        for unsafe_id in ["..", "a/b", "a\nb", "a\0b", "   "] {
+            let root = TempDir::new().unwrap();
+            let repo = TempDir::new().unwrap();
+            let store = store(&root);
+
+            let err = store
+                .create_task(CreateTaskInput {
+                    task_id: unsafe_id.to_string(),
+                    repo_root: Some(repo.path().to_string_lossy().to_string()),
+                    task_text: None,
+                    context_text: None,
+                    settings: None,
+                    execution_mode: None,
+                })
+                .await
+                .expect_err("unsafe task ID must be rejected");
+            assert!(
+                err.to_string().contains("Invalid task ID: "),
+                "{err} for {unsafe_id:?}"
+            );
+
+            // No task directory was created — no workspace may contain tasks.
+            let workspaces = root.path().join("workspaces");
+            if let Ok(mut entries) = fs::read_dir(&workspaces).await {
+                while let Some(ws) = entries.next_entry().await.unwrap() {
+                    let tasks_dir = ws.path().join("tasks");
+                    if let Ok(mut tasks) = fs::read_dir(&tasks_dir).await {
+                        assert!(
+                            tasks.next_entry().await.unwrap().is_none(),
+                            "tasks dir must be empty for {unsafe_id:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn trims_task_id_before_validating_and_creating() {
+        let root = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        let store = store(&root);
+
+        let result = store
+            .create_task(CreateTaskInput {
+                task_id: "  hello  ".to_string(),
+                repo_root: Some(repo.path().to_string_lossy().to_string()),
+                task_text: None,
+                context_text: None,
+                settings: None,
+                execution_mode: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.task, "hello");
+        assert!(Path::new(&result.path).ends_with("hello"));
+    }
+
+    // --- buddy-store-cursor-usage.test.ts (v1.2.16): camelCase usage ---------
+
+    const CURSOR_WORKSPACE_KEY: &str = "cursor-usage-workspace";
+
+    async fn cursor_task_dir(root: &TempDir) -> PathBuf {
+        let dir = root
+            .path()
+            .join("workspaces")
+            .join(CURSOR_WORKSPACE_KEY)
+            .join("tasks")
+            .join("demo");
+        fs::create_dir_all(dir.join("artifacts")).await.unwrap();
+        dir
+    }
+
+    async fn write_cursor_run(
+        task_dir: &Path,
+        run_id: &str,
+        usage: serde_json::Value,
+        duration_ms: u64,
+    ) {
+        write_file(
+            &task_dir
+                .join("artifacts")
+                .join(format!("{run_id}-events.jsonl")),
+            &[
+                json!({
+                    "type": "system",
+                    "subtype": "init",
+                    "session_id": "cursor-session",
+                    "model": "Auto"
+                })
+                .to_string(),
+                json!({
+                    "type": "result",
+                    "subtype": "success",
+                    "session_id": "cursor-session",
+                    "duration_ms": duration_ms,
+                    "usage": usage
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn parses_camel_case_token_usage_from_cursor_result_event() {
+        let root = TempDir::new().unwrap();
+        let task_dir = cursor_task_dir(&root).await;
+        write_cursor_run(
+            &task_dir,
+            "run_cursor_1",
+            json!({
+                "inputTokens": 25_035,
+                "outputTokens": 2_556,
+                "cacheReadTokens": 79_104,
+                "cacheWriteTokens": 999
+            }),
+            31_498,
+        )
+        .await;
+
+        let store = store(&root);
+        let summary = store
+            .get_round_events("demo", "run_cursor_1", CURSOR_WORKSPACE_KEY, Some("cursor"), None)
+            .await
+            .expect("round summary");
+
+        assert_eq!(summary.input_tokens, 25_035);
+        assert_eq!(summary.output_tokens, 2_556);
+        assert_eq!(summary.cache_read_tokens, 79_104);
+        assert_eq!(summary.duration_ms, Some(31_498));
+        assert_eq!(summary.model.as_deref(), Some("Auto"));
+    }
+
+    #[tokio::test]
+    async fn aggregates_cursor_usage_across_task_rounds() {
+        let root = TempDir::new().unwrap();
+        let task_dir = cursor_task_dir(&root).await;
+        write_cursor_run(
+            &task_dir,
+            "run_cursor_1",
+            json!({
+                "inputTokens": 100,
+                "outputTokens": 10,
+                "cacheReadTokens": 1_000,
+                "cacheWriteTokens": 0
+            }),
+            1_500,
+        )
+        .await;
+        write_cursor_run(
+            &task_dir,
+            "run_cursor_2",
+            json!({
+                "inputTokens": 200,
+                "outputTokens": 20,
+                "cacheReadTokens": 2_000,
+                "cacheWriteTokens": 0
+            }),
+            2_500,
+        )
+        .await;
+        write_file(
+            &task_dir.join("transcript.jsonl"),
+            &[
+                json!({
+                    "role": "cursor",
+                    "content": "round one",
+                    "ts": "2026-08-11T10:00:00.000Z",
+                    "meta": { "run_id": "run_cursor_1", "elapsed_ms": 2_000, "round": 1 }
+                })
+                .to_string(),
+                json!({
+                    "role": "cursor",
+                    "content": "round two",
+                    "ts": "2026-08-11T10:01:00.000Z",
+                    "meta": { "run_id": "run_cursor_2", "elapsed_ms": 3_000, "round": 2 }
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .await;
+
+        let store = store(&root);
+        let stats = store
+            .get_task_stats("demo", CURSOR_WORKSPACE_KEY)
+            .await
+            .expect("task stats");
+
+        assert_eq!(stats.actors.len(), 1);
+        let cursor = &stats.actors[0];
+        assert_eq!(cursor.actor, "cursor");
+        assert_eq!(cursor.model.as_deref(), Some("Auto"));
+        assert_eq!(cursor.input_tokens, 300);
+        assert_eq!(cursor.output_tokens, 30);
+        assert_eq!(cursor.cache_read_tokens, 3_000);
+        assert_eq!(cursor.duration_ms, 4_000);
+        assert_eq!(cursor.rounds, 2);
+        assert_eq!(stats.total_input_tokens, 300);
+        assert_eq!(stats.total_output_tokens, 30);
+        assert_eq!(stats.total_cache_read_tokens, 3_000);
+        assert_eq!(stats.total_duration_ms, 4_000);
+        assert_eq!(stats.total_rounds, 2);
     }
 }

@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.2.19-tauri] - 2026-08-13
+
+### Added
+- 同步上游 Electron 版 v1.2.15–v1.2.19 的功能与修复（`davidhoo/buddy`），版本号对齐上游 v1.2.19
+- Git 状态新增当前分支 upstream 信息（`GitStatusResult.upstream`）：提交弹窗远端下拉标注默认跟踪的 `remote/branch`；支持无 upstream 的首次推送（`push --set-upstream`），远端发现改用 `git remote get-url --push`；`buddy_git_commit_and_push` 返回 `GitCommitPushResult`（commitHash/pushStatus/remote/upstreamCreated/pushError），推送失败不再吞掉本地提交
+- 侧栏右键/「...」上下文菜单（新组件 `SidebarActionMenu`）：项目菜单（重命名、复制路径、Finder 显示、移除）与任务菜单；任务数据目录可直接打开
+- 新建任务：任务 ID 前后端统一校验（新模块 `task_id.rs` + `src/shared/task-id.ts`，仅拒绝空、>64 码点、`/`、`.`/`..`、控制字符），先校验再建目录；执行方式开关移至弹窗底部（新共享组件 `Switch`）
+- Cursor 模型检测（`~/.cursor/cli-config.json`，`selectedModel` 优先，Auto 显示 `displayModelId`）与 camelCase usage 统计兼容（`inputTokens`/`outputTokens`/`cacheReadTokens`）
+- `Task` 新增 `task_dir` 字段（列表时动态计算，不落盘）
+
+### Changed
+- 自动更新区分后台/手动检查：后台检查的进行中状态与失败对用户静默，手动检查可提升进行中的后台检查；single-flight 守卫与按操作错误去重；通知与侧栏按 check/download/install 阶段展示差异化标题
+- 移除任务运行中禁用提交入口的限制；提交弹窗远端标签与下拉框同行布局
+- `buddy_git_commit_and_push` 的 `push` 缺省值对齐上游默认 `true`
+- 测试：Rust 298 → 327，前端 146 → 200（新增 create-task-modal、message-bubble-task-stats、sidebar-action-menu、switch 等测试）
+
+### Not ported（上游该区间未同步的内容）
+- 发布流程远程验证门（`scripts/publish-release.sh` 等 8 个提交）：Electron 发布基建，Tauri 版有自己的签名/发布方案，见 `docs/LOCAL_SIGNING.md`、`docs/UPDATER.md`
+- `shell:openInFinder` 失败显式抛错：Tauri 版经 plugin-opener 的 `revealItemInDir`，失败天然 reject，无需移植
+
 ## [1.2.14-tauri] - 2026-08-11
 
 ### Added

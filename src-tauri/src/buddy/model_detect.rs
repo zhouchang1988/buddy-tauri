@@ -29,7 +29,7 @@ use crate::buddy::launchers::{
 
 /// Detect the configured model for an actor.
 ///
-/// @param actor  Actor name (codex, opencode, kimi, claude)
+/// @param actor  Actor name (codex, cursor, opencode, kimi, claude)
 /// @param command  Optional launcher command string. Used both to extract an
 ///                 explicit `-m`/`--model` override and to determine the CLI
 ///                 kind (e.g. distinguishing `wecode codex` from plain `codex`,
@@ -87,6 +87,9 @@ async fn detect_model_from_config_in(
             } else {
                 read_claude_model(&home.join(".claude").join("settings.json")).await
             }
+        }
+        LauncherCommandKind::NativeCursor => {
+            read_cursor_model(&home.join(".cursor").join("cli-config.json")).await
         }
         // contract: model is not knowable before a run.
         _ => None,
@@ -193,6 +196,45 @@ async fn read_json_model(file_path: &Path, field: &str) -> Option<String> {
     } else {
         Some(value.to_string())
     }
+}
+
+fn text_field<'a>(obj: Option<&'a serde_json::Map<String, Value>>, key: &str) -> Option<&'a str> {
+    obj.and_then(|o| o.get(key))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+}
+
+/// Read the selected Cursor CLI model from ~/.cursor/cli-config.json.
+///
+/// Recent Cursor CLIs persist the effective selection in `selectedModel`.
+/// Older versions only expose the display-oriented `model` object. When the
+/// selection is Auto, Cursor stores `modelId: "default"`, so prefer its
+/// user-facing `displayModelId` (normally "auto") instead of showing the
+/// internal sentinel value.
+async fn read_cursor_model(file_path: &Path) -> Option<String> {
+    let raw = tokio::fs::read_to_string(file_path).await.ok()?;
+    let config = serde_json::from_str::<Value>(&raw).ok()?;
+    let selected = config.get("selectedModel").and_then(Value::as_object);
+    let configured = config.get("model").and_then(Value::as_object);
+
+    let selected_model_id = text_field(selected, "modelId");
+    if let Some(id) = selected_model_id {
+        if id != "default" {
+            return Some(id.to_string());
+        }
+    }
+    let configured_model_id = text_field(configured, "modelId");
+    if let Some(id) = configured_model_id {
+        if id != "default" {
+            return Some(id.to_string());
+        }
+    }
+
+    text_field(configured, "displayModelId")
+        .or_else(|| text_field(configured, "displayNameShort"))
+        .or(selected_model_id)
+        .or(configured_model_id)
+        .map(str::to_string)
 }
 
 /// Extract a top-level string field from a TOML config file.
@@ -462,6 +504,101 @@ mod tests {
                 .as_deref(),
             Some("gpt-5.6-luna")
         );
+    }
+
+    #[tokio::test]
+    async fn reads_the_selected_cursor_model_from_cli_config() {
+        let temp = tempfile::tempdir().unwrap();
+        write(
+            temp.path(),
+            ".cursor/cli-config.json",
+            &serde_json::to_string(&json!({
+                "model": {
+                    "modelId": "composer-2.5",
+                    "displayModelId": "composer-2.5"
+                },
+                "selectedModel": {
+                    "modelId": "gpt-5.3-codex-high",
+                    "parameters": [{ "id": "fast", "value": "false" }]
+                }
+            }))
+            .unwrap(),
+        );
+
+        let model = detect_model_from_config_in(temp.path(), "cursor", Some("cursor-agent")).await;
+        assert_eq!(model.as_deref(), Some("gpt-5.3-codex-high"));
+    }
+
+    #[tokio::test]
+    async fn reports_cursor_auto_by_its_display_model_id() {
+        let temp = tempfile::tempdir().unwrap();
+        write(
+            temp.path(),
+            ".cursor/cli-config.json",
+            &serde_json::to_string(&json!({
+                "model": {
+                    "modelId": "default",
+                    "displayModelId": "auto",
+                    "displayName": "Auto"
+                },
+                "selectedModel": { "modelId": "default" }
+            }))
+            .unwrap(),
+        );
+
+        let model = detect_model_from_config_in(temp.path(), "cursor", Some("agent")).await;
+        assert_eq!(model.as_deref(), Some("auto"));
+    }
+
+    #[tokio::test]
+    async fn prefers_an_explicit_cursor_model_launcher_override() {
+        let temp = tempfile::tempdir().unwrap();
+        write(
+            temp.path(),
+            ".cursor/cli-config.json",
+            &serde_json::to_string(&json!({
+                "selectedModel": { "modelId": "composer-2.5" }
+            }))
+            .unwrap(),
+        );
+
+        let model = detect_model_from_config_in(
+            temp.path(),
+            "cursor",
+            Some("cursor-agent --model gpt-5.3-codex-high"),
+        )
+        .await;
+        assert_eq!(model.as_deref(), Some("gpt-5.3-codex-high"));
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_legacy_cursor_model_object_and_display_fields() {
+        let temp = tempfile::tempdir().unwrap();
+        // Legacy config without selectedModel: model.modelId wins.
+        write(
+            temp.path(),
+            ".cursor/cli-config.json",
+            &serde_json::to_string(&json!({ "model": { "modelId": "composer-2.5" } })).unwrap(),
+        );
+        let model = detect_model_from_config_in(temp.path(), "cursor", Some("cursor-agent")).await;
+        assert_eq!(model.as_deref(), Some("composer-2.5"));
+
+        // modelId "default" sentinel: fall back to displayNameShort.
+        write(
+            temp.path(),
+            ".cursor/cli-config.json",
+            &serde_json::to_string(&json!({
+                "model": { "modelId": "default", "displayNameShort": "Auto" }
+            }))
+            .unwrap(),
+        );
+        let model = detect_model_from_config_in(temp.path(), "cursor", Some("cursor-agent")).await;
+        assert_eq!(model.as_deref(), Some("Auto"));
+
+        // No config at all → None.
+        let empty = tempfile::tempdir().unwrap();
+        let model = detect_model_from_config_in(empty.path(), "cursor", Some("cursor-agent")).await;
+        assert_eq!(model, None);
     }
 
     #[tokio::test]

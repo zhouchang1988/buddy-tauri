@@ -19,6 +19,7 @@ import type {
   CreateTaskInput,
   CreateTaskResult,
   Event,
+  GitCommitPushResult,
   GlobalSettings,
   InstructionQueueItem,
   RoundEventSummary,
@@ -77,8 +78,8 @@ const buddy = {
     invoke<void>('buddy_git_stage_all', { repoRoot }),
   gitStageFiles: (repoRoot: string, paths: string[]): Promise<void> =>
     invoke<void>('buddy_git_stage_files', { repoRoot, paths }),
-  gitCommitAndPush: (repoRoot: string, message: string, remote: string, push?: boolean): Promise<unknown> =>
-    invoke<unknown>('buddy_git_commit_and_push', { repoRoot, message, remote, push }),
+  gitCommitAndPush: (repoRoot: string, message: string, remote: string, push?: boolean): Promise<GitCommitPushResult> =>
+    invoke<GitCommitPushResult>('buddy_git_commit_and_push', { repoRoot, message, remote, push }),
   gitDiffForCommitMessage: (repoRoot: string, paths?: string[]): Promise<string> =>
     invoke<string>('buddy_git_diff_for_commit_message', { repoRoot, paths }),
   gitFileDiff: (repoRoot: string, filePath: string): Promise<string> =>

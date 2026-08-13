@@ -31,6 +31,7 @@ describe('Sidebar', () => {
     return {
       task_id: taskId,
       workspace_key: `${taskId}-workspace`,
+      task_dir: `/tmp/buddy/workspaces/${taskId}-workspace/tasks/${taskId}`,
       status: 'READY',
       updated_at: '2026-05-26T10:00:00.000Z',
       repo_root: repoRoot,
@@ -62,10 +63,12 @@ describe('Sidebar', () => {
       onRenameProject: vi.fn(),
       onRenameTask: vi.fn(),
       onOpenInFinder: vi.fn(),
+      onCopyText: vi.fn(),
       onRemoveProject: vi.fn(),
       projectNames: {},
       updateStatus: 'idle' as const,
       updateVersion: '',
+      updateErrorPhase: null as any,
       onUpdateClick: vi.fn(),
       taskNames: {},
       ...overrides
@@ -79,6 +82,7 @@ describe('Sidebar', () => {
     const tasks: Task[] = [{
       task_id: 'demo',
       workspace_key: 'abc123def456',
+      task_dir: '/tmp/buddy/workspaces/abc123def456/tasks/demo',
       status: 'READY',
       updated_at: '',
       repo_root: '/tmp/repo',
@@ -109,11 +113,13 @@ describe('Sidebar', () => {
         onRenameProject={() => {}}
         onRenameTask={() => {}}
         onOpenInFinder={() => {}}
+        onCopyText={() => {}}
         onRemoveProject={() => {}}
         projectNames={{}}
         taskNames={{}}
         updateStatus="idle"
         updateVersion=""
+        updateErrorPhase={null}
         onUpdateClick={() => {}}
       />
     )
@@ -130,6 +136,7 @@ describe('Sidebar', () => {
     const tasks: Task[] = [{
       task_id: 'running demo',
       workspace_key: 'abc123def456',
+      task_dir: '/tmp/buddy/workspaces/abc123def456/tasks/running demo',
       status: 'RUNNING_CLAUDE',
       updated_at: '2026-05-26T08:00:14.000Z',
       repo_root: '/tmp/repo',
@@ -163,11 +170,13 @@ describe('Sidebar', () => {
         onRenameProject={() => {}}
         onRenameTask={() => {}}
         onOpenInFinder={() => {}}
+        onCopyText={() => {}}
         onRemoveProject={() => {}}
         projectNames={{}}
         taskNames={{}}
         updateStatus="idle"
         updateVersion=""
+        updateErrorPhase={null}
         onUpdateClick={() => {}}
       />
     )
@@ -211,7 +220,7 @@ describe('Sidebar', () => {
     fireEvent.click(projectRow)
     expect(projectRow).toHaveAttribute('aria-expanded', 'false')
 
-    fireEvent.click(screen.getByTitle('More actions'))
+    fireEvent.click(screen.getAllByTitle('More actions')[0])
     expect(projectRow).toHaveAttribute('aria-expanded', 'false')
     expect(screen.queryByText('first')).toBeNull()
 
@@ -219,6 +228,88 @@ describe('Sidebar', () => {
     expect(props.onCreateTask).toHaveBeenCalledWith('/tmp/repo')
     expect(projectRow).toHaveAttribute('aria-expanded', 'false')
     expect(screen.queryByText('second')).toBeNull()
+  })
+
+  it('renders only one shared menu at a time across project and task actions', () => {
+    renderSidebar([task('first'), task('second')])
+
+    // The project "..." button is the first "More actions"; the rest belong to (hidden) task rows.
+    const moreButtons = screen.getAllByTitle('More actions')
+    const projectMoreButton = moreButtons[0]
+    const taskMoreButton = moreButtons.find((btn) => {
+      let node: HTMLElement | null = btn as HTMLElement
+      while (node) {
+        if (node.classList.contains('group/task')) return true
+        node = node.parentElement
+      }
+      return false
+    })!
+
+    fireEvent.click(projectMoreButton)
+    expect(screen.getAllByRole('menu')).toHaveLength(1)
+    expect(screen.getByText('Rename project')).toBeTruthy()
+
+    fireEvent.click(taskMoreButton)
+    expect(screen.getAllByRole('menu')).toHaveLength(1)
+    expect(screen.queryByText('Rename project')).toBeNull()
+    expect(screen.getByText('Delete')).toBeTruthy()
+
+    fireEvent.mouseDown(document.body)
+    expect(screen.queryByRole('menu')).toBeNull()
+  })
+
+  it('closes the shared menu on Escape', () => {
+    renderSidebar([task('first')])
+
+    fireEvent.click(screen.getAllByTitle('More actions')[0])
+    expect(screen.getByRole('menu')).toBeTruthy()
+
+    fireEvent.keyDown(document, { key: 'Escape' })
+    expect(screen.queryByRole('menu')).toBeNull()
+  })
+
+  it('opens the project menu from a right-click without collapsing the project', () => {
+    const onCopyText = vi.fn()
+    const onCreateTask = vi.fn()
+    const props = renderSidebar([task('first')], { onCopyText, onCreateTask })
+    const projectRow = screen.getByRole('button', { name: /repo/ })
+
+    fireEvent.contextMenu(projectRow, { clientX: 120, clientY: 80 })
+
+    expect(projectRow).toHaveAttribute('aria-expanded', 'true')
+    expect(onCreateTask).not.toHaveBeenCalled()
+    expect(screen.getByText('Copy Project Path')).toBeVisible()
+
+    fireEvent.click(screen.getByText('Copy Project Path'))
+    expect(onCopyText).toHaveBeenCalledWith('/tmp/repo')
+    expect(props.onOpenInFinder).not.toHaveBeenCalled()
+  })
+
+  it('exposes the same project menu actions from the "..." button as from right-click', () => {
+    renderSidebar([task('first')])
+
+    fireEvent.click(screen.getAllByTitle('More actions')[0])
+
+    const menu = screen.getByRole('menu')
+    expect(menu).toHaveTextContent('Rename project')
+    expect(menu).toHaveTextContent('Copy Project Path')
+    expect(menu).toHaveTextContent('Show in Finder')
+    expect(menu).toHaveTextContent('Remove')
+  })
+
+  it('keeps a collapsed project collapsed when right-clicking it', () => {
+    renderSidebar([task('first'), task('second')])
+    const projectRow = screen.getByRole('button', { name: /repo/ })
+
+    fireEvent.click(projectRow)
+    expect(projectRow).toHaveAttribute('aria-expanded', 'false')
+
+    fireEvent.contextMenu(projectRow, { clientX: 10, clientY: 10 })
+    expect(projectRow).toHaveAttribute('aria-expanded', 'false')
+    expect(screen.getByText('Copy Project Path')).toBeVisible()
+
+    fireEvent.keyDown(document, { key: 'Escape' })
+    expect(projectRow).toHaveAttribute('aria-expanded', 'false')
   })
 
   it('allows the selected task project to stay collapsed when the project was persisted collapsed', () => {
@@ -261,6 +352,105 @@ describe('Sidebar', () => {
       expect(content).toHaveClass('items-center')
     }
   })
+
+  it('opens the task menu from a right-click without selecting the task', () => {
+    const onSelectTask = vi.fn()
+    const onCopyText = vi.fn()
+    const onOpenInFinder = vi.fn()
+    const onDeleteTask = vi.fn()
+    const onRenameTask = vi.fn()
+
+    renderSidebar([task('original-name')], {
+      onSelectTask,
+      onCopyText,
+      onOpenInFinder,
+      onDeleteTask,
+      onRenameTask,
+      taskNames: { 'original-name': '显示名称' }
+    })
+
+    const taskRow = screen.getByText('显示名称').closest('[title]')!
+    fireEvent.contextMenu(taskRow, { clientX: 90, clientY: 110 })
+
+    expect(onSelectTask).not.toHaveBeenCalled()
+    expect(screen.getByText('Copy Task Name')).toBeVisible()
+
+    fireEvent.click(screen.getByText('Copy Task Name'))
+    expect(onCopyText).toHaveBeenCalledWith('显示名称')
+    expect(onDeleteTask).not.toHaveBeenCalled()
+    expect(onRenameTask).not.toHaveBeenCalled()
+  })
+
+  it('opens the task data directory in Finder from the right-click menu', () => {
+    const onOpenInFinder = vi.fn()
+
+    renderSidebar([task('original-name')], { onOpenInFinder })
+
+    const taskRow = screen.getByText('original-name').closest('[title]')!
+    fireEvent.contextMenu(taskRow, { clientX: 90, clientY: 110 })
+
+    fireEvent.click(screen.getByText('Show in Finder'))
+    expect(onOpenInFinder).toHaveBeenCalledWith(
+      '/tmp/buddy/workspaces/original-name-workspace/tasks/original-name'
+    )
+  })
+
+  it('copies the task_id when the task has no custom display name', () => {
+    const onCopyText = vi.fn()
+
+    renderSidebar([task('plain')], { onCopyText })
+
+    const taskRow = screen.getByText('plain').closest('[title]')!
+    fireEvent.contextMenu(taskRow, { clientX: 30, clientY: 30 })
+
+    fireEvent.click(screen.getByText('Copy Task Name'))
+    expect(onCopyText).toHaveBeenCalledWith('plain')
+  })
+
+  it('reuses the same task menu for pinned tasks and shows Unpin', () => {
+    window.localStorage.setItem('buddy.pinnedTaskIds', JSON.stringify(['pinned']))
+    const onCopyText = vi.fn()
+    const onOpenInFinder = vi.fn()
+
+    renderSidebar([task('pinned')], { onCopyText, onOpenInFinder })
+
+    const taskRow = screen.getByText('pinned').closest('[title]')!
+    fireEvent.contextMenu(taskRow, { clientX: 50, clientY: 50 })
+
+    expect(screen.getAllByRole('menu')).toHaveLength(1)
+    expect(screen.getByText('Copy Task Name')).toBeVisible()
+    expect(screen.getByText('Show in Finder')).toBeVisible()
+    expect(screen.getByText('Unpin')).toBeVisible()
+
+    // Right-clicking alone must not toggle pin state — the pin list is unchanged
+    // until the user explicitly clicks Unpin.
+    expect(JSON.parse(window.localStorage.getItem('buddy.pinnedTaskIds') || '[]')).toEqual(['pinned'])
+
+    fireEvent.click(screen.getByText('Copy Task Name'))
+    expect(onCopyText).toHaveBeenCalledWith('pinned')
+
+    // Reopen and verify Finder uses the pinned task's data directory too.
+    fireEvent.contextMenu(taskRow, { clientX: 50, clientY: 50 })
+    fireEvent.click(screen.getByText('Show in Finder'))
+    expect(onOpenInFinder).toHaveBeenCalledWith(
+      '/tmp/buddy/workspaces/pinned-workspace/tasks/pinned'
+    )
+  })
+
+  it('does not write taskReadState when opening or closing the task context menu', () => {
+    window.localStorage.removeItem('buddy.taskReadState')
+
+    renderSidebar([task('first')])
+
+    const taskRow = screen.getByText('first').closest('[title]')!
+    fireEvent.contextMenu(taskRow, { clientX: 30, clientY: 30 })
+    expect(screen.getByText('Copy Task Name')).toBeVisible()
+
+    // Closing via Escape must still leave the read state untouched.
+    fireEvent.keyDown(document, { key: 'Escape' })
+
+    expect(window.localStorage.getItem('buddy.taskReadState')).toBeNull()
+  })
   it('shows installing label when updateStatus is installing', () => {
     renderSidebar([], {
       updateStatus: 'installing',
@@ -281,6 +471,33 @@ describe('Sidebar', () => {
     expect(btn).toHaveAttribute('disabled')
     fireEvent.click(btn!)
     expect(onUpdateClick).not.toHaveBeenCalled()
+  })
+
+  it('shows phase-specific failed labels in sidebar', () => {
+    renderSidebar([], {
+      updateStatus: 'error',
+      updateErrorPhase: 'check',
+      onUpdateClick: vi.fn()
+    })
+    expect(screen.getByText('Check failed')).toBeTruthy()
+  })
+
+  it('shows download-failed label in sidebar for download phase', () => {
+    renderSidebar([], {
+      updateStatus: 'error',
+      updateErrorPhase: 'download',
+      onUpdateClick: vi.fn()
+    })
+    expect(screen.getByText('Download failed')).toBeTruthy()
+  })
+
+  it('shows install-failed label in sidebar for install phase', () => {
+    renderSidebar([], {
+      updateStatus: 'error',
+      updateErrorPhase: 'install',
+      onUpdateClick: vi.fn()
+    })
+    expect(screen.getByText('Install failed')).toBeTruthy()
   })
 
   it('shows failed label when updateStatus is error', () => {

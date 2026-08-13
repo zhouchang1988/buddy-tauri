@@ -10,18 +10,13 @@ use std::path::Path;
 use std::time::Duration;
 
 use regex::Regex;
-use serde::Serialize;
 use tokio::process::Command;
 
 use super::commit_message;
-use super::types::{GitDiffStats, GitFileStatus, GitRemote, GitStatusResult};
-
-/// Result of `gitCommitAndPush`.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GitCommitResult {
-    pub commit_hash: String,
-}
+use super::types::{
+    GitCommitPushResult, GitDiffStats, GitFileStatus, GitPushStatus, GitRemote, GitStatusResult,
+    GitUpstream,
+};
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -150,6 +145,50 @@ pub async fn get_git_branch(cwd: &str) -> String {
         .unwrap_or_default()
 }
 
+struct GitUpstreamRef {
+    remote: String,
+    merge_ref: String,
+}
+
+/// Port of `getGitUpstream`: raw `branch.<name>.remote` + `branch.<name>.merge`
+/// config values; null when unset, on error, or for a detached HEAD.
+async fn get_git_upstream(cwd: &str, branch: &str) -> Option<GitUpstreamRef> {
+    if branch.is_empty() || branch == "HEAD" {
+        return None;
+    }
+    let remote_key = format!("branch.{branch}.remote");
+    let merge_key = format!("branch.{branch}.merge");
+    let remote_args = ["config", "--get", remote_key.as_str()];
+    let merge_args = ["config", "--get", merge_key.as_str()];
+    let (remote, merge_ref) = tokio::join!(
+        exec_git(&remote_args, cwd, 1),
+        exec_git(&merge_args, cwd, 1),
+    );
+    match (remote, merge_ref) {
+        (Ok(remote), Ok(merge_ref)) if !remote.is_empty() && !merge_ref.is_empty() => {
+            Some(GitUpstreamRef { remote, merge_ref })
+        }
+        _ => None,
+    }
+}
+
+/// 只读解析当前分支的 upstream, 返回 UI 需要的 { remote, branch }; 异常/分离 HEAD 降级为 null。
+async fn get_git_upstream_info(cwd: &str, branch: &str) -> Option<GitUpstream> {
+    let git_ref = get_git_upstream(cwd, branch).await?;
+    // branch.<name>.merge 形如 refs/heads/main; 只接受该前缀并剥离, 不暴露给 Renderer。
+    let branch_name = git_ref
+        .merge_ref
+        .strip_prefix("refs/heads/")
+        .unwrap_or_default();
+    if branch_name.is_empty() {
+        return None;
+    }
+    Some(GitUpstream {
+        remote: git_ref.remote,
+        branch: branch_name.to_string(),
+    })
+}
+
 pub async fn get_git_diff_stats(cwd: &str) -> Option<GitDiffStats> {
     let output = exec_git(&["diff", "--numstat", "--no-renames"], cwd, 1)
         .await
@@ -164,23 +203,31 @@ pub async fn get_git_staged_stats(cwd: &str) -> Option<GitDiffStats> {
     parse_diff_stat(&output)
 }
 
+/// Port of `getGitRemotes` (v1.2.17 "discover push remotes reliably"): list
+/// remote names via `git remote`, then resolve each push URL via
+/// `git remote get-url --push <name>` — this finds remotes that only have a
+/// pushurl configured and prefers the push URL over the fetch URL.
 pub async fn get_git_remotes(cwd: &str) -> Vec<GitRemote> {
-    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    let re = RE.get_or_init(|| Regex::new(r"^(\S+)\s+(\S+)\s+\(fetch\)").unwrap());
-    let Ok(output) = exec_git(&["remote", "-v"], cwd, 1).await else {
+    let Ok(output) = exec_git(&["remote"], cwd, 1).await else {
         return Vec::new();
     };
+    let names: Vec<String> = output
+        .split('\n')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect();
     let mut remotes = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for line in output.split('\n') {
-        if let Some(caps) = re.captures(line) {
-            let name = caps[1].to_string();
-            if seen.insert(name.clone()) {
-                remotes.push(GitRemote {
-                    name,
-                    url: caps[2].to_string(),
-                });
-            }
+    for name in names {
+        let url = exec_git(&["remote", "get-url", "--push", &name], cwd, 1)
+            .await
+            .unwrap_or_default();
+        let first_line = url.split('\n').next().unwrap_or_default();
+        if !first_line.is_empty() {
+            remotes.push(GitRemote {
+                name,
+                url: first_line.to_string(),
+            });
         }
     }
     remotes
@@ -291,6 +338,8 @@ pub async fn get_git_status(cwd: &str) -> GitStatusResult {
         diff.as_ref().and_then(|d| d.files.as_deref()),
         staged.as_ref().and_then(|s| s.files.as_deref()),
     );
+    // upstream 依赖 branch 结果, 不能并入上面的 join!; 失败降级为 null。
+    let upstream = get_git_upstream_info(cwd, &branch).await;
     GitStatusResult {
         branch,
         diff,
@@ -298,6 +347,7 @@ pub async fn get_git_status(cwd: &str) -> GitStatusResult {
         untracked,
         files: merged_files,
         remotes,
+        upstream,
     }
 }
 
@@ -326,19 +376,67 @@ pub async fn git_stage_files(cwd: &str, paths: &[String]) -> GitResult<()> {
     Ok(())
 }
 
+/// Port of `gitCommitAndPush` (v1.2.17): commit errors still reject; push
+/// errors are reported in the result instead. Pushing a branch with no
+/// upstream uses `--set-upstream` so the first push establishes tracking.
 pub async fn git_commit_and_push(
     cwd: &str,
     message: &str,
     remote: &str,
     push: bool,
-) -> GitResult<GitCommitResult> {
+) -> GitResult<GitCommitPushResult> {
     remove_stale_index_lock(cwd, 10_000);
     exec_git(&["commit", "-m", message], cwd, 1).await?;
     let commit_hash = exec_git(&["rev-parse", "--short", "HEAD"], cwd, 1).await?;
-    if push {
-        exec_git(&["push", remote], cwd, 1).await?;
+    if !push {
+        return Ok(GitCommitPushResult {
+            commit_hash,
+            push_status: GitPushStatus::NotRequested,
+            remote: None,
+            upstream_created: false,
+            push_error: None,
+        });
     }
-    Ok(GitCommitResult { commit_hash })
+
+    let branch = get_git_branch(cwd).await;
+    let upstream = get_git_upstream(cwd, &branch).await;
+
+    let push_args: Vec<String> = if upstream.is_none() && branch != "HEAD" {
+        vec![
+            "push".to_string(),
+            "--set-upstream".to_string(),
+            remote.to_string(),
+            format!("HEAD:refs/heads/{branch}"),
+        ]
+    } else if upstream.as_ref().is_some_and(|u| u.remote == remote) {
+        let merge_ref = upstream.as_ref().map(|u| u.merge_ref.clone()).unwrap();
+        vec!["push".to_string(), remote.to_string(), format!("HEAD:{merge_ref}")]
+    } else {
+        let refspec = if branch == "HEAD" {
+            "HEAD".to_string()
+        } else {
+            format!("HEAD:refs/heads/{branch}")
+        };
+        vec!["push".to_string(), remote.to_string(), refspec]
+    };
+
+    let arg_refs: Vec<&str> = push_args.iter().map(String::as_str).collect();
+    match exec_git(&arg_refs, cwd, 1).await {
+        Ok(_) => Ok(GitCommitPushResult {
+            commit_hash,
+            push_status: GitPushStatus::Pushed,
+            remote: Some(remote.to_string()),
+            upstream_created: upstream.is_none() && branch != "HEAD",
+            push_error: None,
+        }),
+        Err(error) => Ok(GitCommitPushResult {
+            commit_hash,
+            push_status: GitPushStatus::Failed,
+            remote: Some(remote.to_string()),
+            upstream_created: false,
+            push_error: Some(error.to_string()),
+        }),
+    }
 }
 
 /// List local branch names (short form). Returns [] on error.
@@ -625,17 +723,236 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commit_without_push_returns_short_hash() {
+    async fn commit_without_push_returns_not_requested_result() {
         let dir = init_repo();
         let cwd = path(&dir);
         std::fs::write(dir.path().join("a.txt"), "hello\nworld\n").unwrap();
         git_stage_all(&cwd).await.unwrap();
-        let result = git_commit_and_push(&cwd, "feat: add world", "origin", false)
+        // Remote may be empty/nonexistent when push=false.
+        let result = git_commit_and_push(&cwd, "feat: add world", "", false)
             .await
             .unwrap();
         assert_eq!(result.commit_hash.len(), 7);
+        assert_eq!(result.push_status, GitPushStatus::NotRequested);
+        assert_eq!(result.remote, None);
+        assert!(!result.upstream_created);
+        assert_eq!(result.push_error, None);
         let status = get_git_status(&cwd).await;
         assert!(status.files.is_empty());
+    }
+
+    /// Create a bare remote repo and add it to `dir` under the given name;
+    /// returns the bare repo's path.
+    fn add_bare_remote(dir: &tempfile::TempDir, name: &str) -> tempfile::TempDir {
+        let bare = tempfile::tempdir().unwrap();
+        let init = StdCommand::new("git")
+            .args(["init", "--bare"])
+            .current_dir(bare.path())
+            .output()
+            .unwrap();
+        assert!(init.status.success());
+        let add = StdCommand::new("git")
+            .args(["remote", "add", name, &bare.path().to_string_lossy()])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(add.status.success());
+        bare
+    }
+
+    fn git(dir: &tempfile::TempDir, args: &[&str]) -> String {
+        let output = StdCommand::new("git")
+            .args(args)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    #[tokio::test]
+    async fn first_push_without_upstream_sets_upstream() {
+        let dir = init_repo();
+        let cwd = path(&dir);
+        let bare = add_bare_remote(&dir, "origin");
+        git(&dir, &["checkout", "-b", "feature"]);
+
+        std::fs::write(dir.path().join("a.txt"), "hello\nworld\n").unwrap();
+        git_stage_all(&cwd).await.unwrap();
+        let result = git_commit_and_push(&cwd, "feat: change", "origin", true)
+            .await
+            .unwrap();
+        assert_eq!(result.push_status, GitPushStatus::Pushed);
+        assert_eq!(result.remote.as_deref(), Some("origin"));
+        assert!(result.upstream_created);
+        assert_eq!(result.push_error, None);
+
+        // The bare remote now has the same branch.
+        let branches = StdCommand::new("git")
+            .args(["--git-dir", &bare.path().to_string_lossy()])
+            .args(["branch", "--format=%(refname:short)"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&branches.stdout).trim(),
+            "feature"
+        );
+        // Upstream now points to origin/feature.
+        let upstream = git(&dir, &["rev-parse", "--abbrev-ref", "feature@{upstream}"]);
+        assert_eq!(upstream, "origin/feature");
+    }
+
+    #[tokio::test]
+    async fn push_again_on_tracked_branch_reports_no_upstream_created() {
+        let dir = init_repo();
+        let cwd = path(&dir);
+        let _bare = add_bare_remote(&dir, "origin");
+        git(&dir, &["push", "-u", "origin", "HEAD:refs/heads/main"]);
+
+        std::fs::write(dir.path().join("a.txt"), "hello\nworld\n").unwrap();
+        git_stage_all(&cwd).await.unwrap();
+        let result = git_commit_and_push(&cwd, "feat: change", "origin", true)
+            .await
+            .unwrap();
+        assert_eq!(result.push_status, GitPushStatus::Pushed);
+        assert!(!result.upstream_created);
+    }
+
+    #[tokio::test]
+    async fn push_to_second_remote_keeps_original_upstream() {
+        let dir = init_repo();
+        let cwd = path(&dir);
+        let _origin = add_bare_remote(&dir, "origin");
+        let backup = add_bare_remote(&dir, "backup");
+        git(&dir, &["push", "-u", "origin", "HEAD:refs/heads/main"]);
+
+        std::fs::write(dir.path().join("a.txt"), "hello\nworld\n").unwrap();
+        git_stage_all(&cwd).await.unwrap();
+        let result = git_commit_and_push(&cwd, "feat: change", "backup", true)
+            .await
+            .unwrap();
+        assert_eq!(result.push_status, GitPushStatus::Pushed);
+        assert_eq!(result.remote.as_deref(), Some("backup"));
+        assert!(!result.upstream_created);
+
+        // backup now has main.
+        let branches = StdCommand::new("git")
+            .args(["--git-dir", &backup.path().to_string_lossy()])
+            .args(["branch", "--format=%(refname:short)"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&branches.stdout).trim(), "main");
+        // The original upstream is unchanged.
+        let upstream = git(&dir, &["rev-parse", "--abbrev-ref", "main@{upstream}"]);
+        assert_eq!(upstream, "origin/main");
+    }
+
+    #[tokio::test]
+    async fn failed_push_is_reported_not_thrown_and_keeps_the_commit() {
+        let dir = init_repo();
+        let cwd = path(&dir);
+        // Point origin at a nonexistent path.
+        git(&dir, &["remote", "add", "origin", "/nonexistent/path/to/remote.git"]);
+        let head_before = git(&dir, &["rev-parse", "--short", "HEAD"]);
+
+        std::fs::write(dir.path().join("a.txt"), "hello\nworld\n").unwrap();
+        git_stage_all(&cwd).await.unwrap();
+        let result = git_commit_and_push(&cwd, "feat: change", "origin", true)
+            .await
+            .unwrap();
+        assert_eq!(result.push_status, GitPushStatus::Failed);
+        assert_eq!(result.remote.as_deref(), Some("origin"));
+        assert!(!result.upstream_created);
+        assert!(result.push_error.is_some());
+
+        // The local commit is retained.
+        let last_msg = git(&dir, &["log", "-1", "--pretty=%B"]);
+        assert_eq!(last_msg, "feat: change");
+        assert_ne!(result.commit_hash, head_before);
+    }
+
+    #[tokio::test]
+    async fn commit_failure_still_errors() {
+        let dir = init_repo();
+        let cwd = path(&dir);
+        let _bare = add_bare_remote(&dir, "origin");
+        // Nothing staged -> commit fails.
+        assert!(git_commit_and_push(&cwd, "msg", "origin", true).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn remotes_are_discovered_via_push_urls() {
+        let dir = init_repo();
+        let cwd = path(&dir);
+
+        // No remotes configured.
+        assert!(get_git_remotes(&cwd).await.is_empty());
+
+        git(&dir, &["remote", "add", "origin", "git@github.com:test/repo.git"]);
+        git(&dir, &["remote", "add", "backup", "git@github.com:test/backup.git"]);
+        let remotes = get_git_remotes(&cwd).await;
+        let mut names: Vec<&str> = remotes.iter().map(|r| r.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["backup", "origin"]);
+
+        // Push URL wins over the fetch URL.
+        git(
+            &dir,
+            &[
+                "remote",
+                "set-url",
+                "--push",
+                "origin",
+                "git@github.com:test/push.git",
+            ],
+        );
+        let remotes = get_git_remotes(&cwd).await;
+        let origin = remotes.iter().find(|r| r.name == "origin").unwrap();
+        assert_eq!(origin.url, "git@github.com:test/push.git");
+
+        // A remote with only a pushurl configured is still discovered.
+        git(&dir, &["config", "--unset", "remote.origin.url"]);
+        git(
+            &dir,
+            &["config", "remote.origin.pushurl", "git@github.com:test/push-only.git"],
+        );
+        let remotes = get_git_remotes(&cwd).await;
+        let origin = remotes.iter().find(|r| r.name == "origin").unwrap();
+        assert_eq!(origin.url, "git@github.com:test/push-only.git");
+    }
+
+    #[tokio::test]
+    async fn status_exposes_upstream_of_current_branch() {
+        let dir = init_repo();
+        let cwd = path(&dir);
+        let _bare = add_bare_remote(&dir, "origin");
+        git(&dir, &["push", "-u", "origin", "HEAD:refs/heads/main"]);
+
+        let status = get_git_status(&cwd).await;
+        assert_eq!(status.branch, "main");
+        assert_eq!(
+            status.upstream,
+            Some(GitUpstream {
+                remote: "origin".to_string(),
+                branch: "main".to_string(),
+            })
+        );
+
+        // A branch without upstream config reports null.
+        git(&dir, &["checkout", "-b", "feature"]);
+        let status = get_git_status(&cwd).await;
+        assert_eq!(status.branch, "feature");
+        assert_eq!(status.upstream, None);
+
+        // Detached HEAD reports null too.
+        git(&dir, &["checkout", "--detach"]);
+        let status = get_git_status(&cwd).await;
+        assert_eq!(status.branch, "HEAD");
+        assert_eq!(status.upstream, None);
     }
 
     #[tokio::test]

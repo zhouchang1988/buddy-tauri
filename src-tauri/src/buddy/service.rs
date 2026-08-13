@@ -12,7 +12,7 @@ use serde::Serialize;
 use super::commit_message::{self, GenerateCommitMessageInput};
 use super::defaults::{normalize_global_settings, DEFAULT_LAUNCHER_ORDER};
 use super::events::BuddyEventBus;
-use super::git::{self, GitCommitResult};
+use super::git;
 use super::launchers::{
     build_launcher_command, kind_needs_pty, parser_actor_for_kind, run_launcher,
     run_launcher_with_pty, split_command, LauncherCommandInput, PtyRunInput, RunLauncherInput,
@@ -28,8 +28,9 @@ use super::runner::{
 use super::store::{BuddyStore, StoreError};
 use super::types::{
     AttachmentMeta, BootstrapResponse, CountdownInput, CreateTaskInput, CreateTaskResult, Event,
-    ExecutionMode, GitStatusResult, GlobalSettings, InstructionQueueItem, RoundEventSummary,
-    SendMessageInput, StartTaskInput, Task, TaskDetail, TaskStats, TestLauncherResult,
+    ExecutionMode, GitCommitPushResult, GitStatusResult, GlobalSettings, InstructionQueueItem,
+    RoundEventSummary, SendMessageInput, StartTaskInput, Task, TaskDetail, TaskStats,
+    TestLauncherResult,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -392,7 +393,7 @@ impl BuddyCoreService {
         message: &str,
         remote: &str,
         push: bool,
-    ) -> Result<GitCommitResult, ServiceError> {
+    ) -> Result<GitCommitPushResult, ServiceError> {
         Ok(git::git_commit_and_push(repo_root, message, remote, push).await?)
     }
 

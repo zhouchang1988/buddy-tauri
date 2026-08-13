@@ -1,6 +1,7 @@
 export interface Task {
   task_id: string
   workspace_key: string
+  task_dir: string
   status: TaskStatus
   updated_at: string
   repo_root: string
@@ -338,6 +339,12 @@ export interface GitRemote {
   url: string
 }
 
+/** 当前本地分支的默认跟踪目标 (remote + 目标分支), 不含 refs/heads/ 前缀。 */
+export interface GitUpstream {
+  remote: string
+  branch: string
+}
+
 export interface GitStatusResult {
   branch: string
   diff: GitDiffStats | null
@@ -345,4 +352,16 @@ export interface GitStatusResult {
   untracked: number
   files: GitFileStatus[]
   remotes: GitRemote[]
+  /** 当前分支的 Git upstream; 无当前分支、分离 HEAD 或未配置时为 null。 */
+  upstream: GitUpstream | null
+}
+
+export type GitPushStatus = 'not_requested' | 'pushed' | 'failed'
+
+export interface GitCommitPushResult {
+  commitHash: string
+  pushStatus: GitPushStatus
+  remote: string | null
+  upstreamCreated: boolean
+  pushError: string | null
 }

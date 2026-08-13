@@ -94,6 +94,8 @@ pub enum ExecutionMode {
 pub struct Task {
     pub task_id: String,
     pub workspace_key: String,
+    /// Absolute task directory, computed at list time (not persisted).
+    pub task_dir: String,
     pub status: TaskStatus,
     pub updated_at: String,
     pub repo_root: String,
@@ -593,6 +595,13 @@ pub struct GitRemote {
     pub url: String,
 }
 
+/// 当前本地分支的默认跟踪目标 (remote + 目标分支), 不含 refs/heads/ 前缀。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitUpstream {
+    pub remote: String,
+    pub branch: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitStatusResult {
     pub branch: String,
@@ -601,4 +610,26 @@ pub struct GitStatusResult {
     pub untracked: u64,
     pub files: Vec<GitFileStatus>,
     pub remotes: Vec<GitRemote>,
+    /// 当前分支的 Git upstream; 无当前分支、分离 HEAD 或未配置时为 null。
+    pub upstream: Option<GitUpstream>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum GitPushStatus {
+    #[serde(rename = "not_requested")]
+    NotRequested,
+    #[serde(rename = "pushed")]
+    Pushed,
+    #[serde(rename = "failed")]
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitCommitPushResult {
+    pub commit_hash: String,
+    pub push_status: GitPushStatus,
+    pub remote: Option<String>,
+    pub upstream_created: bool,
+    pub push_error: Option<String>,
 }

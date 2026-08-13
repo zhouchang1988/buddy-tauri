@@ -14,6 +14,7 @@ import { Sidebar } from './components/Sidebar'
 import { ChatArea } from './components/ChatArea'
 import { StatusBar } from './components/StatusBar'
 import { SettingsContent, SettingsTab } from './components/SettingsContent'
+import { Switch } from './components/Switch'
 import { UpdateNotification } from './components/UpdateNotification'
 import { useUpdater } from './hooks/useUpdater'
 import { ACTOR_LABEL_KEY, Actor } from './lib/format'
@@ -23,6 +24,7 @@ import { readStringArraySetting, visibleTasksForShortcuts, markTaskAsRead, readL
 import type { GlobalSettings, InstructionQueueItem, Attachment, AttachmentMeta } from './shared/types'
 import { IMAGE_EXTS, MIME_MAP, EXT_ICON_MAP, isImageAttachment, generateAttachmentId, ensureMimeType } from './lib/attachments'
 import { defaultLauncherFor, normalizeGlobalSettings } from './shared/defaults'
+import { TASK_ID_MAX_CODE_POINTS, validateTaskId } from './shared/task-id'
 
 export default function App() {
   const t = useT()
@@ -187,8 +189,18 @@ export default function App() {
   const handleOpenInFinder = useCallback((path: string) => {
     window.api.openInFinder(path).catch((err: unknown) => {
       console.error('Failed to open in Finder:', err)
+      window.alert(t('sidebar.openInFinderFail', { message: err instanceof Error ? err.message : String(err) }))
     })
-  }, [])
+  }, [t])
+
+  const handleCopyText = useCallback((text: string) => {
+    navigator.clipboard.writeText(text).catch((error: unknown) => {
+      console.error('Failed to copy text:', error)
+      window.alert(t('sidebar.copyFail', {
+        message: error instanceof Error ? error.message : String(error)
+      }))
+    })
+  }, [t])
 
   const handleRemoveProject = useCallback(async (repoRoot: string) => {
     const projectTasks = tasks.filter(t => t.repo_root === repoRoot)
@@ -621,6 +633,7 @@ export default function App() {
         settingsTab={settingsTab}
         updateStatus={updater.status}
         updateVersion={updater.version}
+        updateErrorPhase={updater.errorPhase}
         onUpdateClick={
           updater.status === 'downloaded'
             ? updater.installUpdate
@@ -639,6 +652,7 @@ export default function App() {
         onRenameProject={handleRenameProject}
         onRenameTask={handleRenameTask}
         onOpenInFinder={handleOpenInFinder}
+        onCopyText={handleCopyText}
         onRemoveProject={handleRemoveProject}
         projectNames={projectNames}
         taskNames={taskNames}
@@ -763,12 +777,13 @@ export default function App() {
         onRetry={updater.retryUpdate}
         onDismiss={updater.dismissNotification}
         errorMessage={updater.errorMessage}
+        errorPhase={updater.errorPhase}
       />
     </div>
   )
 }
 
-function CreateTaskModal({
+export function CreateTaskModal({
   onClose,
   onCreate,
   defaultRepoRoot,
@@ -924,12 +939,12 @@ function CreateTaskModal({
     return () => document.removeEventListener('keydown', handleKeyDown)
   }, [onClose, showBranchModal])
 
-  const TASK_NAME_RE = /^[a-zA-Z0-9一-鿿㐀-䶿""「」【】{}][a-zA-Z0-9一-鿿㐀-䶿 ._\-""「」【】{}]{0,63}$/
-  const taskIdError = taskId.trim() && !TASK_NAME_RE.test(taskId.trim())
+  const taskIdValidation = validateTaskId(taskId)
+  const taskIdError = taskIdValidation.reason !== null && taskId.trim()
     ? t('modal.create.taskNameError')
     : null
   const sameActorError = implementer === reviewer
-  const canSubmit = taskId.trim() && !taskIdError && !sameActorError
+  const canSubmit = taskIdValidation.reason === null && !sameActorError
 
   const seedFor = (actor: Actor, session: string): Record<string, string> => {
     const value = session.trim()
@@ -967,7 +982,7 @@ function CreateTaskModal({
       ...seedFor(implementer, implementerSession),
       ...seedFor(reviewer, reviewerSession)
     }
-    onCreate(taskId.trim(), taskText, repoRoot.trim(), settings, attachments.length > 0 ? attachments : undefined, executionMode)
+    onCreate(taskIdValidation.value, taskText, repoRoot.trim(), settings, attachments.length > 0 ? attachments : undefined, executionMode)
   }
 
   const handleSelectDirectory = async () => {
@@ -1024,7 +1039,7 @@ function CreateTaskModal({
             />
             <div className="flex justify-between mt-1">
               <span className="text-xs text-fg-muted">{t('modal.create.taskNameHint')}</span>
-              <span className="text-xs text-fg-muted">{taskId.trim().length}/64</span>
+              <span className="text-xs text-fg-muted">{[...taskIdValidation.value].length}/{TASK_ID_MAX_CODE_POINTS}</span>
             </div>
             {taskIdError && (
               <div className="text-xs text-danger mt-1">{taskIdError}</div>
@@ -1033,15 +1048,20 @@ function CreateTaskModal({
 
           {/* 任务说明 */}
           <div>
-            <label className="block text-xs font-medium text-fg-secondary mb-1">
-              {t('modal.create.taskBrief')}
-            </label>
+            <div className="flex flex-wrap items-baseline gap-x-2 mb-1">
+              <label className="block text-xs font-medium text-fg-secondary">
+                {t('modal.create.taskBrief')}
+              </label>
+              <span className="text-[11px] text-fg-muted">
+                {t('modal.create.taskBriefPasteHint')}
+              </span>
+            </div>
             <textarea
               value={taskText}
               onChange={(e) => setTaskText(e.target.value)}
               onPaste={handlePaste}
-              rows={8}
-              className="w-full h-[160px] px-3 py-1.5 border border-border rounded-lg focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent font-mono text-xs bg-bg"
+              rows={9}
+              className="w-full min-h-[176px] px-3 py-1.5 border border-border rounded-lg focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent font-mono text-xs bg-bg"
             />
             {/* Attachment previews — same layout as Composer */}
             {attachments.length > 0 && (
@@ -1211,56 +1231,41 @@ function CreateTaskModal({
           {sameActorError && (
             <div className="text-xs text-danger">{t('modal.create.sameActorError')}</div>
           )}
-
-          {/* 执行方式 */}
-          <div>
-            <label className="block text-xs font-medium text-fg-secondary mb-1">
-              {t('modal.create.executionMode')}
-            </label>
-            <div className="flex gap-4">
-              {(['immediate', 'queued'] as const).map((mode) => {
-                const active = executionMode === mode
-                return (
-                  <button
-                    key={mode}
-                    type="button"
-                    onClick={() => setExecutionMode(mode)}
-                    className={`flex-1 px-3 py-1.5 text-xs border rounded-lg transition-colors ${
-                      active
-                        ? 'border-accent bg-accent-soft text-fg'
-                        : 'border-border text-fg-secondary hover:bg-bg-subtle'
-                    }`}
-                  >
-                    {mode === 'immediate'
-                      ? t('modal.create.executionMode.immediate')
-                      : t('modal.create.executionMode.queued')}
-                  </button>
-                )
-              })}
-            </div>
-            <div className="text-xs text-fg-muted mt-1">
-              {executionMode === 'immediate'
-                ? t('modal.create.executionMode.immediateHint')
-                : t('modal.create.executionMode.queuedHint')}
-            </div>
-          </div>
         </div>
 
         {/* 底部 */}
-        <div className="px-6 py-4 border-t border-border flex justify-end gap-3">
-          <button
-            onClick={onClose}
-            className="px-4 py-1.5 text-xs text-fg hover:bg-bg-subtle rounded-lg transition-colors"
-          >
-            {t('common.cancel')}
-          </button>
-          <button
-            onClick={handleSubmit}
-            disabled={!canSubmit}
-            className="px-4 py-1.5 text-xs bg-accent-primary text-fg-inverse rounded-lg hover:bg-accent-primary-hover transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            {t('modal.create.submit')} <span className="opacity-60 ml-1">⌘⏎</span>
-          </button>
+        <div className="px-6 py-4 border-t border-border flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-fg-secondary">
+              {executionMode === 'immediate'
+                ? t('modal.create.executionMode.immediate')
+                : t('modal.create.executionMode.queued')}
+            </span>
+            <Switch
+              checked={executionMode === 'immediate'}
+              onChange={(checked) => setExecutionMode(checked ? 'immediate' : 'queued')}
+              ariaLabel={
+                executionMode === 'immediate'
+                  ? t('modal.create.executionMode.immediate')
+                  : t('modal.create.executionMode.queued')
+              }
+            />
+          </div>
+          <div className="flex items-center gap-3">
+            <button
+              onClick={onClose}
+              className="px-4 py-1.5 text-xs text-fg hover:bg-bg-subtle rounded-lg transition-colors"
+            >
+              {t('common.cancel')}
+            </button>
+            <button
+              onClick={handleSubmit}
+              disabled={!canSubmit}
+              className="px-4 py-1.5 text-xs bg-accent-primary text-fg-inverse rounded-lg hover:bg-accent-primary-hover transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {t('modal.create.submit')} <span className="opacity-60 ml-1">⌘⏎</span>
+            </button>
+          </div>
         </div>
       </div>
 

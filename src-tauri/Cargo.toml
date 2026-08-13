@@ -1,6 +1,6 @@
 [package]
 name = "buddy"
-version = "1.2.14"
+version = "1.2.19"
 description = "Dual AI Agent collaborative coding desktop app (Tauri edition)"
 license = "MIT"
 edition = "2021"
