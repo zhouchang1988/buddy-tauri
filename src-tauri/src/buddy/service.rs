@@ -28,7 +28,8 @@ use super::runner::{
 use super::store::{BuddyStore, StoreError};
 use super::types::{
     AttachmentMeta, BootstrapResponse, CountdownInput, CreateTaskInput, CreateTaskResult, Event,
-    ExecutionMode, GitCommitPushResult, GitStatusResult, GlobalSettings, InstructionQueueItem,
+    ExecutionMode, GitCommitPushResult, GitPushAvailability, GitPushResult, GitStatusResult,
+    GlobalSettings, InstructionQueueItem,
     RoundEventSummary, SendMessageInput, StartTaskInput, Task, TaskDetail, TaskStats,
     TestLauncherResult,
 };
@@ -423,6 +424,18 @@ impl BuddyCoreService {
         branch: &str,
     ) -> Result<(), ServiceError> {
         Ok(git::git_create_branch(repo_root, branch).await?)
+    }
+
+    pub async fn git_push_availability(
+        &self,
+        repo_root: &str,
+        remote: &str,
+    ) -> Result<GitPushAvailability, ServiceError> {
+        Ok(git::get_git_push_availability(repo_root, remote).await?)
+    }
+
+    pub async fn git_push(&self, repo_root: &str, remote: &str) -> GitPushResult {
+        git::git_push(repo_root, remote).await
     }
 
     /// Port of the v1.2.11+ `generateCommitMessage(input)`: resolves the

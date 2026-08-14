@@ -16,7 +16,8 @@ use crate::buddy::commit_message::GenerateCommitMessageInput;
 use crate::buddy::service::{BuddyCoreService, EventsResponse};
 use crate::buddy::types::{
     AttachmentMeta, BootstrapResponse, CountdownInput, CreateTaskInput, CreateTaskResult,
-    GitCommitPushResult, GlobalSettings, GitStatusResult, InstructionQueueItem, RoundEventSummary,
+    GitCommitPushResult, GitPushAvailability, GitPushResult, GlobalSettings, GitStatusResult,
+    InstructionQueueItem, RoundEventSummary,
     SendMessageInput, StartTaskInput, Task, TaskDetail, TaskStats, TestLauncherResult,
 };
 use crate::{menu, updater};
@@ -320,6 +321,27 @@ pub async fn buddy_git_create_branch(
         .git_create_branch(&repo_root, &branch)
         .await
         .map_err(err)
+}
+
+#[tauri::command]
+pub async fn buddy_git_push_availability(
+    service: State<'_, BuddyCoreService>,
+    repo_root: String,
+    remote: String,
+) -> CmdResult<GitPushAvailability> {
+    service
+        .git_push_availability(&repo_root, &remote)
+        .await
+        .map_err(err)
+}
+
+#[tauri::command]
+pub async fn buddy_git_push(
+    service: State<'_, BuddyCoreService>,
+    repo_root: String,
+    remote: String,
+) -> CmdResult<GitPushResult> {
+    Ok(service.git_push(&repo_root, &remote).await)
 }
 
 /// TS v1.2.11+: `buddy:generateCommitMessage` takes a single input object

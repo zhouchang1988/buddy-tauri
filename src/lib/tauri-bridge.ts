@@ -20,6 +20,8 @@ import type {
   CreateTaskResult,
   Event,
   GitCommitPushResult,
+  GitPushAvailability,
+  GitPushResult,
   GlobalSettings,
   InstructionQueueItem,
   RoundEventSummary,
@@ -90,6 +92,10 @@ const buddy = {
     invoke<void>('buddy_git_checkout', { repoRoot, branch }),
   gitCreateBranch: (repoRoot: string, branch: string): Promise<void> =>
     invoke<void>('buddy_git_create_branch', { repoRoot, branch }),
+  gitPushAvailability: (repoRoot: string, remote: string): Promise<GitPushAvailability> =>
+    invoke<GitPushAvailability>('buddy_git_push_availability', { repoRoot, remote }),
+  gitPush: (repoRoot: string, remote: string): Promise<GitPushResult> =>
+    invoke<GitPushResult>('buddy_git_push', { repoRoot, remote }),
   generateCommitMessage: (input: { repoRoot: string; actor: string; lang?: string; paths: string[]; taskSettings?: TaskSettings | null }): Promise<{ message: string }> =>
     invoke<{ message: string }>('buddy_generate_commit_message', { input }),
   cancelGenerateCommitMessage: (): Promise<void> =>

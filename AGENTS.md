@@ -24,7 +24,7 @@ pnpm dist:intel             # x86_64 (Intel) DMG
 pnpm dist:universal         # Universal DMG (both arches; needs rustup targets aarch64/x86_64-apple-darwin)
 ```
 
-Both test suites must stay green: `cargo test` (327 tests) **and** `pnpm test` (200 tests).
+Both test suites must stay green: `cargo test` (338 tests) **and** `pnpm test` (231 tests).
 
 ## Architecture
 
@@ -74,11 +74,11 @@ When adding a command: implement `#[tauri::command]` in `src-tauri/src/commands.
 | `model_detect.rs` | Detects the effective model per actor from configs and CLI flags (incl. WeCode) |
 | `notifications.rs` | Desktop notifications via tauri-plugin-notification |
 
-Plus at the crate root: `commands.rs` (40 `#[tauri::command]` handlers), `menu.rs` (native menu), `updater.rs` (tauri-plugin-updater flow), `lib.rs` (wiring).
+Plus at the crate root: `commands.rs` (43 `#[tauri::command]` handlers), `menu.rs` (native menu), `updater.rs` (tauri-plugin-updater flow), `lib.rs` (wiring).
 
 ### `lib.rs` wiring order
 
-`fix_shell_path()` → register plugins (dialog/notification/shell/opener/clipboard-manager/updater) → in `setup`: build `BuddyEventBus` + `BuddyCoreService` (with notifier factory) → spawn task forwarding the bus to `app.emit("buddy:event", ...)` → `block_on(service.recover_interrupted_runs())` (must run before the window is created, matching the Electron edition's `app.whenReady()` ordering) → `app.manage(service)` → `menu::setup_menu` → `updater::init_updater` → `generate_handler!` registers all 40 commands.
+`fix_shell_path()` → register plugins (dialog/notification/shell/opener/clipboard-manager/updater) → in `setup`: build `BuddyEventBus` + `BuddyCoreService` (with notifier factory) → spawn task forwarding the bus to `app.emit("buddy:event", ...)` → `block_on(service.recover_interrupted_runs())` (must run before the window is created, matching the Electron edition's `app.whenReady()` ordering) → `app.manage(service)` → `menu::setup_menu` → `updater::init_updater` → `generate_handler!` registers all 43 commands.
 
 ### Task state machine
 

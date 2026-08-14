@@ -14,7 +14,8 @@ use tokio::process::Command;
 
 use super::commit_message;
 use super::types::{
-    GitCommitPushResult, GitDiffStats, GitFileStatus, GitPushStatus, GitRemote, GitStatusResult,
+    GitCommitPushResult, GitDiffStats, GitFileStatus, GitPushAvailability,
+    GitPushAvailabilityState, GitPushResult, GitPushStatus, GitRemote, GitStatusResult,
     GitUpstream,
 };
 
@@ -398,35 +399,15 @@ pub async fn git_commit_and_push(
         });
     }
 
-    let branch = get_git_branch(cwd).await;
-    let upstream = get_git_upstream(cwd, &branch).await;
+    let resolved = resolve_push_args(cwd, remote).await;
 
-    let push_args: Vec<String> = if upstream.is_none() && branch != "HEAD" {
-        vec![
-            "push".to_string(),
-            "--set-upstream".to_string(),
-            remote.to_string(),
-            format!("HEAD:refs/heads/{branch}"),
-        ]
-    } else if upstream.as_ref().is_some_and(|u| u.remote == remote) {
-        let merge_ref = upstream.as_ref().map(|u| u.merge_ref.clone()).unwrap();
-        vec!["push".to_string(), remote.to_string(), format!("HEAD:{merge_ref}")]
-    } else {
-        let refspec = if branch == "HEAD" {
-            "HEAD".to_string()
-        } else {
-            format!("HEAD:refs/heads/{branch}")
-        };
-        vec!["push".to_string(), remote.to_string(), refspec]
-    };
-
-    let arg_refs: Vec<&str> = push_args.iter().map(String::as_str).collect();
+    let arg_refs: Vec<&str> = resolved.args.iter().map(String::as_str).collect();
     match exec_git(&arg_refs, cwd, 1).await {
         Ok(_) => Ok(GitCommitPushResult {
             commit_hash,
             push_status: GitPushStatus::Pushed,
             remote: Some(remote.to_string()),
-            upstream_created: upstream.is_none() && branch != "HEAD",
+            upstream_created: resolved.upstream_created_on_push,
             push_error: None,
         }),
         Err(error) => Ok(GitCommitPushResult {
@@ -436,6 +417,168 @@ pub async fn git_commit_and_push(
             upstream_created: false,
             push_error: Some(error.to_string()),
         }),
+    }
+}
+
+struct ResolvedPushArgs {
+    args: Vec<String>,
+    /// 本次 push 成功后是否会建立 upstream。仅「无 upstream 且非分离 HEAD」的首次推送为 true。
+    upstream_created_on_push: bool,
+}
+
+/// Port of `resolvePushArgs` (v1.2.20): 解析当前 HEAD 推送到 `remote` 所需的
+/// git 参数, 供「提交后推送」与「独立推送」共用, 确保两条路径的首次推送与
+/// alternate-remote 语义不出现分叉:
+/// - 无 upstream 且非分离 HEAD: `push --set-upstream remote HEAD:refs/heads/<branch>`,
+///   成功后建立 upstream。
+/// - upstream.remote === remote: 推到 upstream 的 mergeRef (如 refs/heads/main)。
+/// - 已有 upstream 但选择了其它 remote / 分离 HEAD: 显式推到同名本地分支,
+///   绝不改写原 upstream。
+async fn resolve_push_args(cwd: &str, remote: &str) -> ResolvedPushArgs {
+    let branch = get_git_branch(cwd).await;
+    let upstream = get_git_upstream(cwd, &branch).await;
+    if upstream.is_none() && branch != "HEAD" {
+        return ResolvedPushArgs {
+            args: vec![
+                "push".to_string(),
+                "--set-upstream".to_string(),
+                remote.to_string(),
+                format!("HEAD:refs/heads/{branch}"),
+            ],
+            upstream_created_on_push: true,
+        };
+    }
+    if upstream.as_ref().is_some_and(|u| u.remote == remote) {
+        let merge_ref = upstream.as_ref().map(|u| u.merge_ref.clone()).unwrap();
+        return ResolvedPushArgs {
+            args: vec!["push".to_string(), remote.to_string(), format!("HEAD:{merge_ref}")],
+            upstream_created_on_push: false,
+        };
+    }
+    let refspec = if branch == "HEAD" {
+        "HEAD".to_string()
+    } else {
+        format!("HEAD:refs/heads/{branch}")
+    };
+    ResolvedPushArgs {
+        args: vec!["push".to_string(), remote.to_string(), refspec],
+        upstream_created_on_push: false,
+    }
+}
+
+/// Port of `getGitPushAvailability` (v1.2.20): 对所选 remote 执行 fetch 后比较
+/// 本地 HEAD 与目标远端分支, 返回可推性。这是一个独立的网络操作入口: 只被显式的
+/// push-status IPC 调用, 不得从 get_git_status() 或其 10 秒轮询触发。
+///
+/// 目标分支: 所选 remote 等于当前 upstream.remote 时用 upstream.branch,
+/// 否则用当前本地分支名——与 resolve_push_args() 的推送目标保持一致。
+/// fetch 失败时返回 Err, 由调用方呈现「检查远端状态失败」而非伪装成可推送。
+pub async fn get_git_push_availability(cwd: &str, remote: &str) -> GitResult<GitPushAvailability> {
+    let branch = get_git_branch(cwd).await;
+    if branch.is_empty() || branch == "HEAD" {
+        return Ok(GitPushAvailability {
+            state: GitPushAvailabilityState::Unavailable,
+            remote: remote.to_string(),
+            branch: String::new(),
+            ahead: 0,
+            behind: 0,
+            upstream_created_on_push: false,
+        });
+    }
+    let upstream = get_git_upstream(cwd, &branch).await;
+    // 非分离 HEAD 时, upstream_created_on_push 与 resolve_push_args 等价 (= upstream 缺失)。
+    let upstream_created_on_push = upstream.is_none();
+
+    // 仅 fetch 这一个确定的 remote; 失败让其报错上浮。
+    exec_git(&["fetch", remote], cwd, 1).await?;
+
+    let target_branch = match upstream.as_ref() {
+        Some(u) if u.remote == remote => u
+            .merge_ref
+            .strip_prefix("refs/heads/")
+            .unwrap_or(&u.merge_ref)
+            .to_string(),
+        _ => branch.clone(),
+    };
+    let remote_ref = format!("refs/remotes/{remote}/{target_branch}");
+
+    let ref_exists = exec_git(
+        &["rev-parse", "--verify", "--quiet", &format!("{remote_ref}^{{commit}}")],
+        cwd,
+        1,
+    )
+    .await
+    .map(|out| !out.trim().is_empty())
+    .unwrap_or(false);
+
+    if !ref_exists {
+        // 远端尚无目标分支: 若本地已有提交即为首次推送, 否则不可推。
+        let has_head = exec_git(&["rev-parse", "--verify", "--quiet", "HEAD"], cwd, 1)
+            .await
+            .map(|out| !out.trim().is_empty())
+            .unwrap_or(false);
+        return Ok(GitPushAvailability {
+            state: if has_head {
+                GitPushAvailabilityState::NewBranch
+            } else {
+                GitPushAvailabilityState::Unavailable
+            },
+            remote: remote.to_string(),
+            branch: target_branch,
+            ahead: u64::from(has_head),
+            behind: 0,
+            upstream_created_on_push,
+        });
+    }
+
+    let counts = exec_git(
+        &["rev-list", "--left-right", "--count", &format!("{remote_ref}...HEAD")],
+        cwd,
+        1,
+    )
+    .await
+    .unwrap_or_else(|_| "0\t0".to_string());
+    let mut parts = counts.split('\t');
+    let behind: u64 = parts.next().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+    let ahead: u64 = parts.next().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+    let state = if ahead > 0 && behind > 0 {
+        GitPushAvailabilityState::Diverged
+    } else if ahead > 0 {
+        GitPushAvailabilityState::Ahead
+    } else if behind > 0 {
+        GitPushAvailabilityState::Behind
+    } else {
+        GitPushAvailabilityState::UpToDate
+    };
+    Ok(GitPushAvailability {
+        state,
+        remote: remote.to_string(),
+        branch: target_branch,
+        ahead,
+        behind,
+        upstream_created_on_push,
+    })
+}
+
+/// Port of `gitPush` (v1.2.20): 独立推送当前 HEAD: 只推已有提交, 不调用
+/// git commit / add / reset, 也不改动工作区。成功/失败以 GitPushResult 返回,
+/// 失败时保留原始 Git stderr, 不抛弃本地状态。
+pub async fn git_push(cwd: &str, remote: &str) -> GitPushResult {
+    let resolved = resolve_push_args(cwd, remote).await;
+    let arg_refs: Vec<&str> = resolved.args.iter().map(String::as_str).collect();
+    match exec_git(&arg_refs, cwd, 1).await {
+        Ok(_) => GitPushResult {
+            push_status: GitPushStatus::Pushed,
+            remote: remote.to_string(),
+            upstream_created: resolved.upstream_created_on_push,
+            push_error: None,
+        },
+        Err(error) => GitPushResult {
+            push_status: GitPushStatus::Failed,
+            remote: remote.to_string(),
+            upstream_created: false,
+            push_error: Some(error.to_string()),
+        },
     }
 }
 
@@ -1081,5 +1224,258 @@ mod tests {
         // Path filter excluding every change → empty.
         let filtered = git_diff_for_commit_message(&cwd, Some(&["other.txt".to_string()])).await;
         assert_eq!(filtered, "");
+    }
+
+    /// Clone a bare remote into a fresh working clone (for advancing origin).
+    fn clone_repo(src: &tempfile::TempDir) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let clone = StdCommand::new("git")
+            .args(["clone", &src.path().to_string_lossy(), "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            clone.status.success(),
+            "git clone failed: {}",
+            String::from_utf8_lossy(&clone.stderr)
+        );
+        let run = |args: &[&str]| {
+            let status = StdCommand::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(status.status.success(), "git {:?} failed", args);
+        };
+        run(&["config", "user.name", "Test"]);
+        run(&["config", "user.email", "test@example.com"]);
+        dir
+    }
+
+    #[tokio::test]
+    async fn push_availability_reports_ahead_when_local_is_1_commit_ahead() {
+        let dir = init_repo();
+        let cwd = path(&dir);
+        let _bare = add_bare_remote(&dir, "origin");
+        git(&dir, &["push", "-u", "origin", "HEAD:refs/heads/main"]);
+
+        std::fs::write(dir.path().join("a.txt"), "changed\n").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-m", "ahead"]);
+
+        let avail = get_git_push_availability(&cwd, "origin").await.unwrap();
+        assert_eq!(avail.state, GitPushAvailabilityState::Ahead);
+        assert_eq!(avail.ahead, 1);
+        assert_eq!(avail.behind, 0);
+        assert_eq!(avail.remote, "origin");
+        assert_eq!(avail.branch, "main");
+        assert!(!avail.upstream_created_on_push);
+    }
+
+    #[tokio::test]
+    async fn push_availability_reports_behind_then_diverged() {
+        let dir = init_repo();
+        let cwd = path(&dir);
+        let bare = add_bare_remote(&dir, "origin");
+        git(&dir, &["push", "-u", "origin", "HEAD:refs/heads/main"]);
+
+        // Advance origin/main from another clone.
+        let other = clone_repo(&bare);
+        std::fs::write(other.path().join("a.txt"), "remote-change\n").unwrap();
+        let other_cwd = path(&other);
+        let run = |args: &[&str]| {
+            let status = StdCommand::new("git")
+                .args(args)
+                .current_dir(&other_cwd)
+                .output()
+                .unwrap();
+            assert!(status.status.success(), "git {:?} failed", args);
+        };
+        run(&["add", "-A"]);
+        run(&["commit", "-m", "remote"]);
+        run(&["push", "origin", "main"]);
+
+        // dir has not moved: behind by 1.
+        let behind = get_git_push_availability(&cwd, "origin").await.unwrap();
+        assert_eq!(behind.state, GitPushAvailabilityState::Behind);
+        assert_eq!(behind.ahead, 0);
+        assert_eq!(behind.behind, 1);
+
+        // Now dir also adds a local commit → diverged.
+        std::fs::write(dir.path().join("other.txt"), "local\n").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-m", "local"]);
+        let diverged = get_git_push_availability(&cwd, "origin").await.unwrap();
+        assert_eq!(diverged.state, GitPushAvailabilityState::Diverged);
+        assert_eq!(diverged.ahead, 1);
+        assert_eq!(diverged.behind, 1);
+    }
+
+    #[tokio::test]
+    async fn push_availability_reports_new_branch_for_branch_without_upstream() {
+        let dir = init_repo();
+        let cwd = path(&dir);
+        let _bare = add_bare_remote(&dir, "origin");
+        git(&dir, &["checkout", "-b", "feature"]);
+
+        let avail = get_git_push_availability(&cwd, "origin").await.unwrap();
+        assert_eq!(avail.state, GitPushAvailabilityState::NewBranch);
+        assert_eq!(avail.branch, "feature");
+        assert_eq!(avail.ahead, 1);
+        assert_eq!(avail.behind, 0);
+        assert!(avail.upstream_created_on_push);
+    }
+
+    #[tokio::test]
+    async fn push_availability_compares_against_selected_remote_and_keeps_upstream() {
+        let dir = init_repo();
+        let cwd = path(&dir);
+        let _origin = add_bare_remote(&dir, "origin");
+        let _backup = add_bare_remote(&dir, "backup");
+        git(&dir, &["push", "-u", "origin", "HEAD:refs/heads/main"]);
+        // Also push base to backup so backup/main exists, then advance local.
+        git(&dir, &["push", "backup", "HEAD:refs/heads/main"]);
+        std::fs::write(dir.path().join("a.txt"), "changed\n").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-m", "local"]);
+
+        let avail = get_git_push_availability(&cwd, "backup").await.unwrap();
+        assert_eq!(avail.state, GitPushAvailabilityState::Ahead);
+        assert_eq!(avail.branch, "main");
+        assert_eq!(avail.ahead, 1);
+        assert_eq!(avail.behind, 0);
+
+        // origin upstream untouched.
+        let upstream = git(&dir, &["rev-parse", "--abbrev-ref", "main@{upstream}"]);
+        assert_eq!(upstream, "origin/main");
+    }
+
+    #[tokio::test]
+    async fn push_availability_reports_up_to_date_when_in_sync() {
+        let dir = init_repo();
+        let cwd = path(&dir);
+        let _bare = add_bare_remote(&dir, "origin");
+        git(&dir, &["push", "-u", "origin", "HEAD:refs/heads/main"]);
+
+        let avail = get_git_push_availability(&cwd, "origin").await.unwrap();
+        assert_eq!(avail.state, GitPushAvailabilityState::UpToDate);
+        assert_eq!(avail.ahead, 0);
+        assert_eq!(avail.behind, 0);
+    }
+
+    #[tokio::test]
+    async fn push_availability_returns_unavailable_on_detached_head() {
+        let dir = init_repo();
+        let cwd = path(&dir);
+        let _bare = add_bare_remote(&dir, "origin");
+        git(&dir, &["push", "-u", "origin", "HEAD:refs/heads/main"]);
+        git(&dir, &["checkout", "--detach"]);
+
+        let avail = get_git_push_availability(&cwd, "origin").await.unwrap();
+        assert_eq!(avail.state, GitPushAvailabilityState::Unavailable);
+        assert_eq!(avail.branch, "");
+    }
+
+    #[tokio::test]
+    async fn push_availability_errors_when_fetch_fails() {
+        let dir = init_repo();
+        let cwd = path(&dir);
+        git(&dir, &["remote", "add", "origin", "/nonexistent/path/to/remote.git"]);
+
+        assert!(get_git_push_availability(&cwd, "origin").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn git_push_pushes_existing_head_without_new_commit() {
+        let dir = init_repo();
+        let cwd = path(&dir);
+        let _bare = add_bare_remote(&dir, "origin");
+        git(&dir, &["push", "-u", "origin", "HEAD:refs/heads/main"]);
+        std::fs::write(dir.path().join("a.txt"), "changed\n").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-m", "local"]);
+
+        let head_before = git(&dir, &["rev-parse", "HEAD"]);
+        let result = git_push(&cwd, "origin").await;
+        assert_eq!(result.push_status, GitPushStatus::Pushed);
+        assert_eq!(result.remote, "origin");
+        assert!(!result.upstream_created);
+        assert_eq!(result.push_error, None);
+
+        let head_after = git(&dir, &["rev-parse", "HEAD"]);
+        assert_eq!(head_after, head_before);
+        // No new commit appeared; working tree still clean.
+        let last_msg = git(&dir, &["log", "-1", "--pretty=%B"]);
+        assert_eq!(last_msg, "local");
+        let status = git(&dir, &["status", "--porcelain"]);
+        assert_eq!(status, "");
+    }
+
+    #[tokio::test]
+    async fn git_push_creates_upstream_on_first_push_of_new_branch() {
+        let dir = init_repo();
+        let cwd = path(&dir);
+        let bare = add_bare_remote(&dir, "origin");
+        git(&dir, &["checkout", "-b", "feature"]);
+
+        let result = git_push(&cwd, "origin").await;
+        assert_eq!(result.push_status, GitPushStatus::Pushed);
+        assert!(result.upstream_created);
+
+        let upstream = git(&dir, &["rev-parse", "--abbrev-ref", "feature@{upstream}"]);
+        assert_eq!(upstream, "origin/feature");
+        let branches = StdCommand::new("git")
+            .args(["--git-dir", &bare.path().to_string_lossy()])
+            .args(["branch", "--format=%(refname:short)"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&branches.stdout).trim(),
+            "feature"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_push_to_alternate_remote_keeps_original_upstream() {
+        let dir = init_repo();
+        let cwd = path(&dir);
+        let _origin = add_bare_remote(&dir, "origin");
+        let backup = add_bare_remote(&dir, "backup");
+        git(&dir, &["push", "-u", "origin", "HEAD:refs/heads/main"]);
+        std::fs::write(dir.path().join("a.txt"), "changed\n").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-m", "local"]);
+
+        let result = git_push(&cwd, "backup").await;
+        assert_eq!(result.push_status, GitPushStatus::Pushed);
+        assert_eq!(result.remote, "backup");
+        assert!(!result.upstream_created);
+
+        let branches = StdCommand::new("git")
+            .args(["--git-dir", &backup.path().to_string_lossy()])
+            .args(["branch", "--format=%(refname:short)"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&branches.stdout).trim(), "main");
+        let upstream = git(&dir, &["rev-parse", "--abbrev-ref", "main@{upstream}"]);
+        assert_eq!(upstream, "origin/main");
+    }
+
+    #[tokio::test]
+    async fn git_push_failure_returns_raw_error_and_keeps_local_commit() {
+        let dir = init_repo();
+        let cwd = path(&dir);
+        git(&dir, &["remote", "add", "origin", "/nonexistent/path/to/remote.git"]);
+
+        let head_before = git(&dir, &["rev-parse", "HEAD"]);
+        let result = git_push(&cwd, "origin").await;
+        assert_eq!(result.push_status, GitPushStatus::Failed);
+        assert_eq!(result.remote, "origin");
+        assert!(!result.upstream_created);
+        let push_error = result.push_error.expect("push error");
+        assert!(!push_error.contains("Commit failed"));
+
+        let head_after = git(&dir, &["rev-parse", "HEAD"]);
+        assert_eq!(head_after, head_before);
     }
 }

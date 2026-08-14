@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.2.20-tauri] - 2026-08-14
+
+### Added
+- 同步上游 Electron 版 v1.2.20 的功能（`davidhoo/buddy`），版本号对齐上游 v1.2.20
+- 独立「推送待推送的提交」入口：工作区干净且本地领先（ahead/new_branch）时，文件状态区显示推送入口与新组件 `PushModal`；新增命令 `buddy_git_push_availability`（fetch 后比较本地 HEAD 与目标远端分支，fetch 失败上浮报错而非伪装可推送）与 `buddy_git_push`（只推已有提交，不产生新提交、不改动工作区，失败保留原始 Git stderr）；推送参数解析抽出 `resolve_push_args` 供「提交后推送」与「独立推送」共用，首次推送与 alternate-remote 语义不分叉
+- 提交弹窗远端下拉项同时展示脱敏后的 push URL（HTTP(S) 去除 userinfo 凭据，SSH/scp 风格原样显示）；option value 与项目级选择记忆仍只用 remote 名称
+- 测试：Rust 327 → 338，前端 200 → 230（新增 push-modal 测试与 file-status 待推送入口用例）
+
+### Fixed
+- 同步上游热修 `e7bd48c0`（上游记为 1.2.21）：修复 Git 状态从加载中变为已加载时，`FileStatus` 条件调用 hooks 导致 React #310、整个界面无法渲染的问题——推送检测相关 hooks（`useMemo` / `useGitPushAvailability`）上移到早退 return 之前，`gitStatus` 访问改为可选链
+- 修复既有 flaky 测试 `commit_message::tests::timeout_error_when_actor_runs_past_deadline`：脚本改为 `exec sleep 60`，避免 sh 被 SIGTERM 后孤儿 `sleep` 持有 stdout 管道导致 reader 阻塞 60s（干净树上约 4/5 概率失败，与本次功能无关）
+
 ## [1.2.19-tauri] - 2026-08-13
 
 ### Added

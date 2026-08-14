@@ -167,6 +167,8 @@ pub fn run() {
             commands::buddy_git_branches,
             commands::buddy_git_checkout,
             commands::buddy_git_create_branch,
+            commands::buddy_git_push_availability,
+            commands::buddy_git_push,
             commands::buddy_generate_commit_message,
             commands::buddy_cancel_generate_commit_message,
             commands::buddy_test_launcher,

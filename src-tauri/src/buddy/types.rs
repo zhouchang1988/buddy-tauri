@@ -633,3 +633,51 @@ pub struct GitCommitPushResult {
     pub upstream_created: bool,
     pub push_error: Option<String>,
 }
+
+/// 独立「推送已有提交」入口的远端可推性状态（v1.2.20）。
+/// fetch 本身失败不映射为某个 state, 而是让查询报错,
+/// 由调用方呈现「检查远端状态失败」而非伪装成可推送或已同步。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum GitPushAvailabilityState {
+    /// 本地领先, 远端未领先
+    #[serde(rename = "ahead")]
+    Ahead,
+    /// 本地与远端同步
+    #[serde(rename = "up_to_date")]
+    UpToDate,
+    /// 仅落后
+    #[serde(rename = "behind")]
+    Behind,
+    /// 双方都有各自提交
+    #[serde(rename = "diverged")]
+    Diverged,
+    /// 远端尚无目标分支, 首次推送
+    #[serde(rename = "new_branch")]
+    NewBranch,
+    /// 无有效 HEAD / 分离 HEAD 等不可推送情形
+    #[serde(rename = "unavailable")]
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitPushAvailability {
+    pub state: GitPushAvailabilityState,
+    pub remote: String,
+    pub branch: String,
+    pub ahead: u64,
+    pub behind: u64,
+    /// 本次推送是否会在成功后建立 upstream (仅无 upstream 的非分离 HEAD 首次推送为 true)。
+    pub upstream_created_on_push: bool,
+}
+
+/// 独立推送结果: 只推当前 HEAD, 不产生新提交、不改动工作区。
+/// push_status 只会是 Pushed / Failed (复用 GitPushStatus, wire 格式一致)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitPushResult {
+    pub push_status: GitPushStatus,
+    pub remote: String,
+    pub upstream_created: bool,
+    pub push_error: Option<String>,
+}

@@ -14,9 +14,20 @@ vi.mock('../../../src/hooks/useI18n', () => ({
 }))
 
 let commitPushMock: Mock<(...args: unknown[]) => unknown>
+let pushAvailData: import('../../../src/shared/types').GitPushAvailability | undefined = undefined
+let pushAvailLoading = false
+let pushAvailError = false
+const pushAvailRefetch = vi.fn()
 vi.mock('../../../src/hooks/useBuddy', () => ({
   useGitStageAll: () => ({ mutateAsync: vi.fn() }),
   useGitCommitAndPush: () => ({ mutateAsync: (...args: unknown[]) => commitPushMock(...args) }),
+  useGitPushAvailability: vi.fn(() => ({
+    data: pushAvailData,
+    isLoading: pushAvailLoading,
+    isError: pushAvailError,
+    error: pushAvailError ? new Error('boom') : null,
+    refetch: pushAvailRefetch,
+  })),
 }))
 
 vi.mock('../../../src/lib/api', () => ({
@@ -38,8 +49,10 @@ vi.mock('../../../src/components/BranchModal', () => ({
   BranchModal: () => null,
 }))
 
-import { CommitModal } from '../../../src/components/FileStatus'
+import { CommitModal, FileStatus } from '../../../src/components/FileStatus'
 import { api } from '../../../src/lib/api'
+import { useGitPushAvailability } from '../../../src/hooks/useBuddy'
+import type { GitPushAvailability } from '../../../src/shared/types'
 
 function makeGitStatus(): GitStatusResult {
   return {
@@ -420,7 +433,7 @@ describe('CommitModal remote display', () => {
     expect(screen.getByText(/git\.noRemote/)).toBeTruthy()
   })
 
-  it('shows the single remote by name (no URL) and enables push', () => {
+  it('shows the single remote name with its push URL and enables push', () => {
     renderModal({ gitStatus: { ...makeGitStatus(), remotes: [{ name: 'origin', url: 'git@github.com:test/repo.git' }] } })
     expect(screen.getByText('git.remote')).toBeTruthy()
     // find the remote select by its origin option
@@ -428,32 +441,35 @@ describe('CommitModal remote display', () => {
     const select = selects.find(s => Array.from(s.options).some(o => o.value === 'origin')) as HTMLSelectElement
     expect(select).toBeTruthy()
     expect(select.value).toBe('origin')
-    expect(select.options[0].textContent).toBe('origin')
-    // 不显示 URL
-    expect(document.body.textContent).not.toContain('git@github.com')
+    expect(select.options[0].value).toBe('origin')
+    // option 文案 = remote 名称 + 两个空格 + Git 地址
+    expect(select.options[0].textContent).toBe('origin  git@github.com:test/repo.git')
     const pushLabel = screen.getByText('git.push').closest('label') as HTMLElement
     const pushCheckbox = pushLabel.querySelector('input[type="checkbox"]') as HTMLInputElement
     expect(pushCheckbox.disabled).toBe(false)
   })
 
-  it('marks only the upstream remote with (remote/branch)', () => {
+  it('marks only the upstream remote with (remote/branch) and shows each URL', () => {
     renderModal({
       gitStatus: {
         ...makeGitStatus(),
         upstream: { remote: 'origin', branch: 'main' },
         remotes: [
           { name: 'origin', url: 'git@github.com:test/origin.git' },
-          { name: 'backup', url: 'git@github.com:test/backup.git' }
+          { name: 'backup', url: 'https://github.com/test/backup.git' }
         ]
       }
     })
     const selects = Array.from(document.querySelectorAll('select'))
     const select = selects.find(s => Array.from(s.options).some(o => o.value === 'origin')) as HTMLSelectElement
     const labels = Array.from(select.options).map(o => o.textContent)
-    expect(labels).toEqual(['origin (origin/main)', 'backup'])
+    expect(labels).toEqual([
+      'origin (origin/main)  git@github.com:test/origin.git',
+      'backup  https://github.com/test/backup.git',
+    ])
   })
 
-  it('shows only remote names when upstream is null', () => {
+  it('shows each remote name with its URL when upstream is null', () => {
     renderModal({
       gitStatus: {
         ...makeGitStatus(),
@@ -467,9 +483,30 @@ describe('CommitModal remote display', () => {
     const selects = Array.from(document.querySelectorAll('select'))
     const select = selects.find(s => Array.from(s.options).some(o => o.value === 'origin')) as HTMLSelectElement
     const labels = Array.from(select.options).map(o => o.textContent)
-    expect(labels).toEqual(['origin', 'backup'])
-    // 不出现括号标记
+    expect(labels).toEqual([
+      'origin  git@github.com:test/origin.git',
+      'backup  git@github.com:test/backup.git',
+    ])
+    // 无 upstream 时不出现括号标记
     expect(document.body.textContent).not.toContain('(origin/')
+  })
+
+  it('strips HTTP(S) userinfo from the displayed URL', () => {
+    renderModal({
+      gitStatus: {
+        ...makeGitStatus(),
+        remotes: [
+          { name: 'private', url: 'https://alice:secret@example.com/org/repo.git' },
+        ],
+      },
+    })
+    const selects = Array.from(document.querySelectorAll('select'))
+    const select = selects.find(s => Array.from(s.options).some(o => o.value === 'private')) as HTMLSelectElement
+    expect(select.options[0].textContent).toBe('private  https://example.com/org/repo.git')
+    expect(select.options[0].value).toBe('private')
+    // 凭据(用户名/令牌)不得出现在界面上
+    expect(document.body.textContent).not.toContain('alice')
+    expect(document.body.textContent).not.toContain('secret')
   })
 
   it('keeps remote label and select on the same row, separate from the bottom push row', () => {
@@ -657,5 +694,194 @@ describe('CommitModal commit allowed while task running', () => {
     await waitFor(() => expect(commitPushMock).toHaveBeenCalled())
     // 确认提交仍调用 stage + commitAndPush
     expect(api.gitStageFiles).toHaveBeenCalledWith('/tmp/repo', expect.any(Array))
+  })
+})
+
+function makeCleanGitStatus(overrides: Partial<GitStatusResult> = {}): GitStatusResult {
+  return {
+    branch: 'main',
+    diff: null,
+    staged: null,
+    untracked: 0,
+    files: [],
+    remotes: [{ name: 'origin', url: 'git@github.com:test/repo.git' }],
+    upstream: null,
+    ...overrides,
+  }
+}
+
+function makeAvail(overrides: Partial<GitPushAvailability> = {}): GitPushAvailability {
+  return {
+    state: 'ahead',
+    remote: 'origin',
+    branch: 'main',
+    ahead: 1,
+    behind: 0,
+    upstreamCreatedOnPush: false,
+    ...overrides,
+  }
+}
+
+function resetPushAvail() {
+  pushAvailData = undefined
+  pushAvailLoading = false
+  pushAvailError = false
+  pushAvailRefetch.mockClear()
+  vi.mocked(useGitPushAvailability).mockClear()
+}
+
+function renderFileStatus(overrides: Record<string, unknown> = {}) {
+  const onOpenCommit = vi.fn()
+  const onOpenPush = vi.fn()
+  const props = {
+    gitStatus: makeCleanGitStatus(),
+    isLoading: false,
+    repoRoot: '/tmp/repo',
+    onOpenCommit,
+    onOpenPush,
+    ...overrides,
+  }
+  render(<FileStatus {...props} />)
+  return { onOpenCommit, onOpenPush, props }
+}
+
+describe('FileStatus pending-push entry', () => {
+  beforeEach(() => {
+    const store = new Map<string, string>()
+    Object.defineProperty(window, 'localStorage', {
+      configurable: true,
+      value: {
+        getItem: vi.fn((key: string) => store.get(key) ?? null),
+        setItem: vi.fn((key: string, value: string) => store.set(key, value)),
+        removeItem: vi.fn((key: string) => store.delete(key)),
+        clear: vi.fn(() => store.clear()),
+      },
+    })
+    resetPushAvail()
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+  })
+
+  it('hides push entry when there are changes; commit button stays enabled', () => {
+    pushAvailData = makeAvail()
+    renderFileStatus({ gitStatus: makeGitStatus() })
+    expect(screen.queryByText(/git\.pushPending/)).toBeNull()
+    const commitBtn = screen.getByText('git.commit').closest('button') as HTMLButtonElement
+    expect(commitBtn.disabled).toBe(false)
+  })
+
+  it('keeps hook order stable when Git status finishes loading', () => {
+    const { rerender } = render(
+      <FileStatus
+        gitStatus={undefined}
+        isLoading={true}
+        repoRoot="/tmp/repo"
+        onOpenCommit={vi.fn()}
+        onOpenPush={vi.fn()}
+      />
+    )
+
+    expect(() => {
+      rerender(
+        <FileStatus
+          gitStatus={makeCleanGitStatus()}
+          isLoading={false}
+          repoRoot="/tmp/repo"
+          onOpenCommit={vi.fn()}
+          onOpenPush={vi.fn()}
+        />
+      )
+    }).not.toThrow()
+  })
+
+  it('shows push entry with ahead count when clean and ahead; click carries detect remote', () => {
+    pushAvailData = makeAvail({ ahead: 3 })
+    const { onOpenPush } = renderFileStatus()
+    const entry = screen.getByText(/git\.pushPending/).closest('button') as HTMLButtonElement
+    expect(entry).toBeTruthy()
+    expect(screen.getByText(/git\.pushAhead/).textContent).toContain('3')
+    fireEvent.click(entry)
+    expect(onOpenPush).toHaveBeenCalledWith('origin')
+  })
+
+  it('shows first-push entry when clean and new_branch', () => {
+    pushAvailData = makeAvail({ state: 'new_branch', ahead: 1 })
+    renderFileStatus()
+    expect(screen.getByText(/git\.pushPending/)).toBeTruthy()
+    expect(screen.getByText(/git\.pushNewBranch/)).toBeTruthy()
+  })
+
+  for (const state of ['up_to_date', 'behind', 'diverged', 'unavailable'] as const) {
+    it(`hides clickable push entry when state is ${state}`, () => {
+      pushAvailData = makeAvail({ state })
+      renderFileStatus()
+      expect(screen.queryByText(/git\.pushPending/)).toBeNull()
+    })
+  }
+
+  it('shows no clickable entry while loading', () => {
+    pushAvailData = undefined
+    pushAvailLoading = true
+    renderFileStatus()
+    expect(screen.queryByText(/git\.pushPending/)).toBeNull()
+    expect(screen.getByText(/git\.pushChecking/)).toBeTruthy()
+  })
+
+  it('shows check-failed error with retry and no push button on fetch error', () => {
+    pushAvailData = undefined
+    pushAvailError = true
+    renderFileStatus()
+    expect(screen.queryByText(/git\.pushPending/)).toBeNull()
+    expect(screen.getByText(/git\.pushCheckFailed/)).toBeTruthy()
+    const retryBtn = screen.getByText('common.retry')
+    fireEvent.click(retryBtn)
+    expect(pushAvailRefetch).toHaveBeenCalled()
+  })
+
+  it('does not enable the push-status query when there are no remotes', () => {
+    renderFileStatus({ gitStatus: makeCleanGitStatus({ remotes: [] }) })
+    expect(useGitPushAvailability).toHaveBeenLastCalledWith('/tmp/repo', null, 'main', false)
+  })
+
+  it('does not enable the push-status query on detached HEAD', () => {
+    renderFileStatus({ gitStatus: makeCleanGitStatus({ branch: 'HEAD' }) })
+    expect(useGitPushAvailability).toHaveBeenLastCalledWith('/tmp/repo', null, 'HEAD', false)
+  })
+
+  it('prefers the upstream remote as detection target', () => {
+    pushAvailData = makeAvail({ remote: 'origin' })
+    const { onOpenPush } = renderFileStatus({
+      gitStatus: makeCleanGitStatus({
+        upstream: { remote: 'origin', branch: 'main' },
+        remotes: [
+          { name: 'backup', url: 'u1' },
+          { name: 'origin', url: 'u2' },
+        ],
+      }),
+    })
+    const entry = screen.getByText(/git\.pushPending/).closest('button') as HTMLButtonElement
+    fireEvent.click(entry)
+    // 检测远端取 upstream.remote (origin)，而非 backup/remotes[0]
+    expect(onOpenPush).toHaveBeenCalledWith('origin')
+  })
+
+  it('falls back to stored lastRemote when no upstream', () => {
+    localStorage.setItem('buddy.lastRemote./tmp/repo', 'backup')
+    pushAvailData = makeAvail({ remote: 'backup' })
+    const { onOpenPush } = renderFileStatus({
+      gitStatus: makeCleanGitStatus({
+        remotes: [
+          { name: 'origin', url: 'u1' },
+          { name: 'backup', url: 'u2' },
+        ],
+      }),
+    })
+    const entry = screen.getByText(/git\.pushPending/).closest('button') as HTMLButtonElement
+    fireEvent.click(entry)
+    expect(onOpenPush).toHaveBeenCalledWith('backup')
   })
 })

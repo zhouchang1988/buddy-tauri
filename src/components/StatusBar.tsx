@@ -3,6 +3,7 @@ import { Check, Copy, Play, RotateCw } from 'lucide-react'
 import { TaskState, TaskSettings, TaskStatus, Event, Failure, GlobalSettings } from '../shared/types'
 import { ResizeHandle } from './ResizeHandle'
 import { FileStatus as FileStatusSection, CommitModal, type CommitFeedback } from './FileStatus'
+import { PushModal } from './PushModal'
 import { TaskStatusIcon } from './TaskStatusIcon'
 import { useGitStatus, type GitStatusResult } from '../hooks/useBuddy'
 import {
@@ -91,6 +92,8 @@ export function StatusBar({
   const repoRoot = taskState?.repo_root || null
   const { data: gitStatus, isLoading: isGitLoading } = useGitStatus(repoRoot)
   const [showCommitModal, setShowCommitModal] = useState(false)
+  const [showPushModal, setShowPushModal] = useState(false)
+  const [pushRemote, setPushRemote] = useState('')
   const [commitFeedback, setCommitFeedback] = useState<CommitFeedback | null>(null)
   // 任务执行中(RUNNING_* / PINGING)时禁止提交,COUNTDOWN 是人工介入窗口,允许提交
   const status = taskState?.status
@@ -189,6 +192,7 @@ export function StatusBar({
           isLoading={isGitLoading}
           repoRoot={repoRoot}
           onOpenCommit={() => { setCommitFeedback(null); setShowCommitModal(true) }}
+          onOpenPush={(remote) => { setPushRemote(remote); setShowPushModal(true); setCommitFeedback(null) }}
           commitFeedback={commitFeedback}
           onDismissFeedback={() => setCommitFeedback(null)}
         />
@@ -220,6 +224,24 @@ export function StatusBar({
             })
           }}
           onSuccess={(msg) => { setCommitFeedback({ type: 'success', message: msg, repoRoot: repoRoot || '' }); setShowCommitModal(false) }}
+         onError={(msg) => { setCommitFeedback({ type: 'error', message: msg, repoRoot: repoRoot || '' }) }}
+       />
+     )}
+      {showPushModal && gitStatus && repoRoot && (
+        <PushModal
+          gitStatus={gitStatus}
+          repoRoot={repoRoot}
+          initialRemote={pushRemote}
+          onClose={() => {
+            setShowPushModal(false)
+            requestAnimationFrame(() => {
+              const active = document.activeElement
+              if (active instanceof HTMLElement && active.closest('details')) {
+                active.blur()
+              }
+            })
+          }}
+          onSuccess={(msg) => { setCommitFeedback({ type: 'success', message: msg, repoRoot: repoRoot || '' }); setShowPushModal(false) }}
           onError={(msg) => { setCommitFeedback({ type: 'error', message: msg, repoRoot: repoRoot || '' }) }}
         />
       )}

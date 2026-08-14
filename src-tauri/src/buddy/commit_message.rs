@@ -1250,7 +1250,10 @@ mod tests {
         let dir = init_repo();
         let cwd = path(&dir);
         std::fs::write(dir.path().join("a.txt"), "hello\nworld\n").unwrap();
-        let script = write_script(dir.path(), "claude", "#!/bin/sh\nsleep 60\n");
+        // `exec` replaces sh with sleep so the timeout's SIGTERM kills the
+        // process itself; a plain `sleep 60` would leave an orphaned
+        // grandchild holding the stdout pipe open and flake the elapsed assert.
+        let script = write_script(dir.path(), "claude", "#!/bin/sh\nexec sleep 60\n");
         let started = std::time::Instant::now();
         let error = generate_commit_message_with_actor(&actor_input(&cwd, "claude", &script, &["a.txt"]))
             .await
