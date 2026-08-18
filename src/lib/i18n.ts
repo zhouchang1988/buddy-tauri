@@ -38,6 +38,18 @@ export function resolveLanguage(pref: LanguagePref): Language {
   return pref === 'auto' ? detectLanguage() : pref
 }
 
+export const LANGUAGE_STORAGE_KEY = 'buddy.language'
+
+// For non-React code (e.g. tauri-bridge) that needs the active UI language.
+export function currentLanguage(): Language {
+  let pref: LanguagePref = 'auto'
+  try {
+    const v = typeof window !== 'undefined' ? window.localStorage?.getItem(LANGUAGE_STORAGE_KEY) : null
+    if (v === 'auto' || v === 'zh-CN' || v === 'zh-TW' || v === 'en') pref = v
+  } catch { /* ignore */ }
+  return resolveLanguage(pref)
+}
+
 const en = {
   // Common
   'common.cancel': 'Cancel',
@@ -58,6 +70,9 @@ const en = {
   'common.required': 'Required',
   'common.copy': 'Copy',
   'common.select': 'Select',
+
+  // Native dialogs
+  'dialog.selectWorkspace.title': 'Select working directory',
 
   // App / branding
   'app.brand': 'Buddy',
@@ -516,6 +531,8 @@ const zhCN: typeof en = {
   'common.copy': '复制',
   'common.select': '选择',
 
+  // Native dialogs
+  'dialog.selectWorkspace.title': '选择工作目录',
   'app.brand': 'Buddy',
   'app.tagline': 'Coding Agent 协作台',
 
@@ -952,6 +969,8 @@ const zhTW: typeof en = {
   'common.copy': '複製',
   'common.select': '選擇',
 
+  // Native dialogs
+  'dialog.selectWorkspace.title': '選擇工作目錄',
   'app.brand': 'Buddy',
   'app.tagline': 'Coding Agent 協作台',
 

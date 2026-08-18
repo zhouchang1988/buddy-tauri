@@ -111,7 +111,7 @@ READY → RUNNING_{ACTOR} → (READY | PAUSED | DONE)
 - **Atomic writes**: Always write JSON via `.tmp` → `rename`, never direct write.
 - **Schemas**: Defined in `src-tauri/src/buddy/schemas.rs`. Validate on read, not write.
 - **Sensitive data**: API keys are automatically redacted from event logs by `redact.rs`.
-- **i18n**: UI text goes through the `useI18n` hook. The prompt builder detects human language and instructs actors to reply in the same language.
+- **i18n**: UI text goes through the `useI18n` hook. The prompt builder detects human language and instructs actors to reply in the same language. Native macOS dialogs (e.g. the directory picker) get a localized title from `currentLanguage()`/`translate()` in `tauri-bridge.ts`, and `src-tauri/Info.plist` declares `CFBundleLocalizations` (en/zh-Hans/zh-Hant) so AppKit localizes panel buttons to the system language.
 - **Command naming**: `buddy:xxx` ↔ `buddy_xxx`; keep `commands.rs`, `lib.rs`, and `tauri-bridge.ts` in sync.
 - **macOS traffic lights**: `trafficLightPosition.y` in `src-tauri/tauri.conf.json` is `28`, deliberately not the Electron edition's `19`. wry's inset code (`inset_traffic_lights`) lands the buttons 9pt above the configured y, so 28 reproduces the Electron layout (button frame top at 19, vertically centered with the 50px sidebar/titlebar row and its `mt-[4px]` toggle buttons).
 - **Tests**: A change is not done until both `pnpm test:rust` and `pnpm test` (plus `pnpm typecheck`) are green. See `docs/TESTING.md`.

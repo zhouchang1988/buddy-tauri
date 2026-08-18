@@ -6,6 +6,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const invokeMock = vi.fn()
 const listenMock = vi.fn()
+const openDialogMock = vi.fn()
 
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: (...args: unknown[]) => invokeMock(...args)
@@ -22,7 +23,7 @@ vi.mock('@tauri-apps/api/window', () => ({
 }))
 
 vi.mock('@tauri-apps/plugin-dialog', () => ({
-  open: vi.fn()
+  open: (...args: unknown[]) => openDialogMock(...args)
 }))
 
 vi.mock('@tauri-apps/plugin-opener', () => ({
@@ -35,6 +36,8 @@ describe('tauri-bridge', () => {
     vi.resetModules()
     invokeMock.mockReset()
     listenMock.mockReset()
+    openDialogMock.mockReset()
+    window.localStorage.clear()
     await import('../../../src/lib/tauri-bridge')
   })
 
@@ -98,6 +101,28 @@ describe('tauri-bridge', () => {
     expect(invokeMock).toHaveBeenCalledWith('updater_install')
     window.api.dismissUpdateError()
     expect(invokeMock).toHaveBeenCalledWith('updater_dismiss_error')
+  })
+
+  it('localizes the directory picker title from the stored language', async () => {
+    openDialogMock.mockResolvedValue('/tmp/repo')
+    window.localStorage.setItem('buddy.language', 'zh-CN')
+
+    await expect(window.api.selectDirectory('/tmp')).resolves.toBe('/tmp/repo')
+    expect(openDialogMock).toHaveBeenCalledWith({
+      directory: true,
+      canCreateDirectories: true,
+      defaultPath: '/tmp',
+      title: '选择工作目录'
+    })
+  })
+
+  it('falls back to the English picker title by default', async () => {
+    openDialogMock.mockResolvedValue(null)
+
+    await expect(window.api.selectDirectory()).resolves.toBeNull()
+    expect(openDialogMock).toHaveBeenCalledWith(
+      expect.objectContaining({ title: 'Select working directory' })
+    )
   })
 
   it('subscribes to buddy:event and forwards only the payload', async () => {

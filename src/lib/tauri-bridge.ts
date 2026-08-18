@@ -12,6 +12,7 @@ import { listen } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import { openUrl, revealItemInDir } from '@tauri-apps/plugin-opener'
+import { currentLanguage, translate } from './i18n'
 import type {
   AttachmentMeta,
   BootstrapResponse,
@@ -115,7 +116,8 @@ const buddy = {
 
 const api = {
   selectDirectory: async (defaultPath?: string): Promise<string | null> => {
-    const selected = await openDialog({ directory: true, canCreateDirectories: true, defaultPath })
+    const title = translate(currentLanguage(), 'dialog.selectWorkspace.title')
+    const selected = await openDialog({ directory: true, canCreateDirectories: true, defaultPath, title })
     return typeof selected === 'string' ? selected : null
   },
   openInFinder: (path: string): Promise<void> =>

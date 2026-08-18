@@ -4,12 +4,13 @@ import {
   LanguagePref,
   SendShortcut,
   TranslationKey,
+  LANGUAGE_STORAGE_KEY,
   detectLanguage,
   resolveLanguage,
   translate
 } from '../lib/i18n'
 
-const LANGUAGE_KEY = 'buddy.language'
+const LANGUAGE_KEY = LANGUAGE_STORAGE_KEY
 const SEND_SHORTCUT_KEY = 'buddy.sendShortcut'
 const LANGUAGE_EVENT = 'buddy.language-change'
 const SEND_SHORTCUT_EVENT = 'buddy.sendShortcut-change'
