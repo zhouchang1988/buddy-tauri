@@ -14,7 +14,7 @@ use tokio::process::Command;
 
 use super::commit_message;
 use super::types::{
-    GitCommitPushResult, GitDiffStats, GitFileStatus, GitPushAvailability,
+    GitCommitPushResult, GitDiffStats, GitFileStatus, GitPendingCommit, GitPushAvailability,
     GitPushAvailabilityState, GitPushResult, GitPushStatus, GitRemote, GitStatusResult,
     GitUpstream,
 };
@@ -482,6 +482,7 @@ pub async fn get_git_push_availability(cwd: &str, remote: &str) -> GitResult<Git
             branch: String::new(),
             ahead: 0,
             behind: 0,
+            pending_commits: Vec::new(),
             upstream_created_on_push: false,
         });
     }
@@ -527,6 +528,7 @@ pub async fn get_git_push_availability(cwd: &str, remote: &str) -> GitResult<Git
             branch: target_branch,
             ahead: u64::from(has_head),
             behind: 0,
+            pending_commits: Vec::new(),
             upstream_created_on_push,
         });
     }
@@ -550,14 +552,90 @@ pub async fn get_git_push_availability(cwd: &str, remote: &str) -> GitResult<Git
     } else {
         GitPushAvailabilityState::UpToDate
     };
+    // 仅在纯 ahead (无分叉) 时取得待推送提交; 分叉直接推送会丢远端提交, 不应诱导核对。
+    // 复用同一 remote_ref/HEAD, 与计数来自同一远端快照。
+    // --reverse 让最旧提交先出现; 不用 --first-parent, 以与 rev-list 计数保持一致。
+    let pending_commits = if state == GitPushAvailabilityState::Ahead {
+        get_pending_commits(cwd, &remote_ref, ahead).await?
+    } else {
+        Vec::new()
+    };
     Ok(GitPushAvailability {
         state,
         remote: remote.to_string(),
         branch: target_branch,
         ahead,
         behind,
+        pending_commits,
         upstream_created_on_push,
     })
+}
+
+/// 解析 `<remote-ref>..HEAD` 范围内、从旧到新的本地独有提交为 { hash, subject }。
+/// 用 NUL 分隔成对解析, 避免提交标题里的空格/制表符/竖线破坏字段拆分。
+/// 输出格式不完整或条数与 ahead 不符时抛错, 不返回部分列表, 以免 UI 误显示已核对完整。
+async fn get_pending_commits(cwd: &str, remote_ref: &str, expected: u64) -> GitResult<Vec<GitPendingCommit>> {
+    // %s 只含提交首行标题, 不含换行; 每条提交输出 <hash>\0<subject>\0 后接一个换行。
+    let output = exec_git(
+        &["log", "--reverse", "--format=%h%x00%s%x00", &format!("{remote_ref}..HEAD")],
+        cwd,
+        1,
+    )
+    .await?;
+    parse_pending_commits(&output, remote_ref, expected)
+}
+
+/// 纯解析: 把 `git log --format=%h%x00%s%x00` 的输出切成 { hash, subject }。
+/// 抽出为独立函数以便对截断/不完整输出做单元测试。
+///
+/// 完整输出形如 `hash\0subject\0\nhash\0subject\0\n` (每条两个 NUL 后接换行),
+/// split(NUL) 后得到 `2N+1` 个 token: N 个 hash、N 个 subject、末尾一个空串。
+/// 缺任一 NUL (如输出被截断成 `hash\0`) 会破坏该结构, 必须抛错而非吞掉。
+fn parse_pending_commits(output: &str, remote_ref: &str, expected: u64) -> GitResult<Vec<GitPendingCommit>> {
+    if output.is_empty() {
+        return Err(GitError(format!(
+            "git log {remote_ref}..HEAD produced empty output"
+        )));
+    }
+    // exec_git 会 trim 掉 stdout 首尾空白, 但记录间的换行 (非首条 hash 前) 仍在。
+    // 先归一化末尾换行, 再按 NUL 切分: 完整 N 条 → 2N 个 token + 末尾空串。
+    let tokens: Vec<&str> = output.trim_end_matches('\n').split('\0').collect();
+    let last = tokens.last().copied().unwrap_or("");
+    if last != "" {
+        // 末尾非空说明最后一条记录缺结尾 NUL (如截断成 `hash\0subject`)。
+        return Err(GitError(format!(
+            "git log {remote_ref}..HEAD produced malformed output: {output:?}"
+        )));
+    }
+    let pairs = tokens.len() - 1; // 去掉末尾空 token
+    if pairs % 2 != 0 {
+        // 奇数: 某条记录缺了 subject NUL (如截断成 `hash\0`)。
+        return Err(GitError(format!(
+            "git log {remote_ref}..HEAD produced unpaired fields: {output:?}"
+        )));
+    }
+    let mut commits = Vec::with_capacity(pairs / 2);
+    let mut i = 0;
+    while i < pairs {
+        // 记录间的换行残留在非首条 hash 前部; 清掉后 hash 须非空 (7 位短 SHA)。
+        let hash = tokens[i].replace('\n', "").trim().to_string();
+        let subject = tokens[i + 1].to_string();
+        if hash.is_empty() {
+            return Err(GitError(format!(
+                "git log {remote_ref}..HEAD produced empty hash in record: {:?}",
+                tokens[i]
+            )));
+        }
+        commits.push(GitPendingCommit { hash, subject });
+        i += 2;
+    }
+    if commits.len() as u64 != expected {
+        return Err(GitError(format!(
+            "git log {remote_ref}..HEAD parsed {} commits but ahead count is {expected}",
+            commits.len()
+        )));
+    }
+    Ok(commits)
 }
 
 /// Port of `gitPush` (v1.2.20): 独立推送当前 HEAD: 只推已有提交, 不调用
@@ -1270,6 +1348,9 @@ mod tests {
         assert_eq!(avail.remote, "origin");
         assert_eq!(avail.branch, "main");
         assert!(!avail.upstream_created_on_push);
+        assert_eq!(avail.pending_commits.len(), 1);
+        assert_eq!(avail.pending_commits[0].subject, "ahead");
+        assert!(avail.pending_commits[0].hash.len() == 7);
     }
 
     #[tokio::test]
@@ -1300,6 +1381,8 @@ mod tests {
         assert_eq!(behind.state, GitPushAvailabilityState::Behind);
         assert_eq!(behind.ahead, 0);
         assert_eq!(behind.behind, 1);
+        // 落后时不列出待推送提交。
+        assert!(behind.pending_commits.is_empty());
 
         // Now dir also adds a local commit → diverged.
         std::fs::write(dir.path().join("other.txt"), "local\n").unwrap();
@@ -1309,6 +1392,8 @@ mod tests {
         assert_eq!(diverged.state, GitPushAvailabilityState::Diverged);
         assert_eq!(diverged.ahead, 1);
         assert_eq!(diverged.behind, 1);
+        // 分叉时 (ahead>0 && behind>0) 不列出待推送提交: 直接推送会丢弃远端提交, 不应诱导用户核对。
+        assert!(diverged.pending_commits.is_empty());
     }
 
     #[tokio::test]
@@ -1324,6 +1409,8 @@ mod tests {
         assert_eq!(avail.ahead, 1);
         assert_eq!(avail.behind, 0);
         assert!(avail.upstream_created_on_push);
+        // 远端尚无目标分支: 不以 HEAD 全历史冒充待推送提交。
+        assert!(avail.pending_commits.is_empty());
     }
 
     #[tokio::test]
@@ -1344,6 +1431,8 @@ mod tests {
         assert_eq!(avail.branch, "main");
         assert_eq!(avail.ahead, 1);
         assert_eq!(avail.behind, 0);
+        assert_eq!(avail.pending_commits.len(), 1);
+        assert_eq!(avail.pending_commits[0].subject, "local");
 
         // origin upstream untouched.
         let upstream = git(&dir, &["rev-parse", "--abbrev-ref", "main@{upstream}"]);
@@ -1361,6 +1450,7 @@ mod tests {
         assert_eq!(avail.state, GitPushAvailabilityState::UpToDate);
         assert_eq!(avail.ahead, 0);
         assert_eq!(avail.behind, 0);
+        assert!(avail.pending_commits.is_empty());
     }
 
     #[tokio::test]
@@ -1374,6 +1464,7 @@ mod tests {
         let avail = get_git_push_availability(&cwd, "origin").await.unwrap();
         assert_eq!(avail.state, GitPushAvailabilityState::Unavailable);
         assert_eq!(avail.branch, "");
+        assert!(avail.pending_commits.is_empty());
     }
 
     #[tokio::test]
@@ -1383,6 +1474,65 @@ mod tests {
         git(&dir, &["remote", "add", "origin", "/nonexistent/path/to/remote.git"]);
 
         assert!(get_git_push_availability(&cwd, "origin").await.is_err());
+    }
+
+    #[test]
+    fn parse_pending_commits_handles_complete_and_multi_record_output() {
+        let n = '\0';
+        let ref_name = "refs/remotes/origin/main";
+        // exec_git trim 掉末尾换行后的真实形态 (单条)。
+        let single = format!("3bb3aed{n}first local{n}");
+        assert_eq!(
+            parse_pending_commits(&single, ref_name, 1).unwrap(),
+            vec![GitPendingCommit { hash: "3bb3aed".into(), subject: "first local".into() }]
+        );
+        // 原始 git 输出带末尾换行, 以及记录间换行残留在非首条 hash 前部。
+        let multi = format!("3bb3aed{n}first local{n}\n2b3dd5a{n}second local{n}\n");
+        assert_eq!(
+            parse_pending_commits(&multi, ref_name, 2).unwrap(),
+            vec![
+                GitPendingCommit { hash: "3bb3aed".into(), subject: "first local".into() },
+                GitPendingCommit { hash: "2b3dd5a".into(), subject: "second local".into() },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_pending_commits_preserves_subjects_with_special_characters() {
+        let n = '\0';
+        let ref_name = "refs/remotes/origin/main";
+        // 标题里同时含空格、制表符和竖线, 证明不靠这些字符拆分字段。
+        let subject = "fix: spaces | pipe\ttab char";
+        let output = format!("3bb3aed{n}second{n}\n2b3dd5a{n}{subject}{n}");
+        let commits = parse_pending_commits(&output, ref_name, 2).unwrap();
+        assert_eq!(commits[0].subject, "second");
+        assert_eq!(commits[1].subject, subject);
+        // 标题是单个空格也完整保留。
+        let space = format!("3bb3aed{n} {n}");
+        let single = parse_pending_commits(&space, ref_name, 1).unwrap();
+        assert_eq!(single[0].subject, " ");
+    }
+
+    #[test]
+    fn parse_pending_commits_rejects_empty_or_truncated_output() {
+        let n = '\0';
+        let ref_name = "refs/remotes/origin/main";
+        assert!(parse_pending_commits("", ref_name, 1).is_err());
+        // 截断成 `hash\0` (缺 subject NUL) → 字段不配对。
+        assert!(parse_pending_commits(&format!("3bb3aed{n}"), ref_name, 1).is_err());
+        // 截断成 `hash\0subject` (缺结尾 NUL) → 末尾非空。
+        assert!(parse_pending_commits(&format!("3bb3aed{n}first local"), ref_name, 1).is_err());
+        // 空 hash 记录。
+        assert!(parse_pending_commits(&format!("{n}first local{n}"), ref_name, 1).is_err());
+    }
+
+    #[test]
+    fn parse_pending_commits_rejects_count_mismatch() {
+        let n = '\0';
+        let ref_name = "refs/remotes/origin/main";
+        let output = format!("3bb3aed{n}first local{n}\n2b3dd5a{n}second local{n}");
+        // 解析出 2 条但 ahead 计数为 1 → 抛错, 不返回部分列表。
+        assert!(parse_pending_commits(&output, ref_name, 1).is_err());
     }
 
     #[tokio::test]

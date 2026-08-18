@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.2.22-tauri] - 2026-08-18
+
+### Added
+- 同步上游 Electron 版 v1.2.22（`davidhoo/buddy`）的「待推送提交列表」功能：检测到本地领先远端（ahead）时，`PushModal` 按从旧到新展示各待推送提交的短 SHA 与标题，推送前即可看清本次实际会推上去哪些提交
+- 后端基于同一远端快照获取 `pendingCommits`（`git log --reverse --format=%h%x00%s%x00 <remote-ref>..HEAD`），与 push 可用性判定共用一次 fetch，不额外触发网络操作、不改写 push 与 Git 配置行为；仅纯 ahead（无分叉）时列出，分叉直接推送会丢远端提交，不诱导核对
+
+### Fixed
+- 移植上游 `parsePendingCommits` 的严格校验（上游提交 `3097aea6`）：遇到空输出、孤立 `hash\0`、缺结尾 NUL 的 `hash\0subject`、空 hash 记录或条数与 ahead 计数不符时直接抛错拒绝，不再静默生成 `{ hash, subject: '' }` 蒙混过计数检查；抽为纯函数 `parse_pending_commits` 并补充回归测试
+
+## [1.2.21-tauri] - 2026-08-17
+
+### Changed
+- 版本号对齐上游 v1.2.21。上游 v1.2.21 的唯一功能改动（`FileStatus` hook 顺序修复，上游提交 `e7bd48c0`）已随 1.2.20-tauri 提前合入，本次仅为版本号对齐，无代码变化
+
 ## [1.2.20-tauri] - 2026-08-14
 
 ### Added

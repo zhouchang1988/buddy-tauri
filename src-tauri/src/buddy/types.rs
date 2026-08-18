@@ -659,6 +659,14 @@ pub enum GitPushAvailabilityState {
     Unavailable,
 }
 
+/// 一条尚未推送的本地提交: 7 位短 SHA 与完整标题 (subject)。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GitPendingCommit {
+    pub hash: String,
+    pub subject: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GitPushAvailability {
@@ -667,6 +675,10 @@ pub struct GitPushAvailability {
     pub branch: String,
     pub ahead: u64,
     pub behind: u64,
+    /// 仅 ahead 时为 `<remote-ref>..HEAD` 范围内、从旧到新的本地独有提交;
+    /// 其余状态 (含 new_branch/同步/落后/分叉/不可用) 一律为 []。
+    /// 解析失败时让 get_git_push_availability 抛错, 不返回部分列表。
+    pub pending_commits: Vec<GitPendingCommit>,
     /// 本次推送是否会在成功后建立 upstream (仅无 upstream 的非分离 HEAD 首次推送为 true)。
     pub upstream_created_on_push: bool,
 }
