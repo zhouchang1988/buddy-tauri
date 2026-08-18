@@ -160,6 +160,8 @@ struct GlobalSettingsWire {
     system_notifications_enabled: bool,
     max_upgrade_retries: Option<u32>,
     custom_prompt: Option<String>,
+    custom_prompt_implementer: Option<String>,
+    custom_prompt_reviewer: Option<String>,
 }
 
 fn default_countdown_seconds() -> u64 {
@@ -179,10 +181,15 @@ fn default_true() -> bool {
 }
 
 /// Validates raw JSON into `GlobalSettings` with the zod schema defaults.
-/// `custom_prompt` is trimmed and normalized to `None` when empty, mirroring
-/// the zod `.trim().transform((v) => (v ? v : undefined))` chain.
+/// The custom prompts are trimmed and normalized to `None` when empty,
+/// mirroring the zod `.trim().transform((v) => (v ? v : undefined))` chain.
 pub fn parse_global_settings(input: &serde_json::Value) -> Result<GlobalSettings, SchemaError> {
     let wire: GlobalSettingsWire = serde_json::from_value(input.clone())?;
+    fn normalize_prompt(prompt: Option<String>) -> Option<String> {
+        prompt
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+    }
     Ok(GlobalSettings {
         protocol_version: Some(wire.protocol_version),
         countdown_seconds: Some(wire.countdown_seconds),
@@ -203,10 +210,9 @@ pub fn parse_global_settings(input: &serde_json::Value) -> Result<GlobalSettings
         auto_generate_commit_message: Some(wire.auto_generate_commit_message),
         system_notifications_enabled: Some(wire.system_notifications_enabled),
         max_upgrade_retries: wire.max_upgrade_retries,
-        custom_prompt: wire
-            .custom_prompt
-            .map(|prompt| prompt.trim().to_string())
-            .filter(|prompt| !prompt.is_empty()),
+        custom_prompt: normalize_prompt(wire.custom_prompt),
+        custom_prompt_implementer: normalize_prompt(wire.custom_prompt_implementer),
+        custom_prompt_reviewer: normalize_prompt(wire.custom_prompt_reviewer),
     })
 }
 
@@ -403,5 +409,19 @@ mod tests {
             populated.custom_prompt.as_deref(),
             Some("Always run tests.")
         );
+    }
+
+    #[test]
+    fn normalizes_role_specific_custom_prompts() {
+        let settings = parse_global_settings(&json!({
+            "custom_prompt_implementer": "  Implement carefully.  ",
+            "custom_prompt_reviewer": "   "
+        }))
+        .unwrap();
+        assert_eq!(
+            settings.custom_prompt_implementer.as_deref(),
+            Some("Implement carefully.")
+        );
+        assert_eq!(settings.custom_prompt_reviewer, None);
     }
 }

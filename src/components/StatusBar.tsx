@@ -414,12 +414,12 @@ function EventLog({ events, t, lang }: { events: Event[]; t: TFunction; lang: La
   // log shows only user-meaningful lifecycle events.
   const visibleEvents = events.filter((event) => !isHiddenEvent(event.type))
   if (!visibleEvents.length) {
-    return <div className="px-4 pb-4 text-xs text-fg-muted">{t('statusBar.eventsEmpty')}</div>
+    return <div className="px-4 pt-1.5 pb-4 text-xs text-fg-muted">{t('statusBar.eventsEmpty')}</div>
   }
   const canExpand = visibleEvents.length > 10
   const displayed = expanded ? [...visibleEvents].reverse() : visibleEvents.slice(-10).reverse()
   return (
-    <div className="px-4 pb-3 space-y-2">
+    <div className="px-4 pt-1.5 pb-3 space-y-2">
       {displayed.map((event) => {
         const failed =
           event.type?.endsWith('.failed') ||

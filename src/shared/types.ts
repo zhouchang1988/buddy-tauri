@@ -195,6 +195,8 @@ export interface GlobalSettings {
   system_notifications_enabled?: boolean
   max_upgrade_retries?: number
   custom_prompt?: string
+  custom_prompt_implementer?: string
+  custom_prompt_reviewer?: string
 }
 
 export interface BuddyError {

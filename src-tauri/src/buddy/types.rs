@@ -386,6 +386,10 @@ pub struct GlobalSettings {
     pub max_upgrade_retries: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_prompt_implementer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_prompt_reviewer: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

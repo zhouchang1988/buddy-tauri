@@ -243,18 +243,34 @@ pub fn build_actor_prompt(input: &BuildActorPromptInput) -> String {
         ));
     }
 
-    // User-defined custom prompt, appended verbatim after the system prompt so
-    // it applies to every actor on every round. Optional; omitted when empty.
-    let custom_prompt = input
-        .global_settings
-        .as_ref()
-        .and_then(|g| g.custom_prompt.as_deref())
-        .map(str::trim)
-        .filter(|p| !p.is_empty());
-    if let Some(custom_prompt) = custom_prompt {
+    // User-defined custom prompts, appended verbatim after the system prompt.
+    // `custom_prompt` applies to every actor on every round; the implementer /
+    // reviewer prompts only apply to the actor playing that role. All are
+    // optional and omitted when empty.
+    let global = input.global_settings.as_ref();
+    fn non_empty(prompt: Option<&String>) -> Option<&str> {
+        let trimmed = prompt?.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    }
+    let shared_prompt = global.and_then(|g| non_empty(g.custom_prompt.as_ref()));
+    let role_prompt = if input.actor == implementer_actor(settings) {
+        global.and_then(|g| non_empty(g.custom_prompt_implementer.as_ref()))
+    } else {
+        global.and_then(|g| non_empty(g.custom_prompt_reviewer.as_ref()))
+    };
+    if shared_prompt.is_some() || role_prompt.is_some() {
         parts.push(String::new());
         parts.push("## Custom instructions".to_string());
-        parts.push(custom_prompt.to_string());
+        if let Some(prompt) = shared_prompt {
+            parts.push(prompt.to_string());
+        }
+        if let Some(prompt) = role_prompt {
+            parts.push(prompt.to_string());
+        }
     }
 
     format!("{}\n", parts.join("\n").trim_end())
@@ -695,6 +711,78 @@ mod tests {
             custom_prompt: Some("   ".to_string()),
             ..Default::default()
         }));
+        assert!(!prompt.contains("## Custom instructions"));
+    }
+
+    // -----------------------------------------------------------------------
+    // role-specific custom prompts
+    // -----------------------------------------------------------------------
+
+    fn build_for_actor(actor: &str, global_settings: GlobalSettings) -> String {
+        let mut input = base_input(actor);
+        input.settings = Some(claude_implements_settings());
+        input.state = Some(json!({ "round": 0, "rounds_in_window": 0 }));
+        input.global_settings = Some(global_settings);
+        build_actor_prompt(&input)
+    }
+
+    #[test]
+    fn sends_the_implementer_prompt_only_to_the_implementer() {
+        let settings = GlobalSettings {
+            custom_prompt_implementer: Some("Implementer only.".to_string()),
+            ..Default::default()
+        };
+
+        let implementer_prompt = build_for_actor("claude", settings.clone());
+        assert!(implementer_prompt.contains("## Custom instructions"));
+        assert!(implementer_prompt.contains("Implementer only."));
+
+        let reviewer_prompt = build_for_actor("codex", settings);
+        assert!(!reviewer_prompt.contains("Implementer only."));
+    }
+
+    #[test]
+    fn sends_the_reviewer_prompt_only_to_the_reviewer() {
+        let settings = GlobalSettings {
+            custom_prompt_reviewer: Some("Reviewer only.".to_string()),
+            ..Default::default()
+        };
+
+        let reviewer_prompt = build_for_actor("codex", settings.clone());
+        assert!(reviewer_prompt.contains("## Custom instructions"));
+        assert!(reviewer_prompt.contains("Reviewer only."));
+
+        let implementer_prompt = build_for_actor("claude", settings);
+        assert!(!implementer_prompt.contains("Reviewer only."));
+    }
+
+    #[test]
+    fn appends_the_role_prompt_after_the_shared_prompt() {
+        let prompt = build_for_actor(
+            "claude",
+            GlobalSettings {
+                custom_prompt: Some("Shared.".to_string()),
+                custom_prompt_implementer: Some("Implementer only.".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let shared_idx = prompt.find("Shared.").unwrap();
+        let role_idx = prompt.find("Implementer only.").unwrap();
+        assert!(role_idx > shared_idx);
+        let last_line = prompt.trim().split('\n').next_back().unwrap();
+        assert_eq!(last_line, "Implementer only.");
+    }
+
+    #[test]
+    fn treats_whitespace_only_role_prompts_as_unset() {
+        let prompt = build_for_actor(
+            "claude",
+            GlobalSettings {
+                custom_prompt_implementer: Some("   ".to_string()),
+                ..Default::default()
+            },
+        );
         assert!(!prompt.contains("## Custom instructions"));
     }
 }

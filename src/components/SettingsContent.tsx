@@ -382,33 +382,11 @@ function GeneralSettings({ globalSettings }: { globalSettings: GlobalSettings | 
   )
 }
 
+type CustomPromptField = 'custom_prompt' | 'custom_prompt_implementer' | 'custom_prompt_reviewer'
+
 function PromptsSettings({ globalSettings }: { globalSettings: GlobalSettings | null }) {
   const t = useT()
-  const updateMutation = useUpdateGlobalSettings()
   const normalizedSettings = normalizeGlobalSettings(globalSettings)
-  const saved = normalizedSettings.custom_prompt ?? ''
-
-  const save = (patch: Partial<GlobalSettings>) => {
-    updateMutation.mutate({ ...normalizedSettings, ...patch })
-  }
-
-  const [draft, setDraft] = useState(saved)
-
-  useEffect(() => {
-    setDraft(normalizedSettings.custom_prompt ?? '')
-  }, [normalizedSettings.custom_prompt])
-
-  const dirty = draft !== saved
-
-  const handleSave = () => {
-    save({ custom_prompt: draft.trim() || undefined })
-  }
-
-  const handleReset = () => {
-    if (!window.confirm(t('settings.prompts.resetConfirm'))) return
-    setDraft('')
-    save({ custom_prompt: undefined })
-  }
 
   return (
     <div className="space-y-4">
@@ -418,19 +396,63 @@ function PromptsSettings({ globalSettings }: { globalSettings: GlobalSettings | 
       </div>
 
       <SettingsList>
-        <div className="px-4 py-4">
-          <div className="text-sm font-medium text-fg mb-2">{t('settings.prompts.customLabel')}</div>
-          <textarea
-            value={draft}
-            rows={8}
-            placeholder={t('settings.prompts.placeholder')}
-            onChange={(e) => setDraft(e.target.value)}
-            className="w-full px-3 py-2 text-sm bg-transparent border border-border rounded-lg font-mono focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent transition-colors resize-y"
-          />
-        </div>
+        <PromptCard
+          label={t('settings.prompts.sharedLabel')}
+          field="custom_prompt"
+          settings={normalizedSettings}
+        />
+        <PromptCard
+          label={t('settings.prompts.implementerLabel')}
+          field="custom_prompt_implementer"
+          settings={normalizedSettings}
+        />
+        <PromptCard
+          label={t('settings.prompts.reviewerLabel')}
+          field="custom_prompt_reviewer"
+          settings={normalizedSettings}
+        />
       </SettingsList>
+    </div>
+  )
+}
 
-      <div className="flex items-center gap-2">
+function PromptCard({ label, field, settings }: {
+  label: string
+  field: CustomPromptField
+  settings: GlobalSettings
+}) {
+  const t = useT()
+  const updateMutation = useUpdateGlobalSettings()
+  const saved = settings[field] ?? ''
+  const [draft, setDraft] = useState(saved)
+
+  useEffect(() => {
+    setDraft(saved)
+  }, [saved])
+
+  const dirty = draft !== saved
+
+  const handleSave = () => {
+    updateMutation.mutate({ ...settings, [field]: draft.trim() || undefined })
+  }
+
+  const handleReset = () => {
+    if (!window.confirm(t('settings.prompts.resetConfirm'))) return
+    setDraft('')
+    updateMutation.mutate({ ...settings, [field]: undefined })
+  }
+
+  return (
+    <div className="px-4 py-4">
+      <div className="text-sm font-medium text-fg mb-2">{label}</div>
+      <textarea
+        value={draft}
+        rows={5}
+        placeholder={t('settings.prompts.placeholder')}
+        onChange={(e) => setDraft(e.target.value)}
+        className="w-full px-3 py-2 text-sm bg-transparent border border-border rounded-lg font-mono focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent transition-colors resize-y"
+      />
+      <div className="flex items-center gap-2 mt-2">
         <button
           type="button"
           onClick={handleSave}
