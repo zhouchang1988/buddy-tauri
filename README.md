@@ -1,10 +1,15 @@
-# Buddy
+# Buddy (Tauri)
 
-> Let's Go, Every Buddy! 让我们一起出发，每一位 Buddy！
+> ⚠️ **项目说明：研究性实验，非稳定项目**
+>
+> 本仓库是为了**研究「用 AI 编程切换开发方案」**而产生的实验项目——即探索如何让 AI Agent 将一个完整的 Electron 应用移植到 Tauri 2（Rust 后端）。它不是一个面向生产环境的稳定项目，功能与质量不做保证。
+>
+> **如果你希望更好地体验和使用 Buddy，请使用原项目：**
+>
+> - 仓库：[davidhoo/buddy](https://github.com/davidhoo/buddy)
+> - 官网：https://davidhoo.github.io/buddy/
 
-双 AI Agent 协作编码的 macOS 桌面应用。两个 AI Actor（执行方 + 审查方）轮流工作，逐步收敛至正确结果，支持人工校准窗口与双确认结束机制。
-
-本仓库是 Buddy 的 **Tauri 2 移植版**（Electron 原版见 [davidhoo/buddy](https://github.com/davidhoo/buddy)）：后端由 Node.js 主进程重写为 Rust，前端渲染代码原样复用，数据目录与原版完全兼容。
+Buddy 是一个双 AI Agent 协作编码的 macOS 桌面应用（两个 AI Actor 轮流工作，双确认结束）。本仓库是它的 **Tauri 2 移植实验版**：后端由 Node.js 主进程重写为 Rust，前端渲染代码原样复用，数据目录与原版兼容。
 
 ## 特性
 

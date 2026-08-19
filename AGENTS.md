@@ -4,9 +4,11 @@ This file provides guidance to AI agents (Codex, Claude Code, Kimi Code, etc.) w
 
 ## Project
 
+**Research experiment, not a stable product.** This repository exists to study **switching development stacks with AI-assisted coding** — having AI agents port a complete Electron app to Tauri 2 (Rust backend). It is experimental; functionality and quality are not guaranteed. For a reliable Buddy experience, use the original project: [davidhoo/buddy](https://github.com/davidhoo/buddy) (official site: https://davidhoo.github.io/buddy/).
+
 Buddy is a macOS desktop app that orchestrates **dual-AI-agent collaborative coding**. Two AI actors (implementer + reviewer) take turns on a task, and the loop ends when both actors confirm "break" (dual-break). Supported actors: Claude Code, Codex, Cursor CLI, OpenCode, Kimi Code.
 
-This repository is the **Tauri 2 port** of the Electron edition ([davidhoo/buddy](https://github.com/davidhoo/buddy)). The backend is Rust (`src-tauri/src/`), ported module by module from the Electron main process; the renderer is reused verbatim. Data directories (`~/Library/Application Support/buddy/`) are byte-for-byte compatible with the Electron edition.
+This repository is the **Tauri 2 port** of the Electron edition. The backend is Rust (`src-tauri/src/`), ported module by module from the Electron main process; the renderer is reused verbatim. Data directories (`~/Library/Application Support/buddy/`) are byte-for-byte compatible with the Electron edition.
 
 ## Commands
 
