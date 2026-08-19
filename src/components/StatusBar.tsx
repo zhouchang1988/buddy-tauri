@@ -10,6 +10,7 @@ import {
   ACTOR_DISPLAY_NAME,
   ACTOR_LABEL_KEY,
   Actor,
+  buildSessionResumeCommand,
   taskActors,
   formatTimeWithRelativeDate,
   decodeErrorText,
@@ -360,7 +361,15 @@ function ActorCard({
 
   const handleCopy = () => {
     if (!session) return
-    navigator.clipboard.writeText(session).then(
+    // 复制的不只是会话 ID，而是可直接在终端执行的完整恢复命令：
+    // cd 到仓库根目录 + actor 启动命令 + 会话续跑参数。
+    const command = buildSessionResumeCommand(
+      actor,
+      session,
+      taskSettings?.launchers?.[actor]?.command,
+      taskState?.repo_root
+    )
+    navigator.clipboard.writeText(command).then(
       () => {
         // 5 秒从剪贴板 Promise 成功完成时开始计算；组件已卸载则放弃。
         if (!mountedRef.current) return

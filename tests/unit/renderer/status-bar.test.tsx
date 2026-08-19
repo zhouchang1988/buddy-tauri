@@ -152,7 +152,7 @@ describe('StatusBar session ID copy feedback', () => {
       taskState: makeTaskState({ claude_session_id: 'sess-123' })
     })
 
-    const copyBtn = screen.getByTitle('Copy session ID')
+    const copyBtn = screen.getByTitle('Copy session resume command')
     expect(copyBtn).toBeInTheDocument()
     expect(copyBtn.querySelector('.lucide-copy')).toBeInTheDocument()
     expect(copyBtn.querySelector('.lucide-check')).not.toBeInTheDocument()
@@ -161,21 +161,34 @@ describe('StatusBar session ID copy feedback', () => {
   it('does not show copy button when there is no session ID', () => {
     renderStatusBarInteractive()
 
-    expect(screen.queryByTitle('Copy session ID')).not.toBeInTheDocument()
-    expect(screen.queryByTitle('Session ID copied')).not.toBeInTheDocument()
+    expect(screen.queryByTitle('Copy session resume command')).not.toBeInTheDocument()
+    expect(screen.queryByTitle('Resume command copied')).not.toBeInTheDocument()
   })
 
-  it('writes the full session ID to clipboard on click', async () => {
+  it('writes the full resume command to clipboard on click', async () => {
     const writeText = mockClipboardResolved()
 
     renderStatusBarInteractive({
       taskState: makeTaskState({ claude_session_id: 'full-session-id-abc' })
     })
 
-    fireEvent.click(screen.getByTitle('Copy session ID'))
+    fireEvent.click(screen.getByTitle('Copy session resume command'))
     await vi.advanceTimersByTimeAsync(0)
 
-    expect(writeText).toHaveBeenCalledWith('full-session-id-abc')
+    expect(writeText).toHaveBeenCalledWith('cd "/tmp/repo" && claude --resume full-session-id-abc')
+  })
+
+  it('builds the resume command per actor with the launcher command', async () => {
+    const writeText = mockClipboardResolved()
+
+    renderStatusBarInteractive({
+      taskState: makeTaskState({ codex_thread_id: 'thread-xyz' })
+    })
+
+    fireEvent.click(screen.getByTitle('Copy session resume command'))
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(writeText).toHaveBeenCalledWith('cd "/tmp/repo" && codex resume thread-xyz')
   })
 
   it('switches to check icon after successful copy', async () => {
@@ -185,10 +198,10 @@ describe('StatusBar session ID copy feedback', () => {
       taskState: makeTaskState({ claude_session_id: 'sess-1' })
     })
 
-    fireEvent.click(screen.getByTitle('Copy session ID'))
+    fireEvent.click(screen.getByTitle('Copy session resume command'))
     await vi.advanceTimersByTimeAsync(0)
 
-    const checkBtn = screen.getByTitle('Session ID copied')
+    const checkBtn = screen.getByTitle('Resume command copied')
     expect(checkBtn).toBeInTheDocument()
     expect(checkBtn.querySelector('.lucide-check')).toBeInTheDocument()
     expect(checkBtn.querySelector('.lucide-copy')).not.toBeInTheDocument()
@@ -201,11 +214,11 @@ describe('StatusBar session ID copy feedback', () => {
       taskState: makeTaskState({ claude_session_id: 'sess-1' })
     })
 
-    fireEvent.click(screen.getByTitle('Copy session ID'))
+    fireEvent.click(screen.getByTitle('Copy session resume command'))
     await vi.advanceTimersByTimeAsync(0)
     await vi.advanceTimersByTimeAsync(4999)
 
-    expect(screen.getByTitle('Session ID copied')).toBeInTheDocument()
+    expect(screen.getByTitle('Resume command copied')).toBeInTheDocument()
   })
 
   it('restores copy icon after 5 seconds', async () => {
@@ -215,14 +228,14 @@ describe('StatusBar session ID copy feedback', () => {
       taskState: makeTaskState({ claude_session_id: 'sess-1' })
     })
 
-    fireEvent.click(screen.getByTitle('Copy session ID'))
+    fireEvent.click(screen.getByTitle('Copy session resume command'))
     await vi.advanceTimersByTimeAsync(0)
     await vi.advanceTimersByTimeAsync(5000)
 
-    const copyBtn = screen.getByTitle('Copy session ID')
+    const copyBtn = screen.getByTitle('Copy session resume command')
     expect(copyBtn).toBeInTheDocument()
     expect(copyBtn.querySelector('.lucide-copy')).toBeInTheDocument()
-    expect(screen.queryByTitle('Session ID copied')).not.toBeInTheDocument()
+    expect(screen.queryByTitle('Resume command copied')).not.toBeInTheDocument()
   })
 
   it('restarts the 5 second timer when copied again while check is shown', async () => {
@@ -232,25 +245,25 @@ describe('StatusBar session ID copy feedback', () => {
       taskState: makeTaskState({ claude_session_id: 'sess-1' })
     })
 
-    fireEvent.click(screen.getByTitle('Copy session ID'))
+    fireEvent.click(screen.getByTitle('Copy session resume command'))
     await vi.advanceTimersByTimeAsync(0) // 对号显示，第一个 5s 定时器开始
 
     // 推进 4s，对号仍在
     await vi.advanceTimersByTimeAsync(4000)
-    expect(screen.getByTitle('Session ID copied')).toBeInTheDocument()
+    expect(screen.getByTitle('Resume command copied')).toBeInTheDocument()
 
     // 对号状态下再次点击，重新开始完整的 5s 计时
-    fireEvent.click(screen.getByTitle('Session ID copied'))
+    fireEvent.click(screen.getByTitle('Resume command copied'))
     await vi.advanceTimersByTimeAsync(0)
 
     // 距第二次点击 4s，对号仍在
     await vi.advanceTimersByTimeAsync(4000)
-    expect(screen.getByTitle('Session ID copied')).toBeInTheDocument()
+    expect(screen.getByTitle('Resume command copied')).toBeInTheDocument()
 
     // 再过 1s（距第二次点击满 5s），恢复复制图标
     await vi.advanceTimersByTimeAsync(1000)
-    expect(screen.getByTitle('Copy session ID')).toBeInTheDocument()
-    expect(screen.queryByTitle('Session ID copied')).not.toBeInTheDocument()
+    expect(screen.getByTitle('Copy session resume command')).toBeInTheDocument()
+    expect(screen.queryByTitle('Resume command copied')).not.toBeInTheDocument()
   })
 
   it('keeps copy icon when clipboard write fails', async () => {
@@ -260,12 +273,12 @@ describe('StatusBar session ID copy feedback', () => {
       taskState: makeTaskState({ claude_session_id: 'sess-fail' })
     })
 
-    fireEvent.click(screen.getByTitle('Copy session ID'))
+    fireEvent.click(screen.getByTitle('Copy session resume command'))
     await vi.advanceTimersByTimeAsync(0)
     await vi.advanceTimersByTimeAsync(5000)
 
-    expect(screen.getByTitle('Copy session ID')).toBeInTheDocument()
-    expect(screen.queryByTitle('Session ID copied')).not.toBeInTheDocument()
+    expect(screen.getByTitle('Copy session resume command')).toBeInTheDocument()
+    expect(screen.queryByTitle('Resume command copied')).not.toBeInTheDocument()
   })
 
   it('keeps implementer and reviewer copy states independent', async () => {
@@ -278,14 +291,14 @@ describe('StatusBar session ID copy feedback', () => {
       })
     })
 
-    const buttons = screen.getAllByTitle('Copy session ID')
+    const buttons = screen.getAllByTitle('Copy session resume command')
     // 点击审查者（codex，第二个）按钮
     fireEvent.click(buttons[1])
     await vi.advanceTimersByTimeAsync(0)
 
-    expect(screen.getAllByTitle('Session ID copied')).toHaveLength(1)
+    expect(screen.getAllByTitle('Resume command copied')).toHaveLength(1)
     // 执行者仍显示复制图标
-    const remainingCopyBtn = screen.getByTitle('Copy session ID')
+    const remainingCopyBtn = screen.getByTitle('Copy session resume command')
     expect(remainingCopyBtn).toBeInTheDocument()
     expect(remainingCopyBtn.querySelector('.lucide-copy')).toBeInTheDocument()
   })
@@ -297,9 +310,9 @@ describe('StatusBar session ID copy feedback', () => {
       taskState: makeTaskState({ task_id: 'task-a', claude_session_id: 'sess-a' })
     })
 
-    fireEvent.click(screen.getByTitle('Copy session ID'))
+    fireEvent.click(screen.getByTitle('Copy session resume command'))
     await vi.advanceTimersByTimeAsync(0)
-    expect(screen.getByTitle('Session ID copied')).toBeInTheDocument()
+    expect(screen.getByTitle('Resume command copied')).toBeInTheDocument()
 
     // 切换到任务 B
     rerender(
@@ -310,8 +323,8 @@ describe('StatusBar session ID copy feedback', () => {
       />
     )
 
-    expect(screen.getByTitle('Copy session ID')).toBeInTheDocument()
-    expect(screen.queryByTitle('Session ID copied')).not.toBeInTheDocument()
+    expect(screen.getByTitle('Copy session resume command')).toBeInTheDocument()
+    expect(screen.queryByTitle('Resume command copied')).not.toBeInTheDocument()
   })
 
   it('restores copy icon when switching back to the original task within 5 seconds', async () => {
@@ -321,9 +334,9 @@ describe('StatusBar session ID copy feedback', () => {
       taskState: makeTaskState({ task_id: 'task-a', claude_session_id: 'sess-a' })
     })
 
-    fireEvent.click(screen.getByTitle('Copy session ID'))
+    fireEvent.click(screen.getByTitle('Copy session resume command'))
     await vi.advanceTimersByTimeAsync(0)
-    expect(screen.getByTitle('Session ID copied')).toBeInTheDocument()
+    expect(screen.getByTitle('Resume command copied')).toBeInTheDocument()
 
     // 切到任务 B
     rerender(
@@ -343,8 +356,8 @@ describe('StatusBar session ID copy feedback', () => {
       />
     )
 
-    expect(screen.getByTitle('Copy session ID')).toBeInTheDocument()
-    expect(screen.queryByTitle('Session ID copied')).not.toBeInTheDocument()
+    expect(screen.getByTitle('Copy session resume command')).toBeInTheDocument()
+    expect(screen.queryByTitle('Resume command copied')).not.toBeInTheDocument()
   })
 
   it('cleans up the timer on unmount without later state updates', async () => {
@@ -362,7 +375,7 @@ describe('StatusBar session ID copy feedback', () => {
     setTimeoutSpy.mockClear()
     clearTimeoutSpy.mockClear()
 
-    fireEvent.click(screen.getByTitle('Copy session ID'))
+    fireEvent.click(screen.getByTitle('Copy session resume command'))
     await vi.advanceTimersByTimeAsync(0)
 
     // 复制成功后应已调度 5s 定时器；它应是目前唯一被调度的 setTimeout
@@ -390,7 +403,7 @@ describe('StatusBar session ID copy feedback', () => {
       taskState: makeTaskState({ task_id: 'task-1', claude_session_id: 'same-sess' })
     })
 
-    fireEvent.click(screen.getByTitle('Copy session ID'))
+    fireEvent.click(screen.getByTitle('Copy session resume command'))
 
     // 在 Promise 解析前切到另一个任务（同一会话 ID）
     rerender(
@@ -405,10 +418,10 @@ describe('StatusBar session ID copy feedback', () => {
     resolveCopy()
     await vi.advanceTimersByTimeAsync(0)
 
-    expect(writeText).toHaveBeenCalledWith('same-sess')
+    expect(writeText).toHaveBeenCalledWith('cd "/tmp/repo" && claude --resume same-sess')
     // task-2 不得因相同会话字符串而显示对号
-    expect(screen.getByTitle('Copy session ID')).toBeInTheDocument()
-    expect(screen.queryByTitle('Session ID copied')).not.toBeInTheDocument()
+    expect(screen.getByTitle('Copy session resume command')).toBeInTheDocument()
+    expect(screen.queryByTitle('Resume command copied')).not.toBeInTheDocument()
   })
 
   it('restores copy icon when status bar is reopened', async () => {
@@ -418,16 +431,16 @@ describe('StatusBar session ID copy feedback', () => {
       taskState: makeTaskState({ claude_session_id: 'sess-reopen' })
     })
 
-    fireEvent.click(screen.getByTitle('Copy session ID'))
+    fireEvent.click(screen.getByTitle('Copy session resume command'))
     await vi.advanceTimersByTimeAsync(0)
-    expect(screen.getByTitle('Session ID copied')).toBeInTheDocument()
+    expect(screen.getByTitle('Resume command copied')).toBeInTheDocument()
 
     // 关闭再重新打开
     rerender(<StatusBar {...statusBarProps({ isOpen: false, taskState: makeTaskState({ claude_session_id: 'sess-reopen' }) })} />)
     rerender(<StatusBar {...statusBarProps({ isOpen: true, taskState: makeTaskState({ claude_session_id: 'sess-reopen' }) })} />)
 
-    expect(screen.getByTitle('Copy session ID')).toBeInTheDocument()
-    expect(screen.queryByTitle('Session ID copied')).not.toBeInTheDocument()
+    expect(screen.getByTitle('Copy session resume command')).toBeInTheDocument()
+    expect(screen.queryByTitle('Resume command copied')).not.toBeInTheDocument()
   })
 })
 

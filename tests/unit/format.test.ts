@@ -1,5 +1,32 @@
 import { describe, it, expect } from 'vitest'
-import { decodeUnicodeEscapes, decodeErrorText, eventPayloadSummary, formatDuration } from '../../src/lib/format'
+import { decodeUnicodeEscapes, decodeErrorText, eventPayloadSummary, formatDuration, buildSessionResumeCommand } from '../../src/lib/format'
+
+describe('buildSessionResumeCommand', () => {
+  it('builds per-actor resume commands', () => {
+    expect(buildSessionResumeCommand('claude', 's1', 'claude', null)).toBe('claude --resume s1')
+    expect(buildSessionResumeCommand('codex', 't1', 'codex', null)).toBe('codex resume t1')
+    expect(buildSessionResumeCommand('cursor', 'c1', 'cursor-agent', null)).toBe('cursor-agent --resume c1')
+    expect(buildSessionResumeCommand('opencode', 'o1', 'opencode', null)).toBe('opencode --session o1')
+    expect(buildSessionResumeCommand('kimi', 'k1', 'kimi', null)).toBe('kimi -S k1')
+  })
+
+  it('prefixes cd to the repo root when available', () => {
+    expect(buildSessionResumeCommand('claude', 's1', 'claude', '/tmp/repo'))
+      .toBe('cd "/tmp/repo" && claude --resume s1')
+  })
+
+  it('escapes double-quote-special chars in the repo path', () => {
+    expect(buildSessionResumeCommand('claude', 's1', 'claude', '/tmp/we "ird" $dir'))
+      .toBe('cd "/tmp/we \\"ird\\" \\$dir" && claude --resume s1')
+  })
+
+  it('keeps user-customized launcher args and falls back to the actor name', () => {
+    expect(buildSessionResumeCommand('codex', 't1', 'codex --profile native', '/r'))
+      .toBe('cd "/r" && codex --profile native resume t1')
+    expect(buildSessionResumeCommand('claude', 's1', '  ', null)).toBe('claude --resume s1')
+    expect(buildSessionResumeCommand('claude', 's1', null, null)).toBe('claude --resume s1')
+  })
+})
 
 describe('formatDuration', () => {
   it('formats sub-second durations as ms', () => {

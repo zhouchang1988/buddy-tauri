@@ -100,6 +100,37 @@ export function taskActors(settings: TaskSettings | null | undefined): {
   return { impl, rev, participants: [impl, rev] }
 }
 
+// 各 actor CLI 在终端交互式恢复会话时的参数形式，与
+// src-tauri/src/buddy/launchers.rs 中续跑会话使用的 flag 保持一致。
+const SESSION_RESUME_ARG: Record<Actor, (sessionId: string) => string> = {
+  claude: (id) => `--resume ${id}`,
+  codex: (id) => `resume ${id}`,
+  cursor: (id) => `--resume ${id}`,
+  opencode: (id) => `--session ${id}`,
+  kimi: (id) => `-S ${id}`
+}
+
+function shellQuoteDouble(text: string): string {
+  return `"${text.replace(/(["\\$`])/g, '\\$1')}"`
+}
+
+/**
+ * 构建在终端里直接恢复某个 actor 会话的完整命令：
+ * `cd "<repoRoot>" && <launcher command> <resume flag> <sessionId>`。
+ * baseCommand 取任务设置里的 launcher 命令（可能带用户自定义参数），为空时退化为 actor 名。
+ */
+export function buildSessionResumeCommand(
+  actor: Actor,
+  sessionId: string,
+  baseCommand?: string | null,
+  repoRoot?: string | null
+): string {
+  const base = (baseCommand || '').trim() || actor
+  const resume = `${base} ${SESSION_RESUME_ARG[actor](sessionId)}`
+  const root = (repoRoot || '').trim()
+  return root ? `cd ${shellQuoteDouble(root)} && ${resume}` : resume
+}
+
 export function shortId(value: string | undefined | null): string {
   if (!value) return ''
   return value.length > 20 ? `${value.slice(0, 8)}...${value.slice(-6)}` : value
