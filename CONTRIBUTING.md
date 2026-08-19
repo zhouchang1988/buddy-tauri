@@ -2,6 +2,8 @@
 
 感谢你对 Buddy 的关注！本文档介绍如何参与项目开发。
 
+> ⚠️ **请注意：本仓库是研究性实验项目**——为研究「用 AI 编程切换开发方案」（Electron → Tauri 2 移植）而产生，不是一个面向生产环境的稳定项目。如果你希望更好地体验和使用 Buddy，请使用原项目 [davidhoo/buddy](https://github.com/davidhoo/buddy)（官网：https://davidhoo.github.io/buddy/）。
+
 ## 开发环境
 
 ### 前置要求
