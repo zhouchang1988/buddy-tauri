@@ -66,7 +66,6 @@ export function normalizeGlobalSettings(settings?: GlobalSettings | null): Globa
     auto_generate_commit_message: settings?.auto_generate_commit_message ?? true,
     system_notifications_enabled: settings?.system_notifications_enabled ?? true,
     max_upgrade_retries: settings?.max_upgrade_retries ?? 3,
-    custom_prompt: settings?.custom_prompt ?? undefined,
     custom_prompt_implementer: settings?.custom_prompt_implementer ?? undefined,
     custom_prompt_reviewer: settings?.custom_prompt_reviewer ?? undefined
   }

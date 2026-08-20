@@ -194,7 +194,6 @@ export interface GlobalSettings {
   auto_generate_commit_message?: boolean
   system_notifications_enabled?: boolean
   max_upgrade_retries?: number
-  custom_prompt?: string
   custom_prompt_implementer?: string
   custom_prompt_reviewer?: string
 }

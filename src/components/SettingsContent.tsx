@@ -382,7 +382,7 @@ function GeneralSettings({ globalSettings }: { globalSettings: GlobalSettings | 
   )
 }
 
-type CustomPromptField = 'custom_prompt' | 'custom_prompt_implementer' | 'custom_prompt_reviewer'
+type CustomPromptField = 'custom_prompt_implementer' | 'custom_prompt_reviewer'
 
 function PromptsSettings({ globalSettings }: { globalSettings: GlobalSettings | null }) {
   const t = useT()
@@ -396,11 +396,6 @@ function PromptsSettings({ globalSettings }: { globalSettings: GlobalSettings | 
       </div>
 
       <SettingsList>
-        <PromptCard
-          label={t('settings.prompts.sharedLabel')}
-          field="custom_prompt"
-          settings={normalizedSettings}
-        />
         <PromptCard
           label={t('settings.prompts.implementerLabel')}
           field="custom_prompt_implementer"

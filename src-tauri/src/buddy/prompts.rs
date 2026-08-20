@@ -244,9 +244,8 @@ pub fn build_actor_prompt(input: &BuildActorPromptInput) -> String {
     }
 
     // User-defined custom prompts, appended verbatim after the system prompt.
-    // `custom_prompt` applies to every actor on every round; the implementer /
-    // reviewer prompts only apply to the actor playing that role. All are
-    // optional and omitted when empty.
+    // The implementer / reviewer prompts only apply to the actor playing that
+    // role. Both are optional and omitted when empty.
     let global = input.global_settings.as_ref();
     fn non_empty(prompt: Option<&String>) -> Option<&str> {
         let trimmed = prompt?.trim();
@@ -256,21 +255,15 @@ pub fn build_actor_prompt(input: &BuildActorPromptInput) -> String {
             Some(trimmed)
         }
     }
-    let shared_prompt = global.and_then(|g| non_empty(g.custom_prompt.as_ref()));
     let role_prompt = if input.actor == implementer_actor(settings) {
         global.and_then(|g| non_empty(g.custom_prompt_implementer.as_ref()))
     } else {
         global.and_then(|g| non_empty(g.custom_prompt_reviewer.as_ref()))
     };
-    if shared_prompt.is_some() || role_prompt.is_some() {
+    if let Some(prompt) = role_prompt {
         parts.push(String::new());
         parts.push("## Custom instructions".to_string());
-        if let Some(prompt) = shared_prompt {
-            parts.push(prompt.to_string());
-        }
-        if let Some(prompt) = role_prompt {
-            parts.push(prompt.to_string());
-        }
+        parts.push(prompt.to_string());
     }
 
     format!("{}\n", parts.join("\n").trim_end())
@@ -666,7 +659,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // custom_prompt
+    // custom prompts
     // -----------------------------------------------------------------------
 
     fn build_with_global_settings(global_settings: Option<GlobalSettings>) -> String {
@@ -684,9 +677,11 @@ mod tests {
     }
 
     #[test]
-    fn appends_the_custom_prompt_as_the_final_section_after_the_system_prompt() {
+    fn appends_the_role_prompt_as_the_final_section_after_the_system_prompt() {
         let prompt = build_with_global_settings(Some(GlobalSettings {
-            custom_prompt: Some("Always run pnpm test before reporting done.".to_string()),
+            custom_prompt_implementer: Some(
+                "Always run pnpm test before reporting done.".to_string(),
+            ),
             ..Default::default()
         }));
 
@@ -706,9 +701,9 @@ mod tests {
     }
 
     #[test]
-    fn treats_whitespace_only_custom_prompt_as_unset() {
+    fn treats_whitespace_only_custom_prompts_as_unset() {
         let prompt = build_with_global_settings(Some(GlobalSettings {
-            custom_prompt: Some("   ".to_string()),
+            custom_prompt_implementer: Some("   ".to_string()),
             ..Default::default()
         }));
         assert!(!prompt.contains("## Custom instructions"));
@@ -754,35 +749,5 @@ mod tests {
 
         let implementer_prompt = build_for_actor("claude", settings);
         assert!(!implementer_prompt.contains("Reviewer only."));
-    }
-
-    #[test]
-    fn appends_the_role_prompt_after_the_shared_prompt() {
-        let prompt = build_for_actor(
-            "claude",
-            GlobalSettings {
-                custom_prompt: Some("Shared.".to_string()),
-                custom_prompt_implementer: Some("Implementer only.".to_string()),
-                ..Default::default()
-            },
-        );
-
-        let shared_idx = prompt.find("Shared.").unwrap();
-        let role_idx = prompt.find("Implementer only.").unwrap();
-        assert!(role_idx > shared_idx);
-        let last_line = prompt.trim().split('\n').next_back().unwrap();
-        assert_eq!(last_line, "Implementer only.");
-    }
-
-    #[test]
-    fn treats_whitespace_only_role_prompts_as_unset() {
-        let prompt = build_for_actor(
-            "claude",
-            GlobalSettings {
-                custom_prompt_implementer: Some("   ".to_string()),
-                ..Default::default()
-            },
-        );
-        assert!(!prompt.contains("## Custom instructions"));
     }
 }

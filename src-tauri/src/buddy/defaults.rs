@@ -83,7 +83,6 @@ pub fn normalize_global_settings(settings: Option<&GlobalSettings>) -> GlobalSet
         auto_generate_commit_message: Some(s.auto_generate_commit_message.unwrap_or(true)),
         system_notifications_enabled: Some(s.system_notifications_enabled.unwrap_or(true)),
         max_upgrade_retries: Some(s.max_upgrade_retries.unwrap_or(3)),
-        custom_prompt: s.custom_prompt.clone().filter(|p| !p.is_empty()),
         custom_prompt_implementer: s
             .custom_prompt_implementer
             .clone()

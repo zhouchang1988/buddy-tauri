@@ -6,7 +6,7 @@
 //! deserialization provides the same accept/reject behavior (missing required
 //! fields and unknown `status` enum values are rejected; unknown keys are
 //! ignored), and the `parse_*` functions apply the zod `.default(...)` values
-//! and the `custom_prompt` trim/normalization explicitly.
+//! and the `custom_prompt_*` trim/normalization explicitly.
 
 use crate::buddy::types::{Event, GlobalSettings, Launcher, TaskSettings, TaskState};
 use serde::Deserialize;
@@ -159,7 +159,6 @@ struct GlobalSettingsWire {
     #[serde(default = "default_true")]
     system_notifications_enabled: bool,
     max_upgrade_retries: Option<u32>,
-    custom_prompt: Option<String>,
     custom_prompt_implementer: Option<String>,
     custom_prompt_reviewer: Option<String>,
 }
@@ -210,7 +209,6 @@ pub fn parse_global_settings(input: &serde_json::Value) -> Result<GlobalSettings
         auto_generate_commit_message: Some(wire.auto_generate_commit_message),
         system_notifications_enabled: Some(wire.system_notifications_enabled),
         max_upgrade_retries: wire.max_upgrade_retries,
-        custom_prompt: normalize_prompt(wire.custom_prompt),
         custom_prompt_implementer: normalize_prompt(wire.custom_prompt_implementer),
         custom_prompt_reviewer: normalize_prompt(wire.custom_prompt_reviewer),
     })
@@ -396,19 +394,6 @@ mod tests {
     #[test]
     fn rejects_malformed_event_json_lines() {
         assert!(parse_event_line("{bad").is_err());
-    }
-
-    #[test]
-    fn normalizes_empty_custom_prompt_to_none() {
-        let settings = parse_global_settings(&json!({ "custom_prompt": "   " })).unwrap();
-        assert_eq!(settings.custom_prompt, None);
-
-        let populated =
-            parse_global_settings(&json!({ "custom_prompt": "Always run tests." })).unwrap();
-        assert_eq!(
-            populated.custom_prompt.as_deref(),
-            Some("Always run tests.")
-        );
     }
 
     #[test]
