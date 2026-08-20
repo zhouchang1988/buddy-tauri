@@ -7,6 +7,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 const invokeMock = vi.fn()
 const listenMock = vi.fn()
 const openDialogMock = vi.fn()
+const openUrlMock = vi.fn()
 
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: (...args: unknown[]) => invokeMock(...args)
@@ -27,7 +28,7 @@ vi.mock('@tauri-apps/plugin-dialog', () => ({
 }))
 
 vi.mock('@tauri-apps/plugin-opener', () => ({
-  openUrl: vi.fn(),
+  openUrl: (...args: unknown[]) => openUrlMock(...args),
   revealItemInDir: vi.fn()
 }))
 
@@ -37,6 +38,7 @@ describe('tauri-bridge', () => {
     invokeMock.mockReset()
     listenMock.mockReset()
     openDialogMock.mockReset()
+    openUrlMock.mockReset()
     window.localStorage.clear()
     await import('../../../src/lib/tauri-bridge')
   })
@@ -162,5 +164,61 @@ describe('tauri-bridge', () => {
     const fsHandler = listenMock.mock.calls.find((c) => c[0] === 'window:fullScreenChange')![1] as (e: { payload: unknown }) => void
     fsHandler({ payload: true })
     expect(fsCb).toHaveBeenCalledWith(true)
+  })
+
+  describe('external link interception', () => {
+    function clickElement(el: Element): MouseEvent {
+      const event = new MouseEvent('click', { bubbles: true, cancelable: true, button: 0 })
+      el.dispatchEvent(event)
+      return event
+    }
+
+    it('opens external http links in the system browser and prevents webview navigation', () => {
+      const anchor = document.createElement('a')
+      anchor.href = 'https://example.com/docs'
+      anchor.innerHTML = '<span>docs</span>'
+      document.body.appendChild(anchor)
+
+      // Click a nested element: delegation must still resolve the anchor,
+      // matching links inside markdown HTML.
+      const event = clickElement(anchor.querySelector('span')!)
+      expect(event.defaultPrevented).toBe(true)
+      expect(openUrlMock).toHaveBeenCalledWith('https://example.com/docs')
+      anchor.remove()
+    })
+
+    it('opens mailto links externally', () => {
+      const anchor = document.createElement('a')
+      anchor.href = 'mailto:user@example.com'
+      document.body.appendChild(anchor)
+
+      const event = clickElement(anchor)
+      expect(event.defaultPrevented).toBe(true)
+      expect(openUrlMock).toHaveBeenCalledWith('mailto:user@example.com')
+      anchor.remove()
+    })
+
+    it('leaves same-origin and in-page links alone', () => {
+      const hashLink = document.createElement('a')
+      hashLink.href = '#section'
+      const relativeLink = document.createElement('a')
+      relativeLink.href = '/internal/page'
+      document.body.append(hashLink, relativeLink)
+
+      expect(clickElement(hashLink).defaultPrevented).toBe(false)
+      expect(clickElement(relativeLink).defaultPrevented).toBe(false)
+      expect(openUrlMock).not.toHaveBeenCalled()
+      hashLink.remove()
+      relativeLink.remove()
+    })
+
+    it('ignores clicks outside anchors', () => {
+      const div = document.createElement('div')
+      document.body.appendChild(div)
+
+      expect(clickElement(div).defaultPrevented).toBe(false)
+      expect(openUrlMock).not.toHaveBeenCalled()
+      div.remove()
+    })
   })
 })

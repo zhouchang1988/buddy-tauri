@@ -552,11 +552,11 @@ export default function App() {
       } else if (action === 'checkForUpdates') {
         updater.checkForUpdates()
       } else if (action === 'openDocumentation') {
-        window.open('https://github.com/zhouchang1988/buddy-tauri#readme', '_blank')
+        void window.api.openExternal('https://github.com/zhouchang1988/buddy-tauri#readme')
       } else if (action === 'openWhatsNew') {
-        window.open('https://github.com/zhouchang1988/buddy-tauri/releases', '_blank')
+        void window.api.openExternal('https://github.com/zhouchang1988/buddy-tauri/releases')
       } else if (action === 'sendFeedback') {
-        window.open('https://github.com/zhouchang1988/buddy-tauri/issues/new', '_blank')
+        void window.api.openExternal('https://github.com/zhouchang1988/buddy-tauri/issues/new')
       } else if (action === 'showKeyboardShortcuts') {
         setView('settings')
         setSettingsTab('keyboard')

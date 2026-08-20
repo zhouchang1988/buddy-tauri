@@ -161,5 +161,30 @@ const api = {
 window.buddy = buddy
 window.api = api
 
+// Open external links in the system browser instead of navigating the webview
+// (which would strand the user with no way back). Delegate from document so it
+// covers links inside markdown HTML injected via dangerouslySetInnerHTML.
+// Same-origin http(s) links (e.g. '#anchor' or relative links resolved against
+// the webview origin) are left alone so in-app navigation still works.
+function handleExternalLinkClick(event: MouseEvent): void {
+  if (event.defaultPrevented || event.button !== 0) return
+  const anchor = (event.target as Element | null)?.closest?.('a[href]')
+  if (!(anchor instanceof HTMLAnchorElement)) return
+  let url: URL
+  try {
+    url = new URL(anchor.href)
+  } catch {
+    return
+  }
+  const isExternal =
+    url.protocol === 'mailto:' ||
+    ((url.protocol === 'http:' || url.protocol === 'https:') && url.origin !== window.location.origin)
+  if (!isExternal) return
+  event.preventDefault()
+  event.stopPropagation()
+  void openUrl(url.toString())
+}
+document.addEventListener('click', handleExternalLinkClick, true)
+
 export type Api = typeof api
 export type BuddyApi = typeof buddy
