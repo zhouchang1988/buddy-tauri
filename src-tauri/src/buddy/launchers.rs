@@ -327,7 +327,6 @@ pub fn build_launcher_command(input: &LauncherCommandInput) -> LauncherCommand {
                 "--force".to_string(),
                 "--output-format".to_string(),
                 "stream-json".to_string(),
-                "--stream-partial-output".to_string(),
             ]);
             if let Some(session_id) = &input.session_id {
                 args.push("--resume".to_string());
@@ -1034,7 +1033,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_cursor_cli_stream_json_command_with_force_and_session_resume() {
+    fn builds_cursor_cli_stream_json_command_without_partial_text_deltas() {
         let mut i = input("cursor", "cursor-agent --model gpt-5", "/tmp/prompt.md");
         i.prompt_text = Some("hello from prompt".to_string());
         i.session_id = Some("cursor-chat".to_string());
@@ -1049,7 +1048,6 @@ mod tests {
                     "--force",
                     "--output-format",
                     "stream-json",
-                    "--stream-partial-output",
                     "--resume",
                     "cursor-chat",
                     "hello from prompt"

@@ -131,7 +131,7 @@ buddy/
 |-------|---------|-------------|
 | Claude | `{cmd} -p --output-format stream-json --input-format text [--resume SID]` | `--resume` |
 | Codex | `{cmd} exec --json -C REPO -o OUTPUT [resume SID]` | `exec resume` |
-| Cursor | `{cmd} --print --force --output-format stream-json --stream-partial-output [--resume SID] PROMPT` | `--resume` |
+| Cursor | `{cmd} --print --force --output-format stream-json [--resume SID] PROMPT` | `--resume` |
 | OpenCode | `{cmd} run --format json [--session SID]` | `--session` |
 | Kimi | `{cmd} --print --output-format stream-json --input-format text [--session SID]` | `--session` |
 

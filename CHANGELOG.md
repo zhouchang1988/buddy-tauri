@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.2.23-tauri] - 2026-08-22
+
+### Fixed
+- 同步上游 Electron 版 v1.2.23（`davidhoo/buddy`，上游提交 `1f3556fd`）：移除 Cursor 启动器的 `--stream-partial-output` 参数，不再请求流式部分文本增量；Rust 端 `build_launcher_command` 的 `NativeCursor` 分支同步删除该参数，测试同步更新
+
 ## [1.2.22-tauri] - 2026-08-18
 
 ### Added
