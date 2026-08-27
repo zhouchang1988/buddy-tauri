@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.2.24-tauri] - 2026-08-26
+
+### Fixed
+- 同步上游 Electron 版 v1.2.24（`davidhoo/buddy`，上游提交 `c3f95eda`）：「停止」与「插队执行」现在会真正 SIGTERM 运行中的 actor 子进程，而不是只把任务翻成 PAUSED、留孤儿进程继续跑。Rust 端移植：`BuddyRunner` 新增按 `workspace_key::task_id` 键控的运行中止表（TS `runControllers` 的 `AbortController` → `Arc<AtomicBool>`，复用 `launchers.rs` 已有的 abort 入参），`interrupt`/`interrupt_and_insert` 统一走 `pause_and_abort_run`（先落 PAUSED + 清 `active_run` + 发 `actor.interrupted`（payload 带 `run_id`），再置中止标记，保证被杀运行的完成/失败回调被 `active_run.run_id` 防护安全忽略）；被中止的执行视为正常停止，不记失败、不重试、不交接
+- 测试：新增 `terminates_live_launcher_process_when_interrupt_is_called` 与 `terminates_replaced_launcher_before_interrupt_and_insert_starts_new_run`（真实子进程 + `kill -0` 存活轮询，对应上游 `buddy-runner-launcher.test.ts` 两个用例；上游 PTY 用例依赖 mock，Rust 端两条路径共用同一 abort 入参，由管道用例覆盖）
+
 ## [1.2.23-tauri] - 2026-08-22
 
 ### Fixed

@@ -7,12 +7,14 @@
 //! upgrade auto-retries, connectivity health checks (PINGING), countdown
 //! pause/skip, and instruction-queue draining between rounds.
 //!
-//! Interrupt semantics mirror the Electron edition: `interrupt` /
-//! `interrupt_and_insert` clear `active_run` and move the task to PAUSED; the
-//! in-flight launcher process is NOT killed (the TS original never killed it
-//! either — `completeActor`/`markFailed` guard on `active_run.run_id` and
-//! no-op when it changed). A hard child-kill would need a cancellation handle
-//! out of `launchers.rs`, which is out of this module's scope.
+//! Interrupt semantics mirror the Electron edition (v1.2.24, upstream
+//! `c3f95eda`): `interrupt` / `interrupt_and_insert` move the task to PAUSED,
+//! clear `active_run`, emit `actor.interrupted`, and then abort the in-flight
+//! launcher process (SIGTERM) through a per-run `AtomicBool` wired into
+//! `run_actor_command`. The state is paused BEFORE the abort fires, so the
+//! killed run's completion/failure callbacks race-safely no-op via the
+//! `active_run.run_id` guards, and the aborted attempt returns normally
+//! instead of marking the task FAILED.
 
 use crate::buddy::events::BuddyEventBus;
 use crate::buddy::launchers::{
@@ -45,6 +47,7 @@ use regex::Regex;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -288,6 +291,12 @@ pub struct RunnerOptions {
 
 type TerminalCallback = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// Abort handle for one live run (TS: the `runControllers` map entries).
+struct RunControllerEntry {
+    run_id: String,
+    abort: Arc<AtomicBool>,
+}
+
 /// The buddy task runner. Cheap to share behind an `Arc`; all mutable hooks
 /// are internally synchronized.
 pub struct BuddyRunner {
@@ -299,6 +308,9 @@ pub struct BuddyRunner {
     /// (DONE / blocking PAUSED / FAILED). Mirrors the mutable
     /// `onTaskTerminal` property of the TS class.
     on_task_terminal: Mutex<Option<TerminalCallback>>,
+    /// In-memory abort handles for live runs; keyed by `workspace_key::task_id`
+    /// (not run_id alone), mirroring the TS `runControllers` map.
+    run_controllers: Mutex<HashMap<String, RunControllerEntry>>,
 }
 
 impl BuddyRunner {
@@ -309,6 +321,7 @@ impl BuddyRunner {
             events: options.events,
             notifier: options.notifier,
             on_task_terminal: Mutex::new(None),
+            run_controllers: Mutex::new(HashMap::new()),
         }
     }
 
@@ -327,6 +340,43 @@ impl BuddyRunner {
     fn notify_terminal(&self, workspace_key: &str) {
         if let Some(callback) = self.on_task_terminal.lock().clone() {
             callback(workspace_key);
+        }
+    }
+
+    fn run_controller_key(workspace_key: &str, task_id: &str) -> String {
+        format!("{workspace_key}::{task_id}")
+    }
+
+    fn register_run_controller(
+        &self,
+        workspace_key: &str,
+        task_id: &str,
+        run_id: &str,
+        abort: Arc<AtomicBool>,
+    ) {
+        self.run_controllers.lock().insert(
+            Self::run_controller_key(workspace_key, task_id),
+            RunControllerEntry {
+                run_id: run_id.to_string(),
+                abort,
+            },
+        );
+    }
+
+    fn clear_run_controller(&self, workspace_key: &str, task_id: &str, run_id: &str) {
+        let mut controllers = self.run_controllers.lock();
+        let key = Self::run_controller_key(workspace_key, task_id);
+        if controllers.get(&key).map(|e| e.run_id.as_str()) == Some(run_id) {
+            controllers.remove(&key);
+        }
+    }
+
+    fn abort_run_controller(&self, workspace_key: &str, task_id: &str, run_id: &str) {
+        let controllers = self.run_controllers.lock();
+        if let Some(entry) = controllers.get(&Self::run_controller_key(workspace_key, task_id)) {
+            if entry.run_id == run_id {
+                entry.abort.store(true, Ordering::SeqCst);
+            }
         }
     }
 
@@ -554,15 +604,20 @@ impl BuddyRunner {
 
         // Follow-up starts produced by complete_actor are auto-advances: their
         // errors are swallowed (TS: try/catch around the auto-start).
-        let advance = self
+        let abort = Arc::new(AtomicBool::new(false));
+        self.register_run_controller(&workspace_key, task_id, &run_id, abort.clone());
+        let result = self
             .execute_actor(
                 task_id,
                 &workspace_key,
                 &actor,
                 &run_id,
                 input.message.clone().unwrap_or_default(),
+                abort,
             )
-            .await?;
+            .await;
+        self.clear_run_controller(&workspace_key, task_id, &run_id);
+        let advance = result?;
         Ok((run_id, advance.map(|next| (next, true))))
     }
 
@@ -755,29 +810,12 @@ impl BuddyRunner {
         .await
     }
 
-    /// `interrupt`: move the task to PAUSED and clear `active_run`. The
-    /// in-flight process is not killed (see module docs); the orphaned run's
-    /// completion is ignored by the `active_run.run_id` guards.
+    /// `interrupt`: move the task to PAUSED, clear `active_run`, emit
+    /// `actor.interrupted`, then SIGTERM the in-flight launcher process via
+    /// the run's abort handle (upstream v1.2.24, `c3f95eda`).
     pub async fn interrupt(&self, task_id: &str, workspace_key: &str) -> Result<(), RunnerError> {
-        self.store
-            .update_task_state(task_id, workspace_key, |mut state| {
-                state.status = TaskStatus::Paused;
-                state.active_run = None;
-                state.updated_at = Some(utc_now());
-                state
-            })
-            .await?;
-        self.store
-            .append_task_event(
-                task_id,
-                workspace_key,
-                EventInput {
-                    event_type: "actor.interrupted".to_string(),
-                    ..Default::default()
-                },
-            )
-            .await?;
-        Ok(())
+        self.pause_and_abort_run(task_id, workspace_key, Map::new())
+            .await
     }
 
     /// `interruptAndInsert`: pull an instruction out of the queue, interrupt
@@ -800,28 +838,17 @@ impl BuddyRunner {
         self.store
             .dequeue_instruction(task_id, workspace_key, queue_item_id)
             .await?;
-        self.store
-            .update_task_state(task_id, workspace_key, |mut s| {
-                s.status = TaskStatus::Paused;
-                s.active_run = None;
-                s.updated_at = Some(utc_now());
-                s
-            })
-            .await?;
-        self.store
-            .append_task_event(
-                task_id,
-                workspace_key,
-                EventInput {
-                    event_type: "actor.interrupted".to_string(),
-                    payload: payload(serde_json::json!({
-                        "reason": "interrupt_and_insert",
-                        "instruction_id": queue_item_id,
-                    })),
-                    ..Default::default()
-                },
-            )
-            .await?;
+        // Interrupt the current actor (pauses state, then SIGTERMs the live
+        // launcher process).
+        self.pause_and_abort_run(
+            task_id,
+            workspace_key,
+            payload(serde_json::json!({
+                "reason": "interrupt_and_insert",
+                "instruction_id": queue_item_id,
+            })),
+        )
+        .await?;
         self.send_message(
             task_id,
             SendMessageInput {
@@ -832,6 +859,47 @@ impl BuddyRunner {
             },
         )
         .await
+    }
+
+    /// Persist PAUSED + clear `active_run`, emit `actor.interrupted`, then
+    /// abort the matching in-memory run controller. Order matters: state must
+    /// be paused before the SIGTERM callbacks can race
+    /// `mark_failed`/`complete_actor` (TS: `pauseAndAbortRun`).
+    async fn pause_and_abort_run(
+        &self,
+        task_id: &str,
+        workspace_key: &str,
+        mut event_payload: Map<String, Value>,
+    ) -> Result<(), RunnerError> {
+        let state = self.store.read_task_state(task_id, workspace_key).await?;
+        let run_id = state.active_run.as_ref().and_then(|r| r.run_id.clone());
+        self.store
+            .update_task_state(task_id, workspace_key, |mut current| {
+                current.status = TaskStatus::Paused;
+                current.active_run = None;
+                current.updated_at = Some(utc_now());
+                current
+            })
+            .await?;
+        event_payload.insert(
+            "run_id".to_string(),
+            run_id.clone().map(Value::from).unwrap_or(Value::Null),
+        );
+        self.store
+            .append_task_event(
+                task_id,
+                workspace_key,
+                EventInput {
+                    event_type: "actor.interrupted".to_string(),
+                    payload: event_payload,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        if let Some(run_id) = run_id {
+            self.abort_run_controller(workspace_key, task_id, &run_id);
+        }
+        Ok(())
     }
 
     pub async fn enqueue_instruction(
@@ -925,6 +993,7 @@ impl BuddyRunner {
         run_id: &str,
         output_lines: Arc<Mutex<Vec<String>>>,
         stderr_lines: Arc<Mutex<Vec<String>>>,
+        abort: Option<Arc<AtomicBool>>,
     ) -> Result<LauncherRunResult, LauncherError> {
         let parser_actor = parser_actor_for_kind(actor, command.kind);
         let mut merged_env = env.clone();
@@ -966,7 +1035,7 @@ impl BuddyRunner {
                     cwd: cwd.to_string(),
                     env: Some(merged_env),
                     timeout_ms,
-                    abort: None,
+                    abort: abort.clone(),
                 },
                 move |data| {
                     for line in data
@@ -996,7 +1065,7 @@ impl BuddyRunner {
                 env: Some(merged_env),
                 stdin_text: command.stdin_text.clone(),
                 timeout_ms,
-                abort: None,
+                abort,
             },
             move |line| {
                 stdout_lines.lock().push(line.clone());
@@ -1144,6 +1213,9 @@ impl BuddyRunner {
                 &run_id,
                 output_lines.clone(),
                 stderr_lines.clone(),
+                // Pings are not wired to the interrupt abort handle (TS: the
+                // `signal` param is only passed from `executeActor`).
+                None,
             )
             .await;
 
@@ -1544,15 +1616,28 @@ impl BuddyRunner {
         actor: &str,
         run_id: &str,
         user_message: String,
+        abort: Arc<AtomicBool>,
     ) -> Result<Option<StartTaskInput>, RunnerError> {
         let mut compact_retries = 0u32;
         let mut upgrade_retries = 0u32;
         loop {
             let failure = match self
-                .execute_actor_attempt(task_id, workspace_key, actor, run_id, &user_message)
+                .execute_actor_attempt(
+                    task_id,
+                    workspace_key,
+                    actor,
+                    run_id,
+                    &user_message,
+                    abort.clone(),
+                )
                 .await
             {
                 Ok(advance) => return Ok(advance),
+                // User interrupt: pause_and_abort_run already cleared
+                // active_run and aborted the run. Treat SIGTERM/abort as a
+                // normal stop — no failure, retry, or handoff
+                // (TS: `if (signal.aborted) return`).
+                Err(_) if abort.load(Ordering::SeqCst) => return Ok(None),
                 Err(AttemptError::Fatal(error)) => return Err(error),
                 Err(AttemptError::Run(failure)) => failure,
             };
@@ -1685,6 +1770,7 @@ impl BuddyRunner {
         actor: &str,
         run_id: &str,
         user_message: &str,
+        abort: Arc<AtomicBool>,
     ) -> Result<Option<StartTaskInput>, AttemptError> {
         let detail = self
             .store
@@ -1787,6 +1873,7 @@ impl BuddyRunner {
                     run_id,
                     output_lines.clone(),
                     stderr_lines.clone(),
+                    Some(abort.clone()),
                 )
                 .await?;
             let elapsed_ms = started.elapsed().as_millis() as u64;
@@ -3787,6 +3874,258 @@ printf '{"type":"break","content":"%s confirms done"}' "$BUDDY_ACTOR" > "$BUDDY_
         assert_eq!(first["content"], json!("done"));
         assert_eq!(first["meta"]["buddy_type"], json!("chat"));
         assert!(first["meta"]["elapsed_ms"].is_number());
+    }
+
+    /// Waits until `path` exists (poll, 50ms interval). Returns false on
+    /// timeout — the test-side equivalent of the TS `vi.waitFor`.
+    async fn wait_for_path(path: &Path, timeout_ms: u64) -> bool {
+        let started = std::time::Instant::now();
+        while started.elapsed().as_millis() < u128::from(timeout_ms) {
+            if path.exists() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        path.exists()
+    }
+
+    /// `kill -0 <pid>`: true while the process exists.
+    fn process_alive(pid: i32) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    async fn wait_until_dead(pid: i32, timeout_ms: u64) -> bool {
+        let started = std::time::Instant::now();
+        while started.elapsed().as_millis() < u128::from(timeout_ms) {
+            if !process_alive(pid) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        !process_alive(pid)
+    }
+
+    /// Upstream v1.2.24 (`c3f95eda`): `interrupt` SIGTERMs the live launcher
+    /// process instead of only flipping PAUSED.
+    #[tokio::test]
+    async fn terminates_live_launcher_process_when_interrupt_is_called() {
+        let root = TempDir::new().unwrap();
+        let ready_file = root.path().join("ready.pid");
+        let fake = write_fake(
+            root.path(),
+            "long-actor.sh",
+            "#!/bin/sh\necho $$ > \"$BUDDY_READY_FILE\"\nexec sleep 60\n",
+        )
+        .await;
+        let store = Arc::new(BuddyStore::new(root.path()));
+        patch_global_settings(&store, json!({ "max_rounds": 1 })).await;
+        let created = create_demo_task(
+            &store,
+            &root,
+            settings_map(&[(
+                "launchers",
+                json!({ "claude": { "command": fake, "env": { "BUDDY_READY_FILE": ready_file.to_string_lossy() }, "timeout_seconds": 30 } }),
+            )]),
+        )
+        .await;
+        let runner = Arc::new(live_runner(&store));
+        let workspace_key = created.workspace_key.clone();
+
+        let start_runner = runner.clone();
+        let start_workspace_key = workspace_key.clone();
+        let start_handle = tokio::spawn(async move {
+            start_runner
+                .start_task(
+                    "demo",
+                    StartTaskInput {
+                        workspace_key: Some(start_workspace_key),
+                        actor: Some("claude".to_string()),
+                        message: None,
+                    },
+                )
+                .await
+        });
+
+        assert!(
+            wait_for_path(&ready_file, 10_000).await,
+            "actor process did not start"
+        );
+        let pid: i32 = tokio::fs::read_to_string(&ready_file)
+            .await
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(pid > 0);
+        assert!(process_alive(pid));
+
+        runner.interrupt("demo", &workspace_key).await.unwrap();
+        let run_id = start_handle.await.unwrap().unwrap();
+        assert!(run_id.starts_with("run_"));
+
+        assert!(
+            wait_until_dead(pid, 10_000).await,
+            "launcher process still alive after interrupt"
+        );
+
+        let detail = store.get_task_detail("demo", &workspace_key).await.unwrap();
+        assert_eq!(detail.state.status, TaskStatus::Paused);
+        assert!(detail.state.active_run.is_none());
+        let interrupted = detail
+            .events
+            .iter()
+            .find(|e| e.event_type == "actor.interrupted")
+            .expect("actor.interrupted event");
+        assert_eq!(
+            interrupted.payload.get("run_id").and_then(Value::as_str),
+            Some(run_id.as_str())
+        );
+        let types = event_types(&detail);
+        assert!(!types.contains(&"actor.failed"));
+        assert!(!types.contains(&"actor.completed"));
+        assert!(!types.contains(&"actor.finished"));
+    }
+
+    /// Upstream v1.2.24 (`c3f95eda`): `interruptAndInsert` kills the replaced
+    /// launcher before starting the inserted instruction's run.
+    #[tokio::test]
+    async fn terminates_replaced_launcher_before_interrupt_and_insert_starts_new_run() {
+        let root = TempDir::new().unwrap();
+        let ready_file = root.path().join("ready.pid");
+        let invoke_file = root.path().join("invoke.count");
+        let fake = write_fake(
+            root.path(),
+            "long-then-chat.sh",
+            r#"#!/bin/sh
+n=0
+if [ -f "$BUDDY_INVOKE_FILE" ]; then n=$(cat "$BUDDY_INVOKE_FILE"); fi
+n=$((n + 1))
+echo "$n" > "$BUDDY_INVOKE_FILE"
+if [ "$n" = "1" ]; then
+  echo $$ > "$BUDDY_READY_FILE"
+  exec sleep 60
+fi
+printf '{"type":"chat","content":"after insert"}' > "$BUDDY_OUTPUT_FILE"
+"#,
+        )
+        .await;
+        let store = Arc::new(BuddyStore::new(root.path()));
+        patch_global_settings(&store, json!({ "max_rounds": 1 })).await;
+        let created = create_demo_task(
+            &store,
+            &root,
+            settings_map(&[(
+                "launchers",
+                json!({ "claude": { "command": fake, "env": { "BUDDY_READY_FILE": ready_file.to_string_lossy(), "BUDDY_INVOKE_FILE": invoke_file.to_string_lossy() }, "timeout_seconds": 30 } }),
+            )]),
+        )
+        .await;
+        let queue_item = store
+            .enqueue_instruction("demo", &created.workspace_key, "please insert this", None)
+            .await
+            .unwrap();
+        // send_message (used by interrupt_and_insert) omits actor; without a
+        // prior health_check pass, start_task would re-enter the connectivity
+        // ping and hang this fixture (the TS test seeds the same state).
+        store
+            .update_task_state("demo", &created.workspace_key, |mut state| {
+                state.health_check = Some(HealthCheckResult {
+                    actors: HashMap::from([
+                        ("claude".to_string(), "passed".to_string()),
+                        ("codex".to_string(), "passed".to_string()),
+                    ]),
+                    failed_actor: None,
+                    failed_reason: None,
+                });
+                state
+            })
+            .await
+            .unwrap();
+        let runner = Arc::new(live_runner(&store));
+        let workspace_key = created.workspace_key.clone();
+
+        let start_runner = runner.clone();
+        let start_workspace_key = workspace_key.clone();
+        let start_handle = tokio::spawn(async move {
+            start_runner
+                .start_task(
+                    "demo",
+                    StartTaskInput {
+                        workspace_key: Some(start_workspace_key),
+                        actor: Some("claude".to_string()),
+                        message: None,
+                    },
+                )
+                .await
+        });
+
+        assert!(
+            wait_for_path(&ready_file, 10_000).await,
+            "actor process did not start"
+        );
+        let pid: i32 = tokio::fs::read_to_string(&ready_file)
+            .await
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(pid > 0);
+
+        runner
+            .interrupt_and_insert("demo", &workspace_key, &queue_item.id)
+            .await
+            .unwrap();
+        let first_run_id = start_handle.await.unwrap().unwrap();
+        assert!(first_run_id.starts_with("run_"));
+
+        assert!(
+            wait_until_dead(pid, 10_000).await,
+            "replaced launcher process still alive after interrupt_and_insert"
+        );
+
+        let detail = store.get_task_detail("demo", &workspace_key).await.unwrap();
+        let types = event_types(&detail);
+        let interrupted_idx = types
+            .iter()
+            .position(|t| *t == "actor.interrupted")
+            .expect("actor.interrupted event");
+        let second_started = types
+            .iter()
+            .skip(interrupted_idx + 1)
+            .any(|t| *t == "actor.started");
+        assert!(second_started, "a new run must start after the interrupt");
+        let interrupted = &detail.events[interrupted_idx];
+        assert_eq!(
+            interrupted.payload.get("reason").and_then(Value::as_str),
+            Some("interrupt_and_insert")
+        );
+        assert_eq!(
+            interrupted
+                .payload
+                .get("instruction_id")
+                .and_then(Value::as_str),
+            Some(queue_item.id.as_str())
+        );
+        assert_eq!(
+            interrupted.payload.get("run_id").and_then(Value::as_str),
+            Some(first_run_id.as_str())
+        );
+        // The first run must not complete/fail; the second run may complete
+        // into PAUSED via max_rounds.
+        assert!(!detail.events.iter().any(|e| {
+            e.run_id.as_deref() == Some(first_run_id.as_str()) && e.event_type == "actor.failed"
+        }));
+        assert!(!detail.events.iter().any(|e| {
+            e.run_id.as_deref() == Some(first_run_id.as_str()) && e.event_type == "actor.completed"
+        }));
+        assert_eq!(detail.state.status, TaskStatus::Paused);
+        assert!(detail.state.active_run.is_none());
     }
 
     #[tokio::test]
