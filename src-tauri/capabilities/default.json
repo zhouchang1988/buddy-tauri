@@ -19,6 +19,7 @@
     "notification:allow-is-permission-granted",
     "opener:allow-open-path",
     "opener:allow-open-url",
+    "opener:allow-reveal-item-in-dir",
     "shell:allow-execute",
     "shell:allow-spawn",
     "clipboard-manager:allow-read-text",
