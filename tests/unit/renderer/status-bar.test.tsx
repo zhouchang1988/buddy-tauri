@@ -532,4 +532,13 @@ describe('StatusBar event log queue event filtering', () => {
     // With only hidden events, the EventLog renders its empty-state message.
     expect(html).toContain('No events.')
   })
+
+  it('toggles the events section hint between collapse and expand', () => {
+    const html = renderStatusBar()
+    expect(html).toContain('group-open:hidden')
+    expect(html).toContain('group-open:inline')
+    expect(html).toContain('Collapse')
+    expect(html).toContain('Expand')
+  })
 })
+

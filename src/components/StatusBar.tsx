@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { Check, Copy, Play, RotateCw } from 'lucide-react'
 import { TaskState, TaskSettings, TaskStatus, Event, Failure, GlobalSettings } from '../shared/types'
 import { ResizeHandle } from './ResizeHandle'
-import { FileStatus as FileStatusSection, CommitModal, type CommitFeedback } from './FileStatus'
+import { FileStatus as FileStatusSection, CommitModal, DetailsToggleHint, type CommitFeedback } from './FileStatus'
 import { PushModal } from './PushModal'
 import { TaskStatusIcon } from './TaskStatusIcon'
 import { useGitStatus, type GitStatusResult } from '../hooks/useBuddy'
@@ -199,10 +199,10 @@ export function StatusBar({
         />
 
         {/* 过程事件 */}
-        <details open className="border-b border-border">
+        <details open className="group border-b border-border">
           <summary className="px-4 py-3 text-sm font-semibold cursor-pointer flex items-center justify-between hover:bg-bg-subtle select-none">
             <span>{t('statusBar.events')}</span>
-            <span className="text-xs font-normal text-fg-secondary">{t('common.collapse')}</span>
+            <DetailsToggleHint t={t} />
           </summary>
           <EventLog events={events} t={t} lang={lang} />
         </details>

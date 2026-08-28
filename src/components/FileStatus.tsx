@@ -34,6 +34,15 @@ interface FileStatusProps {
   onDismissFeedback?: () => void
 }
 
+export function DetailsToggleHint({ t }: { t: TFunction }) {
+  return (
+    <span className="text-xs font-normal text-fg-secondary">
+      <span className="hidden group-open:inline">{t('common.collapse')}</span>
+      <span className="group-open:hidden">{t('common.expand')}</span>
+    </span>
+  )
+}
+
 export function FileStatusBadge({ status, t }: { status: GitFileStatusCode; t: TFunction }) {
   const config: Record<GitFileStatusCode, { label: string; cls: string }> = {
     M: { label: t('git.statusModified'), cls: 'bg-amber-500/15 text-amber-600 dark:text-amber-400' },
@@ -96,10 +105,10 @@ export function FileStatus({ gitStatus, isLoading, repoRoot, onOpenCommit, onOpe
 
   if (isLoading || !gitStatus) {
     return (
-      <details open className="border-b border-border">
+      <details open className="group border-b border-border">
         <summary className="px-4 py-3 text-sm font-semibold cursor-pointer flex items-center justify-between hover:bg-bg-subtle select-none">
           <span>{t('git.fileStatus')}</span>
-          <span className="text-xs font-normal text-fg-secondary">{t('common.collapse')}</span>
+          <DetailsToggleHint t={t} />
         </summary>
         <div className="px-4 pb-3 text-xs text-fg-muted">{t('common.loading')}</div>
       </details>
@@ -108,12 +117,12 @@ export function FileStatus({ gitStatus, isLoading, repoRoot, onOpenCommit, onOpe
 
   if (!gitStatus.branch) {
     return (
-      <details open className="border-b border-border">
+      <details open className="group border-b border-border">
         <summary className="px-4 py-3 text-sm font-semibold cursor-pointer flex items-center justify-between hover:bg-bg-subtle select-none">
           <span>{t('git.fileStatus')}</span>
-          <span className="text-xs font-normal text-fg-secondary">{t('common.collapse')}</span>
+          <DetailsToggleHint t={t} />
         </summary>
-        <div className="px-4 pb-3 text-xs text-fg-muted">{t('git.noRepo')}</div>
+        <div className="px-4 pt-1.5 pb-3 text-xs text-fg-muted">{t('git.noRepo')}</div>
       </details>
     )
   }
@@ -123,10 +132,10 @@ export function FileStatus({ gitStatus, isLoading, repoRoot, onOpenCommit, onOpe
 
   return (
     <>
-    <details open className="border-b border-border">
+    <details open className="group border-b border-border">
       <summary className="px-4 py-3 text-sm font-semibold cursor-pointer flex items-center justify-between hover:bg-bg-subtle select-none">
         <span>{t('git.fileStatus')}</span>
-        <span className="text-xs font-normal text-fg-secondary">{t('common.collapse')}</span>
+        <DetailsToggleHint t={t} />
       </summary>
       <div className="pb-3 space-y-0.5">
         {/* 变更(点击查看 diff) */}

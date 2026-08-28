@@ -886,3 +886,23 @@ describe('FileStatus pending-push entry', () => {
     expect(onOpenPush).toHaveBeenCalledWith('backup')
   })
 })
+
+describe('FileStatus non-git layout and collapse hint', () => {
+  afterEach(() => {
+    cleanup()
+  })
+
+  it('adds top padding to the no-repo message like process events', () => {
+    renderFileStatus({ gitStatus: makeCleanGitStatus({ branch: '' }) })
+    expect(screen.getByText('git.noRepo').className).toContain('pt-1.5')
+  })
+
+  it('shows collapse while open and expand while closed', () => {
+    renderFileStatus({ gitStatus: makeCleanGitStatus({ branch: '' }) })
+    const details = screen.getByText('git.fileStatus').closest('details')
+    expect(details).toHaveClass('group')
+    expect(screen.getByText('common.collapse').className).toContain('group-open:inline')
+    expect(screen.getByText('common.expand').className).toContain('group-open:hidden')
+  })
+})
+
