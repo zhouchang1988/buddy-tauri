@@ -16,7 +16,7 @@
     "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml",
     "dist": "tauri build",
     "dist:universal": "tauri build --target universal-apple-darwin",
-    "dist:arm64": "tauri build --target aarch64-apple-darwin",
+    "dist:arm64": "tauri build",
     "dist:intel": "tauri build --target x86_64-apple-darwin"
   },
   "dependencies": {

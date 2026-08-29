@@ -57,10 +57,10 @@ pnpm dist:intel   # x86_64 (Intel) 包
 
 发布要求同时支持 Apple Silicon 和 Intel Mac，分两个架构各打一个包（通用包体积大、跨架构编译/链接耗时且失败率高，因此默认分架构打包）。前置条件：`rustup target add aarch64-apple-darwin x86_64-apple-darwin`。
 
-设置 `TAURI_SIGNING_PRIVATE_KEY` 后，tauri-cli 会在产出 `.app` / `.dmg` 的同时生成签名（`.sig` 文件）。产物目录按架构区分：
+设置 `TAURI_SIGNING_PRIVATE_KEY` 后，tauri-cli 会在产出 `.app` / `.dmg` 的同时生成签名（`.sig` 文件）。产物目录按架构区分（arm64 为本机原生构建，落在默认 target 目录；intel 为跨架构构建，落在对应 triple 目录）：
 
 ```
-src-tauri/target/aarch64-apple-darwin/release/bundle/
+src-tauri/target/release/bundle/
 ├── dmg/Buddy_x.y.z_aarch64.dmg        # arm64 安装包
 └── macos/Buddy.app.tar.gz             # arm64 更新包 + .sig
 

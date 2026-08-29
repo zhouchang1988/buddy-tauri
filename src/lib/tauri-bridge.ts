@@ -182,7 +182,12 @@ function handleExternalLinkClick(event: MouseEvent): void {
   if (!isExternal) return
   event.preventDefault()
   event.stopPropagation()
-  void openUrl(url.toString())
+  // Requires opener:allow-default-urls (or a matching URL scope) in
+  // capabilities, otherwise openUrl rejects at runtime — log so a silent
+  // no-op never goes unnoticed again.
+  void openUrl(url.toString()).catch((err: unknown) => {
+    console.error('[buddy] failed to open external link:', url.toString(), err)
+  })
 }
 document.addEventListener('click', handleExternalLinkClick, true)
 

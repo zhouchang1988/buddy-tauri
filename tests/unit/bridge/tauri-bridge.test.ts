@@ -39,6 +39,7 @@ describe('tauri-bridge', () => {
     listenMock.mockReset()
     openDialogMock.mockReset()
     openUrlMock.mockReset()
+    openUrlMock.mockResolvedValue(undefined)
     window.localStorage.clear()
     await import('../../../src/lib/tauri-bridge')
   })
