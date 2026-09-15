@@ -32,6 +32,8 @@ pub enum TaskStatus {
     Failed,
     #[serde(rename = "DONE")]
     Done,
+    #[serde(rename = "CANCELLED")]
+    Cancelled,
 }
 
 impl TaskStatus {
@@ -49,6 +51,7 @@ impl TaskStatus {
             TaskStatus::Paused => "PAUSED",
             TaskStatus::Failed => "FAILED",
             TaskStatus::Done => "DONE",
+            TaskStatus::Cancelled => "CANCELLED",
         }
     }
 
@@ -220,6 +223,8 @@ pub struct TaskState {
     pub execution_mode: Option<ExecutionMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue: Option<TaskQueueInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_cleanup_pending: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

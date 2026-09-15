@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { api } from '../lib/api'
+import { appendActorStreamLine, type ActorStreamLine } from '../lib/actor-stream'
 import type { GlobalSettings, GitCommitPushResult, GitDiffStats, GitRemote, GitStatusResult, RoundEventSummary, TaskEventEnvelope, TaskStats } from '../shared/types'
 import type { TestLauncherResult } from '../shared/types'
 import type { GitPushAvailability, GitPushResult } from '../shared/types'
@@ -148,6 +149,17 @@ export function useInterrupt() {
       api.interrupt(taskId, workspaceKey),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['task'] })
+    }
+  })
+}
+
+export function useCancelTask() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ taskId, workspaceKey }: { taskId: string; workspaceKey?: string }) => api.cancelTask(taskId, workspaceKey),
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: ['task'] })
+      queryClient.invalidateQueries({ queryKey: ['tasks'] })
     }
   })
 }
@@ -304,10 +316,7 @@ export function useTaskStats(taskId: string | null, workspaceKey?: string) {
   })
 }
 
-export interface ActorStreamLine {
-  text: string
-  ts: string
-}
+export type { ActorStreamLine }
 
 export function useActorStream(taskId: string | null, runId: string | null) {
   const [lines, setLines] = useState<ActorStreamLine[]>([])
@@ -334,7 +343,9 @@ export function useActorStream(taskId: string | null, runId: string | null) {
       if (bufferRef.current.length === 0) return
       const batch = bufferRef.current
       bufferRef.current = []
-      setLines(prev => [...prev, ...batch])
+      // Only `mode: 'delta'` chunks (Cursor partial output) coalesce into the
+      // current live row; everything else starts a new row.
+      setLines(prev => batch.reduce(appendActorStreamLine, prev))
     }
     const unsub = api.onTaskEvent((envelope: TaskEventEnvelope) => {
       if (envelope.task_id !== taskIdRef.current) return
@@ -342,7 +353,8 @@ export function useActorStream(taskId: string | null, runId: string | null) {
       if (runIdRef.current && envelope.event.run_id && envelope.event.run_id !== runIdRef.current) return
       const text = envelope.event.payload?.text as string | undefined
       if (!text) return
-      bufferRef.current.push({ text, ts: envelope.event.ts })
+      const mode = envelope.event.payload?.stream === 'delta' ? 'delta' as const : 'line' as const
+      bufferRef.current.push({ text, ts: envelope.event.ts, mode })
       if (flushTimerRef.current === null) {
         flushTimerRef.current = setTimeout(flush, 100)
       }

@@ -71,11 +71,14 @@ pub struct LauncherCommand {
 }
 
 /// Result of a launcher run (piped or PTY), mirroring the Electron edition's
-/// `{ exitCode, signal }` shape.
+/// `LauncherRunResult` (`{ exitCode, signal, timedOut? }`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LauncherRunResult {
     pub exit_code: Option<i32>,
     pub signal: Option<String>,
+    /// Set only when Buddy's deadline fired, not on user abort or external
+    /// signals.
+    pub timed_out: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -327,6 +330,16 @@ pub fn build_launcher_command(input: &LauncherCommandInput) -> LauncherCommand {
                 "--force".to_string(),
                 "--output-format".to_string(),
                 "stream-json".to_string(),
+                // Re-enabled for live progress. Consumers must coalesce
+                // deltas (not one event per UI line) and prefer
+                // result.result for the final reply.
+                "--stream-partial-output".to_string(),
+                // Buddy owns the next turn. Finish this turn (including
+                // subagents) without waiting for background shells.
+                // Persistent services must be detached via the Buddy
+                // service commands: CLI cleanup stops shells it still owns
+                // on exit.
+                "--single-turn".to_string(),
             ]);
             if let Some(session_id) = &input.session_id {
                 args.push("--resume".to_string());
@@ -492,19 +505,74 @@ async fn wait_for_abort(flag: Option<Arc<AtomicBool>>) {
     }
 }
 
+/// Split stdout/stderr chunks into complete lines, keeping a trailing partial
+/// line across chunk boundaries so NDJSON events are not broken mid-object
+/// (port of `createLineSplitter`).
+struct LineSplitter<F: FnMut(String)> {
+    buffer: String,
+    on_line: F,
+}
+
+impl<F: FnMut(String)> LineSplitter<F> {
+    fn new(on_line: F) -> Self {
+        LineSplitter {
+            buffer: String::new(),
+            on_line,
+        }
+    }
+
+    fn push(&mut self, chunk: &str) {
+        if chunk.is_empty() {
+            return;
+        }
+        self.buffer.push_str(chunk);
+        while let Some(pos) = self.buffer.find('\n') {
+            let mut line = self.buffer.drain(..pos).collect::<String>();
+            if line.ends_with('\r') {
+                line.pop();
+            }
+            self.buffer.drain(..1);
+            if !line.is_empty() {
+                (self.on_line)(line);
+            }
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.buffer.is_empty() {
+            return;
+        }
+        let line = std::mem::take(&mut self.buffer);
+        (self.on_line)(line);
+    }
+}
+
+/// Cap how long we wait for stdout/stderr to close after the child exits
+/// (port of `streamDrainMs`).
+pub fn stream_drain_ms(timeout_ms: u64) -> u64 {
+    if timeout_ms == 0 {
+        return 250;
+    }
+    timeout_ms.clamp(50, 500)
+}
+
 /// Run a launcher command with piped stdio. Port of `runLauncher`:
-/// - stdout/stderr are delivered per chunk split on `\r?\n`, empty lines
-///   dropped (no cross-chunk line buffering, same as the Electron edition).
-/// - bytes go through `Utf8StreamDecoder` so a multi-byte UTF-8 sequence
-///   split across two reads decodes intact (Node string_decoder parity;
-///   per-chunk `from_utf8_lossy` used to corrupt CJK text into `��`).
+/// - stdout/stderr go through `Utf8StreamDecoder` so a multi-byte UTF-8
+///   sequence split across two reads decodes intact (Node string_decoder
+///   parity), then through `LineSplitter` so NDJSON events split across
+///   chunks are reassembled before parsing.
 /// - `stdin_text` is written to stdin, which is then closed; a broken pipe
 ///   (child exited early) is swallowed like the TS EPIPE guard.
-/// - on timeout the child receives SIGTERM and we await its exit.
+/// - on timeout the child receives SIGTERM (then SIGKILL after 1.5s, since
+///   cancellation must settle even when a CLI ignores SIGTERM) and we await
+///   its exit. `timed_out` is only set when Buddy's deadline fired, not on
+///   user abort.
+/// - after the child exits, draining inherited pipes is bounded by
+///   `stream_drain_ms`: hung grandchild pipes cannot stall the runner.
 pub async fn run_launcher<F, G>(
     input: &RunLauncherInput,
-    mut on_stdout: F,
-    mut on_stderr: G,
+    on_stdout: F,
+    on_stderr: G,
 ) -> Result<LauncherRunResult, LauncherError>
 where
     F: FnMut(String) + Send,
@@ -536,57 +604,55 @@ where
     let mut stdout = child.stdout.take().expect("stdout piped");
     let mut stderr = child.stderr.take().expect("stderr piped");
     let mut stdin = child.stdin.take().expect("stdin piped");
+    let pid = child.id();
 
-    let stdout_reader = async move {
+    type IoFuture<'a> =
+        std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a>>;
+
+    let mut stdout_reader: Option<IoFuture<'_>> = Some(Box::pin(async move {
+        let mut splitter = LineSplitter::new(on_stdout);
         let mut buf = [0u8; 8192];
         let mut decoder = Utf8StreamDecoder::default();
-        let mut emit = |text: &str| {
-            for line in text.split('\n') {
-                let line = line.strip_suffix('\r').unwrap_or(line);
-                if !line.is_empty() {
-                    on_stdout(line.to_string());
-                }
-            }
-        };
         loop {
             match stdout.read(&mut buf).await {
                 Ok(0) => {
-                    emit(&decoder.finish());
-                    break Ok(());
+                    splitter.push(&decoder.finish());
+                    splitter.flush();
+                    return Ok(());
                 }
-                Ok(n) => emit(&decoder.push(&buf[..n])),
-                Err(error) => break Err(error),
+                Ok(n) => splitter.push(&decoder.push(&buf[..n])),
+                Err(error) => {
+                    splitter.flush();
+                    return Err(error);
+                }
             }
         }
-    };
-    let stderr_reader = async move {
+    }));
+    let mut stderr_reader: Option<IoFuture<'_>> = Some(Box::pin(async move {
+        let mut splitter = LineSplitter::new(on_stderr);
         let mut buf = [0u8; 8192];
         let mut decoder = Utf8StreamDecoder::default();
-        let mut emit = |text: &str| {
-            for line in text.split('\n') {
-                let line = line.strip_suffix('\r').unwrap_or(line);
-                if !line.is_empty() {
-                    on_stderr(line.to_string());
-                }
-            }
-        };
         loop {
             match stderr.read(&mut buf).await {
                 Ok(0) => {
-                    emit(&decoder.finish());
-                    break Ok(());
+                    splitter.push(&decoder.finish());
+                    splitter.flush();
+                    return Ok(());
                 }
-                Ok(n) => emit(&decoder.push(&buf[..n])),
-                Err(error) => break Err(error),
+                Ok(n) => splitter.push(&decoder.push(&buf[..n])),
+                Err(error) => {
+                    splitter.flush();
+                    return Err(error);
+                }
             }
         }
-    };
+    }));
 
     // Write prompt text to stdin, then close the writable side. The child may
     // exit before we finish writing (e.g. wecode auto-upgrades and relaunches
     // itself, closing the pipe) — swallow EPIPE like the Electron edition.
     let stdin_text = input.stdin_text.clone().unwrap_or_default();
-    let stdin_writer = async move {
+    let mut stdin_writer: Option<IoFuture<'_>> = Some(Box::pin(async move {
         let result = stdin.write_all(stdin_text.as_bytes()).await;
         drop(stdin);
         match result {
@@ -594,36 +660,112 @@ where
             Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
             Err(error) => Err(error),
         }
-    };
+    }));
 
-    let wait_for_exit = async {
+    // Phase 1: drive the IO futures while waiting for the child to exit (or
+    // for the deadline / abort flag to fire). Completes on exit alone —
+    // readers may still have buffered data or hung grandchild writers.
+    let mut timed_out = false;
+    let status = {
         let timeout = tokio::time::sleep(std::time::Duration::from_millis(input.timeout_ms));
         tokio::pin!(timeout);
         let abort = wait_for_abort(input.abort.clone());
         tokio::pin!(abort);
-        tokio::select! {
-            status = child.wait() => status,
-            _ = &mut timeout => {
-                send_sigterm(child.id());
-                child.wait().await
+        enum Trigger {
+            Exit(std::io::Result<std::process::ExitStatus>),
+            Timeout,
+            Abort,
+            Io(std::io::Result<()>),
+        }
+        let mut wait = Box::pin(child.wait());
+        let trigger = loop {
+            tokio::select! {
+                status = &mut wait => break Trigger::Exit(status),
+                _ = &mut timeout => break Trigger::Timeout,
+                // Abort: SIGTERM like the TS `onAbort`, then resolve
+                // normally — the caller checks the abort flag.
+                _ = &mut abort => break Trigger::Abort,
+                result = async { stdout_reader.as_mut().expect("polled while Some").await }, if stdout_reader.is_some() => {
+                    stdout_reader = None;
+                    if let Err(error) = &result { break Trigger::Io(Err(std::io::Error::new(error.kind(), error.to_string()))); }
+                }
+                result = async { stderr_reader.as_mut().expect("polled while Some").await }, if stderr_reader.is_some() => {
+                    stderr_reader = None;
+                    if let Err(error) = &result { break Trigger::Io(Err(std::io::Error::new(error.kind(), error.to_string()))); }
+                }
+                result = async { stdin_writer.as_mut().expect("polled while Some").await }, if stdin_writer.is_some() => {
+                    stdin_writer = None;
+                    if let Err(error) = &result { break Trigger::Io(Err(std::io::Error::new(error.kind(), error.to_string()))); }
+                }
             }
-            // Abort: SIGTERM like the TS `onAbort`, then resolve normally —
-            // the caller checks the abort flag to tell abort from exit.
-            _ = &mut abort => {
-                send_sigterm(child.id());
-                child.wait().await
+        };
+        match trigger {
+            Trigger::Exit(status) => status?,
+            Trigger::Io(result) => result.map(|_| unreachable!("no exit status")).map_err(LauncherError::Io)?,
+            Trigger::Timeout | Trigger::Abort => {
+                if matches!(trigger, Trigger::Timeout) {
+                    timed_out = input
+                        .abort
+                        .as_ref()
+                        .map(|flag| !flag.load(Ordering::SeqCst))
+                        .unwrap_or(true);
+                }
+                send_sigterm(pid);
+                // The CLI may ignore SIGTERM; escalate to SIGKILL so the
+                // deadline always settles (TS: the forceKill timer).
+                match tokio::time::timeout(std::time::Duration::from_millis(1500), &mut wait).await
+                {
+                    Ok(status) => status?,
+                    Err(_) => {
+                        send_sigkill(pid);
+                        wait.await?
+                    }
+                }
             }
         }
     };
 
-    let (out_result, err_result, in_result, status_result) =
-        tokio::join!(stdout_reader, stderr_reader, stdin_writer, wait_for_exit);
-    out_result?;
-    err_result?;
-    in_result?;
-    let status = status_result?;
+    // Phase 2: the deadline covers the launcher, not draining inherited pipes
+    // after exit. Bound the drain: grandchildren may keep pipes open after
+    // the launcher exits. On expiry the reader futures are dropped, which
+    // closes the pipes (TS: `destroyStream`).
+    let drain = async move {
+        let out = match stdout_reader {
+            Some(future) => future.await,
+            None => Ok(()),
+        };
+        let err = match stderr_reader {
+            Some(future) => future.await,
+            None => Ok(()),
+        };
+        let inp = match stdin_writer {
+            Some(future) => future.await,
+            None => Ok(()),
+        };
+        (out, err, inp)
+    };
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(stream_drain_ms(input.timeout_ms)),
+        drain,
+    )
+    .await
+    {
+        Ok((out_result, err_result, in_result)) => {
+            out_result?;
+            err_result?;
+            in_result?;
+        }
+        Err(_) => {}
+    }
 
-    Ok(exit_result_from_status(&status))
+    let mut result = exit_result_from_status(&status);
+    result.timed_out = timed_out;
+    Ok(result)
+}
+
+/// TS `LauncherTimeoutError` message (`Actor timed out after N seconds`).
+pub fn launcher_timeout_message(timeout_ms: u64) -> String {
+    format!("Actor timed out after {} seconds", timeout_ms / 1000)
 }
 
 #[cfg(unix)]
@@ -632,6 +774,7 @@ fn exit_result_from_status(status: &std::process::ExitStatus) -> LauncherRunResu
     LauncherRunResult {
         exit_code: status.code(),
         signal: status.signal().map(signal_name),
+        timed_out: false,
     }
 }
 
@@ -640,6 +783,7 @@ fn exit_result_from_status(status: &std::process::ExitStatus) -> LauncherRunResu
     LauncherRunResult {
         exit_code: status.code(),
         signal: None,
+        timed_out: false,
     }
 }
 
@@ -664,9 +808,18 @@ fn signal_name(signal: i32) -> String {
 /// shell out to `kill(1)`; failures are ignored (the wait fallback still
 /// reaps the child, matching the Electron edition's fire-and-forget kill).
 fn send_sigterm(pid: Option<u32>) {
+    send_signal(pid, "-TERM");
+}
+
+/// Send SIGKILL to a process by id (the TS `forceKill` escalation).
+fn send_sigkill(pid: Option<u32>) {
+    send_signal(pid, "-KILL");
+}
+
+fn send_signal(pid: Option<u32>, signal: &str) {
     if let Some(pid) = pid {
         let _ = std::process::Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
+            .args([signal, &pid.to_string()])
             .status();
     }
 }
@@ -837,6 +990,21 @@ where
     let abort = wait_for_abort(input.abort.clone());
     tokio::pin!(abort);
 
+    // TS `onAbort`: SIGTERM, then SIGKILL 1.5s later if the child still has
+    // not exited (CLIs may trap SIGTERM). The delayed kill is a no-op when
+    // the process already exited (ESRCH).
+    let kill_with_escalation = |pid: Option<u32>, killer: &mut Box<dyn portable_pty::ChildKiller + Send + Sync>| {
+        send_sigterm(pid);
+        if let Some(pid) = pid {
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                send_sigkill(Some(pid));
+            });
+        } else {
+            let _ = killer.kill();
+        }
+    };
+
     let mut drained = false;
     let mut decoder = Utf8StreamDecoder::default();
     let result = loop {
@@ -848,31 +1016,33 @@ where
                 break LauncherRunResult {
                     exit_code: Some(status.exit_code() as i32),
                     signal: None,
+                    timed_out: false,
                 };
             }
             _ = &mut timeout => {
                 // Mirror node-pty: SIGTERM on timeout, resolve immediately
                 // with a null exit code and the numeric signal as a string.
                 // The detached wait task still reaps the child afterwards.
-                send_sigterm(pid);
-                if pid.is_none() {
-                    let _ = killer.kill();
-                }
+                kill_with_escalation(pid, &mut killer);
                 break LauncherRunResult {
                     exit_code: None,
                     signal: Some("15".to_string()),
+                    // The deadline fired (not a user abort or external signal).
+                    timed_out: input
+                        .abort
+                        .as_ref()
+                        .map(|flag| !flag.load(Ordering::SeqCst))
+                        .unwrap_or(true),
                 };
             }
             // Abort: same shape as the timeout arm (TS `onAbort` kills with
             // SIGTERM and lets the run resolve; the caller checks the flag).
             _ = &mut abort => {
-                send_sigterm(pid);
-                if pid.is_none() {
-                    let _ = killer.kill();
-                }
+                kill_with_escalation(pid, &mut killer);
                 break LauncherRunResult {
                     exit_code: None,
                     signal: Some("15".to_string()),
+                    timed_out: false,
                 };
             }
             chunk = rx.recv() => {
@@ -1033,7 +1203,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_cursor_cli_stream_json_command_without_partial_text_deltas() {
+    fn builds_cursor_cli_stream_json_command_with_partial_text_deltas() {
         let mut i = input("cursor", "cursor-agent --model gpt-5", "/tmp/prompt.md");
         i.prompt_text = Some("hello from prompt".to_string());
         i.session_id = Some("cursor-chat".to_string());
@@ -1048,6 +1218,8 @@ mod tests {
                     "--force",
                     "--output-format",
                     "stream-json",
+                    "--stream-partial-output",
+                    "--single-turn",
                     "--resume",
                     "cursor-chat",
                     "hello from prompt"
@@ -1319,7 +1491,8 @@ mod tests {
             result,
             LauncherRunResult {
                 exit_code: Some(0),
-                signal: None
+                signal: None,
+                timed_out: false,
             }
         );
         assert_eq!(stdout_lines, vec!["hello", "world"]);
@@ -1456,5 +1629,142 @@ mod tests {
             &out[..out.len().min(200)]
         );
         assert!(out.contains("测试输出中文内容😀"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Stream draining / deadlines (upstream buddy-launchers.test.ts +
+    // buddy-launcher-timeout.test.ts)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stream_drain_ms_bounds() {
+        assert_eq!(stream_drain_ms(0), 250);
+        assert_eq!(stream_drain_ms(10), 50);
+        assert_eq!(stream_drain_ms(50), 50);
+        assert_eq!(stream_drain_ms(200), 200);
+        assert_eq!(stream_drain_ms(600_000), 500);
+    }
+
+    #[test]
+    fn line_splitter_keeps_partial_lines_across_chunks() {
+        let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut splitter = LineSplitter::new({
+            let lines = lines.clone();
+            move |line| lines.lock().unwrap().push(line)
+        });
+        splitter.push("{\"type\":\"ass");
+        splitter.push("istant\"}\nsec");
+        splitter.push("ond\r\n");
+        assert_eq!(
+            *lines.lock().unwrap(),
+            vec!["{\"type\":\"assistant\"}", "second"]
+        );
+        splitter.push("tail-without-newline");
+        assert_eq!(lines.lock().unwrap().len(), 2);
+        splitter.flush();
+        assert_eq!(lines.lock().unwrap()[2], "tail-without-newline");
+    }
+
+    #[tokio::test]
+    async fn run_launcher_reassembles_ndjson_split_across_chunks() {
+        let input = RunLauncherInput {
+            command: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "printf '%s' '{\"a\":'; sleep 0.2; printf '%s\\n' '1}'".to_string(),
+            ],
+            cwd: "/tmp".to_string(),
+            timeout_ms: 10_000,
+            ..Default::default()
+        };
+        let mut lines = Vec::new();
+        run_launcher(&input, |line| lines.push(line), |_| {})
+            .await
+            .unwrap();
+        assert_eq!(lines, vec!["{\"a\":1}"]);
+    }
+
+    #[tokio::test]
+    async fn run_launcher_returns_when_grandchild_keeps_pipe_open() {
+        // The grandchild (`sleep`) inherits stdout and keeps the pipe open
+        // after the launcher exits — the drain must be bounded.
+        let input = RunLauncherInput {
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), "sleep 3 & echo done".to_string()],
+            cwd: "/tmp".to_string(),
+            timeout_ms: 30_000,
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+        let mut lines = Vec::new();
+        let result = run_launcher(&input, |line| lines.push(line), |_| {})
+            .await
+            .unwrap();
+        assert_eq!(result.exit_code, Some(0));
+        assert!(!result.timed_out);
+        assert_eq!(lines, vec!["done"]);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "drain was not bounded: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_launcher_marks_deadline_as_timed_out() {
+        let input = RunLauncherInput {
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), "sleep 10".to_string()],
+            cwd: "/tmp".to_string(),
+            timeout_ms: 300,
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+        let result = run_launcher(&input, |_| {}, |_| {}).await.unwrap();
+        assert!(result.timed_out);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "timeout did not settle: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_launcher_force_kills_when_sigterm_is_ignored() {
+        let input = RunLauncherInput {
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), "trap '' TERM; sleep 5".to_string()],
+            cwd: "/tmp".to_string(),
+            timeout_ms: 300,
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+        let result = run_launcher(&input, |_| {}, |_| {}).await.unwrap();
+        assert!(result.timed_out);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(1500),
+            "SIGKILL escalation fired too early: {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "SIGKILL escalation never settled: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_launcher_abort_is_not_reported_as_timed_out() {
+        let abort = Arc::new(AtomicBool::new(false));
+        let input = RunLauncherInput {
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), "sleep 10".to_string()],
+            cwd: "/tmp".to_string(),
+            timeout_ms: 300,
+            abort: Some(abort.clone()),
+            ..Default::default()
+        };
+        abort.store(true, Ordering::SeqCst);
+        let result = run_launcher(&input, |_| {}, |_| {}).await.unwrap();
+        assert!(!result.timed_out);
     }
 }

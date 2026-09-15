@@ -6,6 +6,16 @@ use regex::Regex;
 use serde_json::{Map, Value};
 use std::sync::OnceLock;
 
+/// How the renderer should present a streamed chunk (TS `streamMode`):
+/// `Delta` appends onto the current live text row (Cursor partial tokens),
+/// `Line` always starts a new row (tools, reconnect, other actors).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StreamMode {
+    Delta,
+    Line,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ParsedActorLine {
@@ -20,6 +30,8 @@ pub struct ParsedActorLine {
     /// True for noise events (e.g. system/hook) that carry no actor content.
     #[serde(default, skip_serializing_if = "is_false")]
     pub noise: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_mode: Option<StreamMode>,
 }
 
 fn is_false(v: &bool) -> bool {
@@ -215,31 +227,174 @@ pub fn parse_codex_json_line(line: &str) -> serde_json::Result<ParsedActorLine> 
 /// Parse Cursor Agent CLI's --output-format stream-json events.
 pub fn parse_cursor_stream_line(line: &str) -> serde_json::Result<ParsedActorLine> {
     let json: Value = serde_json::from_str(line)?;
-    let content = get(&json, "message").and_then(|m| get(m, "content"));
-    let mut text: Option<String> = None;
+    let session_id = cursor_session_id_from_event(&json);
+    let raw_type = get_text(&json, "type");
 
-    if let Some(content) = content.and_then(Value::as_array) {
-        let joined = content
-            .iter()
-            .map(text_from_content_part)
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join("");
-        if !joined.is_empty() {
-            text = Some(joined);
-        }
+    if raw_type.as_deref() == Some("result") {
+        // The final reply is taken from the result by extract_cursor_output;
+        // do not stream it as another UI row. Successful results stay
+        // non-noise so plain-text replies are not mistaken for
+        // context-exhausted placeholders.
+        let ok = get_text(&json, "subtype").as_deref() == Some("success")
+            && get_text(&json, "result")
+                .map(|r| !r.trim().is_empty())
+                .unwrap_or(false);
+        return Ok(ParsedActorLine {
+            session_id,
+            raw_type,
+            noise: !ok,
+            ..Default::default()
+        });
     }
 
-    if text.is_none() && get(&json, "type").and_then(Value::as_str) == Some("result") {
-        text = get_text(&json, "result");
+    if raw_type.as_deref() == Some("tool_call") {
+        let detail = cursor_tool_call_detail(&json);
+        return Ok(ParsedActorLine {
+            text: Some(detail.map(|d| format!("🔧 {d}")).unwrap_or_else(|| "🔧 tool".to_string())),
+            session_id,
+            raw_type,
+            stream_mode: Some(StreamMode::Line),
+            ..Default::default()
+        });
+    }
+
+    // Real Cursor reconnect/retry events use type=connection|retry, not system.
+    if raw_type.as_deref() == Some("connection") || raw_type.as_deref() == Some("retry") {
+        let subtype = get_text(&json, "subtype").or_else(|| raw_type.clone());
+        return Ok(ParsedActorLine {
+            text: subtype.map(|s| format!("⏳ {s}")),
+            session_id,
+            raw_type,
+            stream_mode: Some(StreamMode::Line),
+            ..Default::default()
+        });
+    }
+
+    if raw_type.as_deref() == Some("system") {
+        let subtype = get_text(&json, "subtype").unwrap_or_default();
+        if subtype.to_lowercase().contains("reconnect") || subtype.to_lowercase().contains("retry")
+        {
+            return Ok(ParsedActorLine {
+                text: Some(format!("⏳ {subtype}")),
+                session_id,
+                raw_type,
+                stream_mode: Some(StreamMode::Line),
+                ..Default::default()
+            });
+        }
+        return Ok(ParsedActorLine {
+            session_id,
+            raw_type,
+            noise: true,
+            ..Default::default()
+        });
+    }
+
+    if raw_type.as_deref() == Some("assistant") {
+        // Official consumer rules with --stream-partial-output:
+        // - timestamp_ms present, model_call_id absent → live delta (use)
+        // - timestamp_ms + model_call_id → buffered copy before tool (skip)
+        // - no timestamp_ms → final flush duplicate (skip)
+        let has_timestamp = get(&json, "timestamp_ms").map(json_present).unwrap_or(false);
+        let has_model_call_id = get(&json, "model_call_id").map(json_present).unwrap_or(false);
+        if !has_timestamp || has_model_call_id {
+            return Ok(ParsedActorLine {
+                session_id,
+                raw_type,
+                noise: true,
+                ..Default::default()
+            });
+        }
+
+        let content = get(&json, "message").and_then(|m| get(m, "content"));
+        let text = content.and_then(Value::as_array).and_then(|content| {
+            let joined = content
+                .iter()
+                .map(text_from_content_part)
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("");
+            if joined.is_empty() {
+                None
+            } else {
+                Some(joined)
+            }
+        });
+        return Ok(ParsedActorLine {
+            text,
+            session_id,
+            raw_type,
+            stream_mode: Some(StreamMode::Delta),
+            ..Default::default()
+        });
     }
 
     Ok(ParsedActorLine {
-        text,
-        session_id: cursor_session_id_from_event(&json),
-        raw_type: get_text(&json, "type"),
+        session_id,
+        raw_type,
+        noise: true,
         ..Default::default()
     })
+}
+
+/// TS `value != null && value !== ''`.
+fn json_present(value: &Value) -> bool {
+    !value.is_null() && !(value.is_string() && value.as_str() == Some(""))
+}
+
+fn cursor_tool_call_detail(event: &Value) -> Option<String> {
+    let subtype = get_text(event, "subtype");
+    let Some(tool_call) = get(event, "tool_call").and_then(object_value) else {
+        return subtype.map(|s| format!("tool {s}"));
+    };
+    for (key, value) in tool_call {
+        let name = {
+            let stripped = key.strip_suffix("ToolCall").unwrap_or(key);
+            if stripped.is_empty() {
+                key.clone()
+            } else {
+                stripped.to_string()
+            }
+        };
+        let args = get(value, "args")
+            .and_then(object_value)
+            .or_else(|| object_value(value));
+        let detail = args.and_then(cursor_tool_args_detail);
+        let label = match detail {
+            Some(d) => format!("{name} {d}"),
+            None => name,
+        };
+        return Some(match subtype {
+            Some(s) => format!("{label} ({s})"),
+            None => label,
+        });
+    }
+    subtype.map(|s| format!("tool {s}"))
+}
+
+fn cursor_tool_args_detail(args: &Map<String, Value>) -> Option<String> {
+    let path = args
+        .get("path")
+        .or_else(|| args.get("file_path"))
+        .or_else(|| args.get("file"))
+        .or_else(|| args.get("target_notebook"))
+        .and_then(text_value);
+    if let Some(path) = path {
+        return Some(truncate(&path, 80));
+    }
+    let cmd = args
+        .get("command")
+        .or_else(|| args.get("cmd"))
+        .and_then(text_value);
+    if let Some(cmd) = cmd {
+        return Some(truncate(&cmd, 80));
+    }
+    for value in args.values() {
+        if let Some(s) = text_value(value) {
+            return Some(truncate(&s, 80));
+        }
+    }
+    None
 }
 
 pub fn parse_opencode_json_line(line: &str) -> serde_json::Result<ParsedActorLine> {
@@ -742,32 +897,23 @@ fn extract_claude_output(raw_events: &str) -> String {
 
 fn extract_cursor_output(raw_events: &str) -> String {
     let mut result = String::new();
-    let mut chunks: Vec<String> = Vec::new();
     for event in parse_jsonl_buffer(raw_events) {
-        if get(&event, "type").and_then(Value::as_str) == Some("result") {
-            if let Some(final_text) = get_text(&event, "result") {
-                if !final_text.is_empty() {
-                    result = final_text;
-                }
+        if get(&event, "type").and_then(Value::as_str) != Some("result") {
+            continue;
+        }
+        // Only a successful, non-empty result is the formal reply. Do not fall
+        // back to concatenating assistant deltas (partial mode would
+        // duplicate badly).
+        if get_text(&event, "subtype").as_deref() != Some("success") {
+            continue;
+        }
+        if let Some(final_text) = get_text(&event, "result") {
+            if !final_text.is_empty() {
+                result = final_text;
             }
         }
-        let content = get(&event, "message").and_then(|m| get(m, "content"));
-        if let Some(content) = content.and_then(Value::as_array) {
-            chunks.extend(
-                content
-                    .iter()
-                    .map(text_from_content_part)
-                    .filter(|s| !s.is_empty()),
-            );
-        }
     }
-    (if !result.is_empty() {
-        result
-    } else {
-        chunks.join("")
-    })
-    .trim()
-    .to_string()
+    result.trim().to_string()
 }
 
 fn extract_opencode_output(raw_events: &str) -> String {
@@ -1133,6 +1279,7 @@ mod tests {
     fn extracts_cursor_stream_json_text_and_preserves_session_id() {
         let event = parse_cursor_stream_line(&stringify(json!({
             "type": "assistant",
+            "timestamp_ms": 1000,
             "session_id": "cursor-chat",
             "message": {
                 "role": "assistant",
@@ -1146,6 +1293,149 @@ mod tests {
             Some("{\"type\":\"chat\",\"content\":\"done\"}")
         );
         assert_eq!(event.session_id.as_deref(), Some("cursor-chat"));
+        assert_eq!(event.stream_mode, Some(StreamMode::Delta));
+    }
+
+    #[test]
+    fn shows_cursor_tool_and_reconnect_events_and_skips_buffered_assistant_copies() {
+        let tool = parse_cursor_stream_line(&stringify(json!({
+            "type": "tool_call",
+            "subtype": "started",
+            "session_id": "cursor-chat",
+            "tool_call": { "readToolCall": { "args": { "path": "/tmp/a.ts" } } }
+        })))
+        .unwrap();
+        assert_eq!(tool.text.as_deref(), Some("🔧 read /tmp/a.ts (started)"));
+        assert_eq!(tool.session_id.as_deref(), Some("cursor-chat"));
+        assert_eq!(tool.stream_mode, Some(StreamMode::Line));
+
+        let reconnecting = parse_cursor_stream_line(&stringify(json!({
+            "type": "connection",
+            "subtype": "reconnecting",
+            "session_id": "cursor-chat",
+            "timestamp_ms": 1776080427217i64
+        })))
+        .unwrap();
+        assert_eq!(reconnecting.text.as_deref(), Some("⏳ reconnecting"));
+        assert_eq!(reconnecting.raw_type.as_deref(), Some("connection"));
+        assert_eq!(reconnecting.stream_mode, Some(StreamMode::Line));
+
+        let retry = parse_cursor_stream_line(&stringify(json!({
+            "type": "retry",
+            "subtype": "starting",
+            "session_id": "cursor-chat"
+        })))
+        .unwrap();
+        assert_eq!(retry.text.as_deref(), Some("⏳ starting"));
+        assert_eq!(retry.raw_type.as_deref(), Some("retry"));
+        assert_eq!(retry.stream_mode, Some(StreamMode::Line));
+
+        let buffered = parse_cursor_stream_line(&stringify(json!({
+            "type": "assistant",
+            "timestamp_ms": 1,
+            "model_call_id": "call-1",
+            "session_id": "cursor-chat",
+            "message": { "content": [{ "type": "text", "text": "buffered copy" }] }
+        })))
+        .unwrap();
+        assert_eq!(buffered.text, None);
+        assert!(buffered.noise);
+
+        let final_flush = parse_cursor_stream_line(&stringify(json!({
+            "type": "assistant",
+            "session_id": "cursor-chat",
+            "message": { "content": [{ "type": "text", "text": "前文后文完整副本" }] }
+        })))
+        .unwrap();
+        assert_eq!(final_flush.text, None);
+        assert!(final_flush.noise);
+
+        let delta = parse_cursor_stream_line(&stringify(json!({
+            "type": "assistant",
+            "timestamp_ms": 2,
+            "session_id": "cursor-chat",
+            "message": { "content": [{ "type": "text", "text": "Hi" }] }
+        })))
+        .unwrap();
+        assert_eq!(delta.text.as_deref(), Some("Hi"));
+        assert_eq!(delta.stream_mode, Some(StreamMode::Delta));
+    }
+
+    #[test]
+    fn keeps_tool_separated_cursor_deltas_distinct() {
+        let events = [
+            json!({ "type": "assistant", "timestamp_ms": 1, "message": { "content": [{ "type": "text", "text": "前文" }] } }),
+            json!({ "type": "tool_call", "subtype": "started", "tool_call": { "readToolCall": { "args": { "path": "a.ts" } } } }),
+            json!({ "type": "assistant", "timestamp_ms": 2, "message": { "content": [{ "type": "text", "text": "后文" }] } }),
+            json!({ "type": "assistant", "message": { "content": [{ "type": "text", "text": "前文后文" }] } }),
+        ];
+        let mut rows: Vec<(String, StreamMode)> = Vec::new();
+        for event in events {
+            let parsed = parse_cursor_stream_line(&stringify(event)).unwrap();
+            let Some(text) = parsed.text else { continue };
+            let mode = parsed.stream_mode.unwrap_or(StreamMode::Line);
+            // Mirrors the renderer's appendActorStreamLine coalescing.
+            if mode == StreamMode::Delta {
+                if let Some(last) = rows.last_mut() {
+                    if last.1 == StreamMode::Delta {
+                        last.0.push_str(&text);
+                        continue;
+                    }
+                }
+            }
+            rows.push((text, mode));
+        }
+        let texts: Vec<&str> = rows.iter().map(|(text, _)| text.as_str()).collect();
+        assert_eq!(texts, vec!["前文", "🔧 read a.ts (started)", "后文"]);
+    }
+
+    #[test]
+    fn marks_successful_cursor_result_events_non_noise_without_streamed_text() {
+        let success = parse_cursor_stream_line(&stringify(json!({
+            "type": "result",
+            "subtype": "success",
+            "session_id": "cursor-chat",
+            "result": "plain text reply"
+        })))
+        .unwrap();
+        assert_eq!(success.text, None);
+        assert!(!success.noise);
+        assert_eq!(success.raw_type.as_deref(), Some("result"));
+
+        let failed = parse_cursor_stream_line(&stringify(json!({
+            "type": "result",
+            "subtype": "error",
+            "session_id": "cursor-chat",
+            "result": "request failed"
+        })))
+        .unwrap();
+        assert!(failed.noise);
+    }
+
+    #[test]
+    fn does_not_treat_cursor_assistant_text_as_final_output_when_result_is_missing() {
+        let output = extract_actor_output(
+            "cursor",
+            &[
+                stringify(json!({ "type": "assistant", "timestamp_ms": 1, "session_id": "cursor-chat", "message": { "content": [{ "type": "text", "text": "Hi — starting work." }] } })),
+                stringify(json!({ "type": "assistant", "timestamp_ms": 2, "session_id": "cursor-chat", "message": { "content": [{ "type": "text", "text": "{\"type\":\"chat\",\"content\":\"your response text here\"}" }] } })),
+            ]
+            .join("\n"),
+        );
+        assert_eq!(output, "");
+    }
+
+    #[test]
+    fn ignores_failed_cursor_result_events_when_extracting_final_output() {
+        let output = extract_actor_output(
+            "cursor",
+            &[
+                stringify(json!({ "type": "assistant", "timestamp_ms": 1, "session_id": "cursor-chat", "message": { "content": [{ "type": "text", "text": "almost" }] } })),
+                stringify(json!({ "type": "result", "subtype": "error", "session_id": "cursor-chat", "result": "request failed" })),
+            ]
+            .join("\n"),
+        );
+        assert_eq!(output, "");
     }
 
     #[test]

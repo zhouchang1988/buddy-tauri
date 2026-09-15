@@ -18,14 +18,15 @@
 
 use crate::buddy::events::BuddyEventBus;
 use crate::buddy::launchers::{
-    build_launcher_command, command_kind_for, kind_needs_pty, parser_actor_for_kind, run_launcher,
-    run_launcher_with_pty, LauncherCommand, LauncherCommandKind, LauncherCommandInput,
-    LauncherError, LauncherRunResult, PtyRunInput, RunLauncherInput,
+    build_launcher_command, command_kind_for, kind_needs_pty, launcher_timeout_message,
+    parser_actor_for_kind, run_launcher, run_launcher_with_pty, LauncherCommand,
+    LauncherCommandKind, LauncherCommandInput, LauncherError, LauncherRunResult, PtyRunInput,
+    RunLauncherInput,
 };
 use crate::buddy::locks::{create_run_lock, remove_run_lock};
 use crate::buddy::parsers::{
     extract_actor_output, parse_actor_events, parse_actor_line, parse_buddy_message,
-    parse_jsonl_buffer, BuddyMessage, ParsedActorLine,
+    parse_jsonl_buffer, BuddyMessage, ParsedActorLine, StreamMode,
 };
 use crate::buddy::prompts::{
     actor_display_name, build_actor_prompt, build_ping_prompt, hash_text,
@@ -34,6 +35,7 @@ use crate::buddy::prompts::{
 };
 use crate::buddy::queue_coordinator::QueueTaskRunner;
 use crate::buddy::store::{BuddyStore, EventInput, StoreError};
+use crate::buddy::task_services::TaskServiceManager;
 use crate::buddy::types::{
     ActiveRun, AttachmentMeta, BreakMarker, Countdown, CountdownInput, Event, Failure,
     GlobalSettings, HealthCheckResult, InstructionQueueItem, Launcher, SendMessageInput,
@@ -162,7 +164,7 @@ fn upgrade_patterns() -> &'static [Regex] {
             r"自动升级",
             r"升级完成",
             r"请重启",
-            r"已更新",
+            r"已更新(?:到|至)(?:最新版本|\s*v?\d)",
         ]
         .iter()
         .map(|p| Regex::new(&format!("(?i){p}")).unwrap())
@@ -186,8 +188,20 @@ fn cli_warning_patterns() -> &'static [Regex] {
 }
 
 /// Check if an error/stderr message indicates the child exited for an auto-upgrade.
+/// Inspected line by line: CLI upgrade banners are plain diagnostics, while
+/// stream-json records contain prompts, assistant replies and tool output —
+/// none of which proves an upgrade. JSON lines (including truncated NDJSON)
+/// are skipped.
 pub fn is_upgrade_exit_error(message: &str) -> bool {
-    upgrade_patterns().iter().any(|p| p.is_match(message))
+    message.lines().any(|line| {
+        if line.trim_start().starts_with('{') {
+            return false;
+        }
+        if serde_json::from_str::<serde_json::Value>(line).is_ok() {
+            return false;
+        }
+        upgrade_patterns().iter().any(|p| p.is_match(line))
+    })
 }
 
 /// Check if an error message indicates a context window limit error.
@@ -297,9 +311,16 @@ struct RunControllerEntry {
     abort: Arc<AtomicBool>,
 }
 
+/// native_cursor finished without a usable successful result — never
+/// auto-retry (TS `CursorMissingResultError`).
+pub const CURSOR_MISSING_RESULT_MESSAGE: &str =
+    "Cursor actor exited without a successful result event";
+
 /// The buddy task runner. Cheap to share behind an `Arc`; all mutable hooks
 /// are internally synchronized.
 pub struct BuddyRunner {
+    /// Task-scoped background service broker (TS `runner.services`).
+    services: Arc<TaskServiceManager>,
     store: Arc<BuddyStore>,
     execute_launchers: bool,
     events: Option<BuddyEventBus>,
@@ -311,18 +332,46 @@ pub struct BuddyRunner {
     /// In-memory abort handles for live runs; keyed by `workspace_key::task_id`
     /// (not run_id alone), mirroring the TS `runControllers` map.
     run_controllers: Mutex<HashMap<String, RunControllerEntry>>,
+    /// In-flight `start_task` calls per task (TS `pendingTasks`): cancellation
+    /// waits for live actor writes to settle before releasing the queue slot.
+    pending_tasks: Mutex<HashMap<String, PendingTasks>>,
+    /// Tasks whose cancellation is in progress (TS `cancelling`).
+    cancelling: Mutex<std::collections::HashSet<String>>,
+    /// Abort handles for in-flight health checks (TS `healthControllers`).
+    health_controllers: Mutex<HashMap<String, Arc<AtomicBool>>>,
+}
+
+/// Pending `start_task` futures for one task plus the signal fired when the
+/// last one settles.
+struct PendingTasks {
+    count: usize,
+    drained: Arc<tokio::sync::Notify>,
 }
 
 impl BuddyRunner {
     pub fn new(store: Arc<BuddyStore>, options: RunnerOptions) -> Self {
         BuddyRunner {
+            services: Arc::new(TaskServiceManager::new(store.clone())),
             store,
             execute_launchers: options.execute_launchers.unwrap_or(true),
             events: options.events,
             notifier: options.notifier,
             on_task_terminal: Mutex::new(None),
             run_controllers: Mutex::new(HashMap::new()),
+            pending_tasks: Mutex::new(HashMap::new()),
+            cancelling: Mutex::new(std::collections::HashSet::new()),
+            health_controllers: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Test hook: replace the supervisor spawner of the service manager.
+    #[cfg(test)]
+    pub fn replace_services(&mut self, services: Arc<TaskServiceManager>) {
+        self.services = services;
+    }
+
+    pub fn services(&self) -> &Arc<TaskServiceManager> {
+        &self.services
     }
 
     pub fn store(&self) -> &Arc<BuddyStore> {
@@ -393,6 +442,40 @@ impl BuddyRunner {
         task_id: &str,
         input: StartTaskInput,
     ) -> Result<String, RunnerError> {
+        let key = Self::run_controller_key(input.workspace_key.as_deref().unwrap_or(""), task_id);
+        if self.cancelling.lock().contains(&key) {
+            return Err(RunnerError::msg("Task cancellation is in progress"));
+        }
+        // Track the in-flight start so cancel_task can wait for live actor
+        // writes to settle (TS `pendingTasks`).
+        let drained = {
+            let mut pending = self.pending_tasks.lock();
+            let entry = pending.entry(key.clone()).or_insert_with(|| PendingTasks {
+                count: 0,
+                drained: Arc::new(tokio::sync::Notify::new()),
+            });
+            entry.count += 1;
+            entry.drained.clone()
+        };
+        let result = self.start_task_trampoline(task_id, input).await;
+        {
+            let mut pending = self.pending_tasks.lock();
+            if let Some(entry) = pending.get_mut(&key) {
+                entry.count -= 1;
+                if entry.count == 0 {
+                    pending.remove(&key);
+                    drained.notify_waiters();
+                }
+            }
+        }
+        result
+    }
+
+    async fn start_task_trampoline(
+        &self,
+        task_id: &str,
+        input: StartTaskInput,
+    ) -> Result<String, RunnerError> {
         let mut pending: Option<(StartTaskInput, bool)> = Some((input, false));
         let mut outer_run_id: Option<String> = None;
         while let Some((current, swallow_errors)) = pending.take() {
@@ -429,6 +512,10 @@ impl BuddyRunner {
             .ok_or_else(|| RunnerError::msg("workspace_key is required"))?;
         let detail = self.store.get_task_detail(task_id, &workspace_key).await?;
 
+        if detail.state.status == TaskStatus::Cancelled {
+            return Err(RunnerError::msg("Task has been cancelled"));
+        }
+
         // Health check: on first start (round 0, no sessions, no prior health
         // check), ping both actors. Skipped when an explicit actor is requested
         // or in test mode. Re-runs when the previous attempt failed
@@ -449,11 +536,27 @@ impl BuddyRunner {
                     state
                 })
                 .await?;
+            let key = Self::run_controller_key(&workspace_key, task_id);
+            let health_abort = Arc::new(AtomicBool::new(false));
+            self.health_controllers
+                .lock()
+                .insert(key.clone(), health_abort.clone());
+            if self.cancelling.lock().contains(&key) {
+                health_abort.store(true, Ordering::SeqCst);
+            }
             // The post-health-check implementer start is NOT an auto-advance:
             // its errors propagate (TS: runHealthCheck awaits startTask directly).
-            let (health_run_id, followup) = self
-                .run_health_check(task_id, &workspace_key, &implementer, &reviewer)
-                .await?;
+            let result = self
+                .run_health_check(
+                    task_id,
+                    &workspace_key,
+                    &implementer,
+                    &reviewer,
+                    Some(health_abort),
+                )
+                .await;
+            self.health_controllers.lock().remove(&key);
+            let (health_run_id, followup) = result?;
             return Ok((health_run_id, followup.map(|next| (next, false))));
         }
 
@@ -606,6 +709,13 @@ impl BuddyRunner {
         // errors are swallowed (TS: try/catch around the auto-start).
         let abort = Arc::new(AtomicBool::new(false));
         self.register_run_controller(&workspace_key, task_id, &run_id, abort.clone());
+        if self
+            .cancelling
+            .lock()
+            .contains(&Self::run_controller_key(&workspace_key, task_id))
+        {
+            abort.store(true, Ordering::SeqCst);
+        }
         let result = self
             .execute_actor(
                 task_id,
@@ -812,10 +922,154 @@ impl BuddyRunner {
 
     /// `interrupt`: move the task to PAUSED, clear `active_run`, emit
     /// `actor.interrupted`, then SIGTERM the in-flight launcher process via
-    /// the run's abort handle (upstream v1.2.24, `c3f95eda`).
+    /// the run's abort handle (upstream v1.2.24, `c3f95eda`). A no-op on
+    /// terminal (DONE/CANCELLED) tasks.
     pub async fn interrupt(&self, task_id: &str, workspace_key: &str) -> Result<(), RunnerError> {
+        let state = self.store.read_task_state(task_id, workspace_key).await?;
+        if state.status == TaskStatus::Done || state.status == TaskStatus::Cancelled {
+            return Ok(());
+        }
         self.pause_and_abort_run(task_id, workspace_key, Map::new())
             .await
+    }
+
+    /// Stop the task's Buddy-owned services, keeping external and explicitly
+    /// retained ones (TS `cleanupServices`). Returns false when some services
+    /// could not be stopped; records stay on disk for a later retry.
+    pub async fn cleanup_services(
+        &self,
+        task_id: &str,
+        workspace_key: &str,
+    ) -> Result<bool, RunnerError> {
+        self.store
+            .update_task_state(task_id, workspace_key, |mut state| {
+                state.service_cleanup_pending = Some(true);
+                state
+            })
+            .await?;
+        let failures = self
+            .services
+            .cleanup_task(task_id, workspace_key)
+            .await
+            .unwrap_or_else(|error| vec![error]);
+        self.store
+            .update_task_state(task_id, workspace_key, |mut state| {
+                state.service_cleanup_pending = Some(!failures.is_empty());
+                state
+            })
+            .await?;
+        if !failures.is_empty() {
+            self.store
+                .append_task_event(
+                    task_id,
+                    workspace_key,
+                    EventInput {
+                        event_type: "service.cleanup_failed".to_string(),
+                        payload: payload(serde_json::json!({ "errors": failures })),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            let mut meta = Map::new();
+            meta.insert("kind".to_string(), Value::from("service_cleanup_failed"));
+            self.store
+                .append_transcript(
+                    task_id,
+                    workspace_key,
+                    "system",
+                    &format!(
+                        "后台服务清理未完成，已暂停，保留记录供重试：{}",
+                        failures.join("; ")
+                    ),
+                    meta,
+                )
+                .await?;
+            return Ok(false);
+        }
+        self.store
+            .append_task_event(
+                task_id,
+                workspace_key,
+                EventInput {
+                    event_type: "service.cleanup_completed".to_string(),
+                    payload: payload(serde_json::json!({
+                        "retained": "external_or_explicitly_kept",
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        Ok(true)
+    }
+
+    /// `cancelTask`: abort the current actor/health check, wait for live
+    /// writes to settle, clean up services, then land in CANCELLED (or PAUSED
+    /// when cleanup failed, preserving records for a retry).
+    pub async fn cancel_task(&self, task_id: &str, workspace_key: &str) -> Result<(), RunnerError> {
+        let key = Self::run_controller_key(workspace_key, task_id);
+        if self.cancelling.lock().contains(&key) {
+            return Err(RunnerError::msg(
+                "Task cancellation is already in progress",
+            ));
+        }
+        self.cancelling.lock().insert(key.clone());
+        let result: Result<(), RunnerError> = async {
+            self.pause_and_abort_run(
+                task_id,
+                workspace_key,
+                payload(serde_json::json!({ "reason": "task_cancelled" })),
+            )
+            .await?;
+            // Do not delete task files or release its queue slot until live
+            // actor writes settle.
+            loop {
+                let drained = {
+                    let pending = self.pending_tasks.lock();
+                    pending.get(&key).map(|entry| entry.drained.clone())
+                };
+                match drained {
+                    None => break,
+                    Some(drained) => drained.notified().await,
+                }
+            }
+            let cleaned = self.cleanup_services(task_id, workspace_key).await?;
+            self.store
+                .update_task_state(task_id, workspace_key, |mut state| {
+                    state.status = if cleaned {
+                        TaskStatus::Cancelled
+                    } else {
+                        TaskStatus::Paused
+                    };
+                    state.active_run = None;
+                    state.countdown = None;
+                    state.pending_break = None;
+                    state.health_check = None;
+                    state.instruction_queue = Some(Vec::new());
+                    state.updated_at = Some(utc_now());
+                    state
+                })
+                .await?;
+            if !cleaned {
+                return Err(RunnerError::msg(
+                    "Task services could not be cleaned up; task records were preserved",
+                ));
+            }
+            self.store
+                .append_task_event(
+                    task_id,
+                    workspace_key,
+                    EventInput {
+                        event_type: "task.cancelled".to_string(),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            self.notify_terminal(workspace_key);
+            Ok(())
+        }
+        .await;
+        self.cancelling.lock().remove(&key);
+        result
     }
 
     /// `interruptAndInsert`: pull an instruction out of the queue, interrupt
@@ -898,6 +1152,14 @@ impl BuddyRunner {
             .await?;
         if let Some(run_id) = run_id {
             self.abort_run_controller(workspace_key, task_id, &run_id);
+        }
+        if let Some(health_abort) = self
+            .health_controllers
+            .lock()
+            .get(&Self::run_controller_key(workspace_key, task_id))
+            .cloned()
+        {
+            health_abort.store(true, Ordering::SeqCst);
         }
         Ok(())
     }
@@ -1002,7 +1264,9 @@ impl BuddyRunner {
         }
 
         // Streams one parsed text chunk to the event bus as `actor.stdout`.
-        let publish_stdout = |text: String| {
+        // `stream: 'delta'` marks Cursor partial-output deltas so the renderer
+        // coalesces them into one live row instead of one row per chunk.
+        let publish_stdout = |text: String, stream_mode: Option<StreamMode>| {
             if let Some(events) = &self.events {
                 events.publish(TaskEventEnvelope {
                     workspace_key: workspace_key.to_string(),
@@ -1014,7 +1278,10 @@ impl BuddyRunner {
                         actor: Some(actor.to_string()),
                         ts: utc_now(),
                         run_id: Some(run_id.to_string()),
-                        payload: payload(serde_json::json!({ "text": text })),
+                        payload: payload(serde_json::json!({
+                            "text": text,
+                            "stream": if stream_mode == Some(StreamMode::Delta) { "delta" } else { "line" },
+                        })),
                     },
                 });
             }
@@ -1045,8 +1312,8 @@ impl BuddyRunner {
                     {
                         output_lines.lock().push(line.to_string());
                         if let Ok(parsed) = parse_actor_line(&parser_actor, line) {
-                            if let Some(text) = parsed.text {
-                                publish_stdout(text);
+                            if let Some(text) = parsed.text.clone() {
+                                publish_stdout(text, parsed.stream_mode);
                             }
                         }
                     }
@@ -1070,8 +1337,8 @@ impl BuddyRunner {
             move |line| {
                 stdout_lines.lock().push(line.clone());
                 if let Ok(parsed) = parse_actor_line(&parser_actor, &line) {
-                    if let Some(text) = parsed.text {
-                        publish_stdout(text);
+                    if let Some(text) = parsed.text.clone() {
+                        publish_stdout(text, parsed.stream_mode);
                     }
                 }
             },
@@ -1088,27 +1355,51 @@ impl BuddyRunner {
         task_id: &str,
         workspace_key: &str,
         actor: &str,
+        abort: Option<Arc<AtomicBool>>,
     ) -> Result<PingOutcome, RunnerError> {
         let global_settings = self.store.read_global_settings().await?;
         let max_upgrade_retries = global_settings
             .max_upgrade_retries
             .unwrap_or(DEFAULT_MAX_UPGRADE_RETRIES);
 
+        let aborted = || {
+            abort
+                .as_ref()
+                .map(|flag| flag.load(Ordering::SeqCst))
+                .unwrap_or(false)
+        };
         let mut upgrade_retries = 0u32;
         loop {
-            let attempt = self.execute_ping_attempt(task_id, workspace_key, actor).await?;
+            if aborted() {
+                return Ok(PingOutcome {
+                    success: false,
+                    error: Some("Health check cancelled".to_string()),
+                    ..Default::default()
+                });
+            }
+            let attempt = self
+                .execute_ping_attempt(task_id, workspace_key, actor, abort.clone())
+                .await?;
+            if aborted() {
+                return Ok(PingOutcome {
+                    success: false,
+                    error: Some("Health check cancelled".to_string()),
+                    ..Default::default()
+                });
+            }
             if attempt.success {
                 return Ok(attempt);
             }
 
-            let combined = format!(
-                "{}\n{}\n{}",
-                attempt.stderr, attempt.stdout,
-                attempt.error.as_deref().unwrap_or("")
-            )
-            .trim()
-            .to_string();
-            if upgrade_retries < max_upgrade_retries && is_upgrade_exit_error(&combined) {
+            // Scan CLI diagnostics only; the extracted error text may contain
+            // arbitrary assistant content.
+            let combined = format!("{}\n{}", attempt.stderr, attempt.stdout)
+                .trim()
+                .to_string();
+            if !attempt.timed_out
+                && upgrade_retries < max_upgrade_retries
+                && is_upgrade_exit_error(&combined)
+            {
                 upgrade_retries += 1;
                 self.store
                     .append_task_event(
@@ -1160,6 +1451,7 @@ impl BuddyRunner {
         task_id: &str,
         workspace_key: &str,
         actor: &str,
+        abort: Option<Arc<AtomicBool>>,
     ) -> Result<PingOutcome, RunnerError> {
         let detail = self.store.get_task_detail(task_id, workspace_key).await?;
         let launcher = detail
@@ -1213,9 +1505,7 @@ impl BuddyRunner {
                 &run_id,
                 output_lines.clone(),
                 stderr_lines.clone(),
-                // Pings are not wired to the interrupt abort handle (TS: the
-                // `signal` param is only passed from `executeActor`).
-                None,
+                abort,
             )
             .await;
 
@@ -1232,6 +1522,17 @@ impl BuddyRunner {
                     &parser_actor_for_kind(actor, command.kind),
                     &raw_events,
                 );
+
+                if result.timed_out {
+                    return Ok(PingOutcome {
+                        success: false,
+                        timed_out: true,
+                        error: Some(launcher_timeout_message(PING_TIMEOUT_SECONDS * 1000)),
+                        stderr: stderr_text,
+                        stdout: stdout_text,
+                        ..Default::default()
+                    });
+                }
 
                 if result.exit_code != Some(0) {
                     let error = if !stderr_text.is_empty() {
@@ -1310,6 +1611,7 @@ impl BuddyRunner {
         workspace_key: &str,
         implementer: &str,
         reviewer: &str,
+        abort: Option<Arc<AtomicBool>>,
     ) -> Result<(String, Option<StartTaskInput>), RunnerError> {
         let actors = vec![implementer.to_string(), reviewer.to_string()];
         let mut pending_results = HashMap::new();
@@ -1365,10 +1667,20 @@ impl BuddyRunner {
 
         // TS: Promise.allSettled over both pings (concurrent).
         let (first, second) = tokio::join!(
-            self.execute_ping(task_id, workspace_key, &actors[0]),
-            self.execute_ping(task_id, workspace_key, &actors[1])
+            self.execute_ping(task_id, workspace_key, &actors[0], abort.clone()),
+            self.execute_ping(task_id, workspace_key, &actors[1], abort.clone())
         );
         let ping_results = [first, second];
+        if abort
+            .as_ref()
+            .map(|flag| flag.load(Ordering::SeqCst))
+            .unwrap_or(false)
+        {
+            return Ok((
+                format!("ping_cancelled_{}", Utc::now().timestamp_millis()),
+                None,
+            ));
+        }
 
         let mut all_passed = true;
         let mut failed_actor: Option<String> = None;
@@ -1646,10 +1958,15 @@ impl BuddyRunner {
                 .global_settings
                 .max_compact_retries
                 .unwrap_or(DEFAULT_MAX_COMPACT_RETRIES);
+            // Missing/invalid Cursor results and deadlines must fail
+            // immediately. Do not let stdout chatter (e.g. the words "new
+            // version") trip upgrade or context-window retries.
+            let skip_auto_retry = failure.skip_auto_retry;
             // Auto-reset session on context window limit errors. `/compact`
             // does NOT work in -p (pipe) mode, so we go straight to a session
             // reset with an injected compact context.
-            if is_context_window_limit_error(&failure.message)
+            if !skip_auto_retry
+                && is_context_window_limit_error(&failure.message)
                 && compact_retries < max_compact_retries
                 && session_id_for_actor(actor, &failure.detail.state, Some(&failure.detail.settings))
                     .is_some()
@@ -1698,19 +2015,20 @@ impl BuddyRunner {
             }
 
             // Auto-retry when the child process exits due to an auto-upgrade
-            // (e.g. wecode/codex). Include raw stdout: wecode prints upgrade
-            // progress to stdout, which `extractActorOutput` filters out.
+            // (e.g. wecode/codex). Inspect CLI diagnostics only (stderr + raw
+            // stdout), filtering stream-json records; the extracted failure
+            // message contains assistant/tool content and must not be scanned.
             let max_upgrade_retries = failure
                 .global_settings
                 .max_upgrade_retries
                 .unwrap_or(DEFAULT_MAX_UPGRADE_RETRIES);
-            let combined_message = format!(
-                "{}\n{}\n{}",
-                failure.message, failure.stderr_text, failure.stdout_text
-            )
-            .trim()
-            .to_string();
-            if upgrade_retries < max_upgrade_retries && is_upgrade_exit_error(&combined_message) {
+            let combined_message = format!("{}\n{}", failure.stderr_text, failure.stdout_text)
+                .trim()
+                .to_string();
+            if !skip_auto_retry
+                && upgrade_retries < max_upgrade_retries
+                && is_upgrade_exit_error(&combined_message)
+            {
                 self.store
                     .append_task_event(
                         task_id,
@@ -1812,6 +2130,10 @@ impl BuddyRunner {
             ),
             global_settings: Some(global_settings.clone()),
             user_message: Some(user_message.to_string()),
+            cursor_single_turn: Some(
+                command_kind_for(actor, &launcher.command) == LauncherCommandKind::NativeCursor,
+            ),
+            managed_services: Some(true),
         });
         let prompt_file = artifacts_dir.join(format!("{run_id}-prompt.md"));
         let output_file = artifacts_dir.join(format!("{run_id}-output.md"));
@@ -1858,14 +2180,30 @@ impl BuddyRunner {
         .await
         .map_err(|e| AttemptError::Fatal(e.into()))?;
 
-        // Everything below runs inside the TS try/catch/finally.
-        let run_result: Result<Option<StartTaskInput>, RunnerError> = async {
+        // Everything below runs inside the TS try/catch/finally. The error
+        // tuple's bool is the TS `skipAutoRetry` flag: missing/invalid Cursor
+        // results and launcher deadlines fail immediately, never tripping
+        // upgrade or context-window retries.
+        let run_result: Result<Option<StartTaskInput>, (RunnerError, bool)> = async {
+            // User interrupt: pause_and_abort_run already cleared active_run;
+            // do not open the service broker for a dead run (TS:
+            // `if (signal.aborted) return`).
+            if abort.load(Ordering::SeqCst) {
+                return Ok(None);
+            }
+            let mut service_run = self
+                .services
+                .open_run(task_id, workspace_key, run_id, &launcher.env)
+                .await
+                .map_err(|error| (RunnerError::msg(error), false))?;
+            let mut run_env = launcher.env.clone();
+            run_env.extend(service_run.env.clone());
             let started = std::time::Instant::now();
             let result = self
                 .run_actor_command(
                     &command,
                     &cwd,
-                    &launcher.env,
+                    &run_env,
                     launcher.timeout_seconds.saturating_mul(1000),
                     actor,
                     workspace_key,
@@ -1875,7 +2213,9 @@ impl BuddyRunner {
                     stderr_lines.clone(),
                     Some(abort.clone()),
                 )
-                .await?;
+                .await
+                .map_err(|error| (RunnerError::from(error), false))?;
+            service_run.close();
             let elapsed_ms = started.elapsed().as_millis() as u64;
 
             let stdout_text = output_lines.lock().join("\n");
@@ -1884,6 +2224,17 @@ impl BuddyRunner {
                 collect_output_text(actor, command.kind, &output_file, &stdout_text).await;
             let mut parsed_lines =
                 parse_actor_events(&parser_actor_for_kind(actor, command.kind), &raw_events);
+            // Persist the raw output above, but never accept partial text or
+            // retry a deadline as an upgrade/context reset, even if the child
+            // exits with code 0.
+            if result.timed_out {
+                return Err((
+                    RunnerError::msg(launcher_timeout_message(
+                        launcher.timeout_seconds.saturating_mul(1000),
+                    )),
+                    true,
+                ));
+            }
             if actor == "kimi"
                 && session_id.is_some()
                 && !parsed_lines.iter().any(|line| line.session_id.is_some())
@@ -1918,11 +2269,31 @@ impl BuddyRunner {
                 if !output_text.trim().is_empty() {
                     parts.push(output_text.trim().to_string());
                 }
-                return Err(RunnerError::msg(if parts.is_empty() {
-                    exit_error_message(result.exit_code, result.signal.as_deref())
-                } else {
-                    parts.join("\n\n")
-                }));
+                return Err((
+                    RunnerError::msg(if parts.is_empty() {
+                        exit_error_message(result.exit_code, result.signal.as_deref())
+                    } else {
+                        parts.join("\n\n")
+                    }),
+                    false,
+                ));
+            }
+
+            // native_cursor: require a successful result event. Never promote
+            // streamed assistant/tool text into a completed round when the
+            // CLI did not finish (TS `CursorMissingResultError`).
+            if command.kind == LauncherCommandKind::NativeCursor {
+                let has_success_result = parse_jsonl_buffer(&raw_events).iter().any(|event| {
+                    get_json(event, "type").and_then(Value::as_str) == Some("result")
+                        && get_json(event, "subtype").and_then(Value::as_str) == Some("success")
+                        && get_json(event, "result")
+                            .and_then(Value::as_str)
+                            .map(|r| !r.trim().is_empty())
+                            .unwrap_or(false)
+                });
+                if !has_success_result {
+                    return Err((RunnerError::msg(CURSOR_MISSING_RESULT_MESSAGE), true));
+                }
             }
 
             // Ghost output: raw events exist but nothing was extracted
@@ -1977,9 +2348,12 @@ impl BuddyRunner {
                 && non_noise_parsed_text.is_empty()
                 && parsed_lines.iter().any(|l| l.noise && l.text.is_some());
             if has_only_noise_output {
-                return Err(RunnerError::msg(format!(
-                    "Actor exited with only noise events (likely {CONTEXT_EXHAUSTED_PHRASE})"
-                )));
+                return Err((
+                    RunnerError::msg(format!(
+                        "Actor exited with only noise events (likely {CONTEXT_EXHAUSTED_PHRASE})"
+                    )),
+                    false,
+                ));
             } else if output_text.trim().is_empty() && !non_noise_raw.trim().is_empty() {
                 let parsed_text = if !non_noise_parsed_text.is_empty() {
                     non_noise_parsed_text
@@ -1995,15 +2369,19 @@ impl BuddyRunner {
                 if !parsed_text.is_empty() {
                     output_text = parsed_text;
                 } else {
-                    return Err(RunnerError::msg(truncate_chars(non_noise_raw.trim(), 500)));
+                    return Err((
+                        RunnerError::msg(truncate_chars(non_noise_raw.trim(), 500)),
+                        false,
+                    ));
                 }
             } else if output_text.trim().is_empty()
                 && !raw_events.trim().is_empty()
                 && non_noise_raw.trim().is_empty()
             {
                 // All events were noise (e.g. only system/hook events).
-                return Err(RunnerError::msg(
-                    "Actor exited without producing any output",
+                return Err((
+                    RunnerError::msg("Actor exited without producing any output"),
+                    false,
                 ));
             }
 
@@ -2018,6 +2396,7 @@ impl BuddyRunner {
                 result.exit_code.unwrap_or(0),
             )
             .await
+            .map_err(|error| (error, false))
         }
         .await;
 
@@ -2027,7 +2406,7 @@ impl BuddyRunner {
 
         match run_result {
             Ok(advance) => Ok(advance),
-            Err(error) => {
+            Err((error, skip_auto_retry)) => {
                 // Prefer the actual error message over stderr; only use stderr
                 // as fallback and filter out known CLI warnings.
                 let message = error.to_string();
@@ -2046,6 +2425,7 @@ impl BuddyRunner {
                     stdout_text,
                     detail,
                     global_settings,
+                    skip_auto_retry,
                 }))
             }
         }
@@ -2084,8 +2464,13 @@ impl BuddyRunner {
         let message = parse_buddy_message(text);
 
         // Degraded response detection: only noise placeholders with no buddy
-        // protocol JSON → treat as a context window limit error.
-        let has_non_noise_content = parsed_lines.iter().any(|l| l.text.is_some() && !l.noise);
+        // protocol JSON → treat as a context window limit error. A successful
+        // Cursor result counts as content even though it is not streamed as
+        // text (TS: `l.rawType === 'result' && !l.noise`).
+        let has_non_noise_content = parsed_lines.iter().any(|l| {
+            (l.text.is_some() && !l.noise)
+                || (l.raw_type.as_deref() == Some("result") && !l.noise)
+        });
         let has_buddy_json_in_output = match &message {
             BuddyMessage::Message { text: message_text } => message_text != text,
             BuddyMessage::Break { .. } => true,
@@ -2129,6 +2514,14 @@ impl BuddyRunner {
             .as_deref()
             .map(|q| !q.is_empty())
             .unwrap_or(false);
+        // Dual-break lands in DONE only after the task's Buddy-owned services
+        // are stopped; queued instructions keep the task running without
+        // cleanup (TS `cleanupServices` in completeActor).
+        let cleaned = if !break_confirmed || has_queued_instructions {
+            true
+        } else {
+            self.cleanup_services(task_id, workspace_key).await?
+        };
 
         let mut transcript_meta = Map::new();
         transcript_meta.insert("round".to_string(), Value::from(round));
@@ -2212,8 +2605,10 @@ impl BuddyRunner {
                 if break_confirmed {
                     state.status = if has_queued_instructions {
                         TaskStatus::Ready
-                    } else {
+                    } else if cleaned {
                         TaskStatus::Done
+                    } else {
+                        TaskStatus::Paused
                     };
                     state.countdown = None;
                     state.pending_break = None;
@@ -2260,6 +2655,12 @@ impl BuddyRunner {
             .await?;
 
         if break_confirmed {
+            if !cleaned {
+                // Cleanup failed: records were preserved and the task is
+                // PAUSED; skip the done bookkeeping (TS: early return).
+                self.notify_terminal(workspace_key);
+                return Ok(None);
+            }
             self.store
                 .append_task_event(
                     task_id,
@@ -2545,17 +2946,28 @@ impl BuddyRunner {
         });
 
         if let Some(other_break) = other_actor_break {
+            // The failed actor's round ends the task; stop its Buddy-owned
+            // services first. Cleanup failure keeps records and pauses.
+            let cleaned = self.cleanup_services(task_id, workspace_key).await?;
             let round = state_before.round;
             let failure_ts = failure.ts.clone().unwrap_or_else(utc_now);
             self.store
                 .update_task_state(task_id, workspace_key, |mut state| {
-                    state.status = TaskStatus::Done;
+                    state.status = if cleaned {
+                        TaskStatus::Done
+                    } else {
+                        TaskStatus::Paused
+                    };
                     state.active_run = None;
                     state.pending_break = None;
                     state.updated_at = Some(failure_ts.clone());
                     state
                 })
                 .await?;
+            if !cleaned {
+                self.notify_terminal(workspace_key);
+                return Ok(());
+            }
             self.append_actor_failed_event(task_id, workspace_key, actor, run_id, message)
                 .await?;
             let other_actor = other_break.actor.clone().unwrap_or_default();
@@ -3073,6 +3485,9 @@ struct PingOutcome {
     error: Option<String>,
     stderr: String,
     stdout: String,
+    /// The ping hit Buddy's deadline (TS `timedOut`) — never retried as an
+    /// upgrade exit.
+    timed_out: bool,
 }
 
 /// A failed actor run attempt, carrying everything the retry/marking logic
@@ -3083,6 +3498,10 @@ struct ActorRunFailure {
     stdout_text: String,
     detail: TaskDetail,
     global_settings: GlobalSettings,
+    /// Missing/invalid Cursor results and launcher deadlines must fail
+    /// immediately — never trip upgrade or context-window retries (TS
+    /// `skipAutoRetry`).
+    skip_auto_retry: bool,
 }
 
 enum AttemptError {
@@ -3486,8 +3905,12 @@ fn utc_now() -> String {
 
 /// Convert a `serde_json::json!` object into the owned payload map the store
 /// expects. Non-object values yield an empty map (never happens at call sites).
-fn payload(value: Value) -> Map<String, Value> {
-    match value {
+/// Object field access on a parsed JSON event (mirrors the parsers' `get`).
+fn get_json<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
+    value.as_object().and_then(|obj| obj.get(key))
+}
+
+fn payload(value: Value) -> Map<String, Value> {    match value {
         Value::Object(map) => map,
         _ => Map::new(),
     }
@@ -5957,5 +6380,401 @@ exit 0
     fn health_check_skipped_with_seed_session() {
         let state = health_state(json!({ "claude_session_id": "seed-123" }));
         assert!(!needs_health_check(&state, &health_settings(json!({}))));
+    }
+
+    // -----------------------------------------------------------------------
+    // Upgrade-exit detection (upstream buddy-upgrade-retry.test.ts)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn upgrade_detection_ignores_json_lines_and_tightened_patterns() {
+        assert!(!is_upgrade_exit_error("last_collect_at 已更新的作者"));
+        for event_type in ["user", "assistant", "tool_call", "result", "system"] {
+            let line = serde_json::to_string(&json!({
+                "type": event_type,
+                "message": { "content": "自动升级完成，请重启; A new version is available" }
+            }))
+            .unwrap();
+            assert!(!is_upgrade_exit_error(&line), "{event_type}");
+        }
+        assert!(is_upgrade_exit_error(
+            "{\"type\":\"user\",\"message\":\"hello\"}\nUpgrade complete, restarting..."
+        ));
+        // Truncated NDJSON never proves an upgrade either.
+        assert!(!is_upgrade_exit_error("{\"type\":\"tool_call\",\"result\":\"new version"));
+        // Tightened Chinese pattern: bare 已更新 no longer matches, versioned
+        // forms still do.
+        assert!(!is_upgrade_exit_error("配置已更新，继续使用"));
+        assert!(is_upgrade_exit_error("已更新到最新版本"));
+        assert!(is_upgrade_exit_error("已更新至 v2.1.0"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Cursor missing result / launcher deadlines (upstream
+    // buddy-runner-launcher.test.ts + buddy-launcher-timeout.test.ts)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn native_cursor_without_successful_result_fails_without_retry() {
+        let root = TempDir::new().unwrap();
+        let store = Arc::new(BuddyStore::new(root.path()));
+        let runs_file = root.path().join("runs");
+        let cursor = write_fake(
+            root.path(),
+            "cursor-agent",
+            &format!(
+                "#!/bin/sh\necho run >> {}\nprintf '%s\\n' '{{\"type\":\"assistant\",\"timestamp_ms\":1,\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"working\"}}]}}}}'\nexit 0\n",
+                runs_file.to_string_lossy()
+            ),
+        )
+        .await;
+        let created = create_demo_task(
+            &store,
+            &root,
+            settings_map(&[(
+                "launchers",
+                json!({ "cursor": { "command": cursor, "env": {}, "timeout_seconds": 5 } }),
+            )]),
+        )
+        .await;
+        let runner = live_runner(&store);
+        let error = runner
+            .start_task(
+                "demo",
+                StartTaskInput {
+                    workspace_key: Some(created.workspace_key.clone()),
+                    actor: Some("cursor".to_string()),
+                    message: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(CURSOR_MISSING_RESULT_MESSAGE),
+            "{error}"
+        );
+        let detail = store
+            .get_task_detail("demo", &created.workspace_key)
+            .await
+            .unwrap();
+        assert_eq!(detail.state.status, TaskStatus::Failed);
+        let types = event_types(&detail);
+        assert!(!types.contains(&"actor.upgrade_detected"));
+        assert!(!types.contains(&"actor.context_limit_detected"));
+        // No auto-retry of any kind: exactly one launcher invocation.
+        let runs = tokio::fs::read_to_string(&runs_file).await.unwrap();
+        assert_eq!(runs.trim().lines().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn timed_out_actor_fails_without_upgrade_retry_even_with_upgrade_banner() {
+        let root = TempDir::new().unwrap();
+        let store = Arc::new(BuddyStore::new(root.path()));
+        let actor = write_fake(
+            root.path(),
+            "slow-actor.sh",
+            "#!/bin/sh\nprintf 'Auto-update in progress\\n' >&2\nsleep 10\n",
+        )
+        .await;
+        patch_global_settings(&store, json!({ "max_upgrade_retries": 3 })).await;
+        let created = create_demo_task(
+            &store,
+            &root,
+            settings_map(&[(
+                "launchers",
+                json!({ "claude": { "command": actor, "env": {}, "timeout_seconds": 1 } }),
+            )]),
+        )
+        .await;
+        let runner = live_runner(&store);
+        let error = runner
+            .start_task(
+                "demo",
+                StartTaskInput {
+                    workspace_key: Some(created.workspace_key.clone()),
+                    actor: Some("claude".to_string()),
+                    message: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("timed out after 1 seconds"),
+            "{error}"
+        );
+        let detail = store
+            .get_task_detail("demo", &created.workspace_key)
+            .await
+            .unwrap();
+        let types = event_types(&detail);
+        assert!(!types.contains(&"actor.upgrade_detected"));
+        assert!(!types.contains(&"actor.completed"));
+        assert_eq!(detail.state.status, TaskStatus::Failed);
+    }
+
+    // -----------------------------------------------------------------------
+    // Task cancellation (upstream buddy-task-services.test.ts runner cases)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn cancel_task_aborts_live_health_checks_and_blocks_restart() {
+        let root = TempDir::new().unwrap();
+        let store = Arc::new(BuddyStore::new(root.path()));
+        let pids_file = root.path().join("health.pids");
+        let ping = write_fake(
+            root.path(),
+            "ping.sh",
+            &format!(
+                "#!/bin/sh\necho $$ >> {}\nexec sleep 30\n",
+                pids_file.to_string_lossy()
+            ),
+        )
+        .await;
+        let created = create_demo_task(
+            &store,
+            &root,
+            settings_map(&[(
+                "launchers",
+                json!({
+                    "claude": { "command": ping, "env": {}, "timeout_seconds": 30 },
+                    "codex": { "command": ping, "env": {}, "timeout_seconds": 30 }
+                }),
+            )]),
+        )
+        .await;
+        let runner = live_runner(&store);
+
+        let start = runner.start_task(
+            "demo",
+            StartTaskInput {
+                workspace_key: Some(created.workspace_key.clone()),
+                actor: None,
+                message: None,
+            },
+        );
+        let cancel = async {
+            // Wait until both health-check processes are live.
+            let mut pids: Vec<u32> = Vec::new();
+            for _ in 0..400 {
+                if let Ok(text) = tokio::fs::read_to_string(&pids_file).await {
+                    pids = text
+                        .trim()
+                        .lines()
+                        .filter_map(|line| line.parse().ok())
+                        .collect();
+                    if pids.len() == 2 {
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            assert_eq!(pids.len(), 2, "health checks did not start");
+            runner
+                .cancel_task("demo", &created.workspace_key)
+                .await
+                .unwrap();
+            pids
+        };
+        let (start_result, pids) = tokio::join!(start, cancel);
+        start_result.unwrap();
+
+        for pid in pids {
+            let alive = std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false);
+            assert!(!alive, "health check process {pid} survived cancellation");
+        }
+        let detail = store
+            .get_task_detail("demo", &created.workspace_key)
+            .await
+            .unwrap();
+        assert_eq!(detail.state.status, TaskStatus::Cancelled);
+        let types = event_types(&detail);
+        assert!(!types.contains(&"actor.started"));
+        assert!(types.contains(&"task.cancelled"));
+
+        // A cancelled task cannot be started again; interrupt is a no-op.
+        let error = runner
+            .start_task(
+                "demo",
+                StartTaskInput {
+                    workspace_key: Some(created.workspace_key.clone()),
+                    actor: None,
+                    message: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("cancelled"), "{error}");
+        runner
+            .interrupt("demo", &created.workspace_key)
+            .await
+            .unwrap();
+        let state = store
+            .read_task_state("demo", &created.workspace_key)
+            .await
+            .unwrap();
+        assert_eq!(state.status, TaskStatus::Cancelled);
+    }
+
+    // -----------------------------------------------------------------------
+    // Service cleanup across the task lifecycle (upstream
+    // buddy-task-services.test.ts runner cases)
+    // -----------------------------------------------------------------------
+
+    fn test_supervisor_spawner() -> crate::buddy::task_services::SupervisorSpawner {
+        Arc::new(|config, _log, _env| {
+            let config = config.clone();
+            tokio::spawn(async move {
+                let _ = crate::buddy::task_services::run_service_supervisor(config).await;
+            });
+            Ok(())
+        })
+    }
+
+    /// Seed a Buddy-owned service for `demo` as if an earlier actor run had
+    /// started it, then return the task to READY. Returns the service pid.
+    async fn seed_service(root: &TempDir, store: &Arc<BuddyStore>, runner: &BuddyRunner, workspace_key: &str) -> u32 {
+        store
+            .update_task_state("demo", workspace_key, |mut state| {
+                state.status = TaskStatus::RunningCursor;
+                state.active_run = Some(ActiveRun {
+                    run_id: Some("seed-run".to_string()),
+                    actor: "cursor".to_string(),
+                    started_at: utc_now(),
+                    status: Some("running".to_string()),
+                    session_id_before: None,
+                    session_id_after: None,
+                });
+                state
+            })
+            .await
+            .unwrap();
+        let mut lease = runner
+            .services()
+            .open_run("demo", workspace_key, "seed-run", &HashMap::new())
+            .await
+            .unwrap();
+        let socket = lease.env.get("BUDDY_SERVICE_SOCKET").unwrap().clone();
+        let token = lease.env.get("BUDDY_SERVICE_TOKEN").unwrap().clone();
+        let started = tokio::task::spawn_blocking(move || {
+            crate::buddy::task_services::service_client_run_with(
+                &[
+                    "start".to_string(),
+                    "worker".to_string(),
+                    "--".to_string(),
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "exec sleep 60".to_string(),
+                ],
+                Some(&socket),
+                Some(&token),
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        lease.close();
+        store
+            .update_task_state("demo", workspace_key, |mut state| {
+                state.status = TaskStatus::Ready;
+                state.active_run = None;
+                state
+            })
+            .await
+            .unwrap();
+        let pid = started.get("pid").and_then(Value::as_u64).unwrap() as u32;
+        assert!(process_alive(pid as i32));
+        pid
+    }
+
+    async fn dual_break_outcome(root: &TempDir, reviewer_script: &str, reviewer_name: &str) -> (Arc<BuddyStore>, TaskDetail, u32) {
+        let store = Arc::new(BuddyStore::new(root.path()));
+        let break_actor = write_fake(root.path(), "break.sh", BREAK_ACTOR).await;
+        let reviewer = write_fake(root.path(), reviewer_name, reviewer_script).await;
+        let created = create_demo_task(
+            &store,
+            root,
+            settings_map(&[(
+                "launchers",
+                json!({
+                    "claude": { "command": break_actor, "env": {}, "timeout_seconds": 10 },
+                    "codex": { "command": reviewer, "env": {}, "timeout_seconds": 10 }
+                }),
+            )]),
+        )
+        .await;
+        let mut runner = live_runner(&store);
+        runner.replace_services(Arc::new(TaskServiceManager::with_spawner(
+            store.clone(),
+            test_supervisor_spawner(),
+        )));
+        let worker_pid = seed_service(root, &store, &runner, &created.workspace_key).await;
+        runner
+            .start_task(
+                "demo",
+                StartTaskInput {
+                    workspace_key: Some(created.workspace_key.clone()),
+                    actor: Some("claude".to_string()),
+                    message: None,
+                },
+            )
+            .await
+            .unwrap();
+        let detail = store
+            .get_task_detail("demo", &created.workspace_key)
+            .await
+            .unwrap();
+        (store, detail, worker_pid)
+    }
+
+    #[tokio::test]
+    async fn dual_break_completion_cleans_task_services() {
+        let root = TempDir::new().unwrap();
+        let (_store, detail, worker_pid) =
+            dual_break_outcome(&root, BREAK_ACTOR, "break2.sh").await;
+        assert_eq!(detail.state.status, TaskStatus::Done);
+        let types = event_types(&detail);
+        assert!(types.contains(&"service.cleanup_completed"));
+        assert!(types.contains(&"task.done"));
+        assert!(!process_alive(worker_pid as i32));
+    }
+
+    #[tokio::test]
+    async fn break_confirmed_on_reviewer_failure_cleans_task_services() {
+        let root = TempDir::new().unwrap();
+        let (_store, detail, worker_pid) =
+            dual_break_outcome(&root, FAILING_ACTOR, "fail.sh").await;
+        assert_eq!(detail.state.status, TaskStatus::Done);
+        let types = event_types(&detail);
+        assert!(types.contains(&"service.cleanup_completed"));
+        assert!(!process_alive(worker_pid as i32));
+    }
+
+    #[tokio::test]
+    async fn cancel_task_on_paused_task_cleans_services() {
+        let root = TempDir::new().unwrap();
+        let store = Arc::new(BuddyStore::new(root.path()));
+        let created = create_demo_task(&store, &root, None).await;
+        let mut runner = live_runner(&store);
+        runner.replace_services(Arc::new(TaskServiceManager::with_spawner(
+            store.clone(),
+            test_supervisor_spawner(),
+        )));
+        let worker_pid = seed_service(&root, &store, &runner, &created.workspace_key).await;
+        runner
+            .cancel_task("demo", &created.workspace_key)
+            .await
+            .unwrap();
+        let state = store
+            .read_task_state("demo", &created.workspace_key)
+            .await
+            .unwrap();
+        assert_eq!(state.status, TaskStatus::Cancelled);
+        assert!(!process_alive(worker_pid as i32));
     }
 }

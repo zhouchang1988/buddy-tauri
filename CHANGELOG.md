@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.2.26-tauri] - 2026-09-14
+
+### Added
+- 同步上游 Electron 版 v1.2.26（`davidhoo/buddy`，上游提交 `29315635`）：任务级后台服务管理。跨轮 Worker/开发服务器走 Buddy 注入的 `"$BUDDY_SERVICE_CLI"` 命令启动与复用；任务双方确认完成、取消或删除时自动清理未要求保留的服务；支持登记外部服务（external）与用户明确要求保留的服务（--keep/keep）；应用重启后对终态/已删除/待清理任务继续清理。Rust 端：新增 `task_services.rs`（`TaskServiceManager` + 读时校验的 service schemas），记录落在 `dataRoot/runtime/services/`
+- 上游的 `service-supervisor.cjs` / `service-client.cjs` 两个 Node 脚本在本仓库以 Rust 重写并嵌入应用二进制（隐藏子命令 `__service_supervisor` / `__service_client`，经 `main.rs` 分流）：supervisor 独占服务进程组的信号权（先 SIGTERM 后 SIGKILL 并校验进程组退出），client 是 actor shell 调用的短命 CLI（`$BUDDY_SERVICE_CLI` 为生成的包装脚本）。不依赖用户机器上的 Node 运行时
+- 标题栏新增「取消任务」（新 IPC `buddy:cancelTask` ↔ `buddy_cancel_task`，bridge/preload/renderer 三处同步）：中止当前 actor/连通性检查、等待写入结束、清理服务后进入 CANCELLED 终态，隐藏继续按钮与输入框；与普通「停止/中断」可恢复暂停区分开；队列协调器不再把 CANCELLED 任务当阻塞者
+
+### Fixed
+- 同步上游 v1.2.26（`226a1ea0`）：Cursor 新会话与恢复会话均加 `--single-turn`，模型回合结束后不再死等后台 shell 即可交接下一轮；每轮提示追加 Cursor 回合生命周期与服务管理说明
+- 启动器超时改为明确报错（`timed_out` 标记 + `LauncherTimeoutError` 文案），不再误进升级重试或会话重置；中止/超时先 SIGTERM、1.5 秒后 SIGKILL 兜底；升级关键词检测只看 CLI 纯文本诊断，跳过 JSON 事件、截断 NDJSON 与已提取的任务回复；`已更新` 关键词收紧为「已更新到/至最新版本|版本号」
+
+## [1.2.25-tauri] - 2026-09-14
+
+### Fixed
+- 同步上游 Electron 版 v1.2.25（`davidhoo/buddy`，上游提交 `97779b47`）：原生 Cursor 重新启用 `--stream-partial-output` 恢复实时流式输出；renderer 新增 `lib/actor-stream.ts`，只把标记为 delta 的增量合并进同一行（工具/重连事件另起新行），不再一字一行刷屏
+- Cursor 必须交出非空的 `result.success` 正式结果才进入下一轮：`extract_cursor_output` 不再回退拼接 assistant 增量，runner 对缺失正式结果的 native_cursor 直接失败（`CURSOR_MISSING_RESULT`），且不触发升级/上下文自动重试
+- launcher 退出后不再死等被孙进程占着的 stdout/stderr 管道：按行分割器跨 chunk 重组 NDJSON 行，子进程退出后 drain 上限 `stream_drain_ms`（50–500ms），超时强制关闭管道
+
 ## [1.2.24-tauri] - 2026-08-26
 
 ### Fixed

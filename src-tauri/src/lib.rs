@@ -150,6 +150,7 @@ pub fn run() {
             commands::buddy_skip_countdown,
             commands::buddy_pause_countdown,
             commands::buddy_interrupt,
+            commands::buddy_cancel_task,
             commands::buddy_enqueue_instruction,
             commands::buddy_dequeue_instruction,
             commands::buddy_clear_instruction_queue,

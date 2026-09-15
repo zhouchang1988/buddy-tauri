@@ -57,6 +57,10 @@ describe('tauri-bridge', () => {
     invokeMock.mockResolvedValue([])
     await window.buddy.getTasks()
     expect(invokeMock).toHaveBeenCalledWith('buddy_get_tasks')
+
+    invokeMock.mockResolvedValue(undefined)
+    await window.buddy.cancelTask('task', 'workspace')
+    expect(invokeMock).toHaveBeenCalledWith('buddy_cancel_task', { taskId: 'task', workspaceKey: 'workspace' })
   })
 
   it('passes positional args as a camelCase args object', async () => {

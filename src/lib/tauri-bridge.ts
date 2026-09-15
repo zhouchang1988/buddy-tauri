@@ -59,6 +59,8 @@ const buddy = {
     invoke<void>('buddy_pause_countdown', { taskId, input }),
   interrupt: (taskId: string, workspaceKey?: string): Promise<void> =>
     invoke<void>('buddy_interrupt', { taskId, workspaceKey }),
+  cancelTask: (taskId: string, workspaceKey?: string): Promise<void> =>
+    invoke<void>('buddy_cancel_task', { taskId, workspaceKey }),
   enqueueInstruction: (taskId: string, workspaceKey: string, content: string, attachments?: AttachmentMeta[]): Promise<InstructionQueueItem> =>
     invoke<InstructionQueueItem>('buddy_enqueue_instruction', { taskId, workspaceKey, content, attachments }),
   dequeueInstruction: (taskId: string, workspaceKey: string, itemId: string): Promise<void> =>

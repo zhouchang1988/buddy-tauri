@@ -31,7 +31,7 @@ use super::types::{
     ExecutionMode, GitCommitPushResult, GitPushAvailability, GitPushResult, GitStatusResult,
     GlobalSettings, InstructionQueueItem,
     RoundEventSummary, SendMessageInput, StartTaskInput, Task, TaskDetail, TaskStats,
-    TestLauncherResult,
+    TestLauncherResult, TaskStatus,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -205,6 +205,10 @@ impl BuddyCoreService {
         workspace_key: Option<&str>,
     ) -> Result<(), ServiceError> {
         let workspace_key = require_workspace_key(workspace_key)?;
+        // Cancel first: abort any live actor run and clean up the task's
+        // Buddy-owned services. Cleanup failure preserves the task records
+        // and refuses the delete.
+        self.runner.cancel_task(task_id, workspace_key).await?;
         self.store.delete_task(task_id, workspace_key).await?;
         // Removing a blocking task may unblock the queue.
         spawn_on_task_terminal(&self.coordinator, workspace_key);
@@ -222,6 +226,13 @@ impl BuddyCoreService {
             .filter(|k| !k.is_empty())
             .ok_or_else(|| ServiceError::msg("workspace_key is required"))?;
         let state = self.store.read_task_state(task_id, &workspace_key).await.ok();
+        if state
+            .as_ref()
+            .map(|s| s.status == TaskStatus::Cancelled)
+            .unwrap_or(false)
+        {
+            return Err(ServiceError::msg("Task has been cancelled"));
+        }
         // A queued task must not be started directly by the renderer via
         // runner.startTask, because runner.canStartFrom('QUEUED') is false. Any
         // manual user start on a queued task goes through the coordinator's
@@ -278,6 +289,18 @@ impl BuddyCoreService {
         // A user interrupt moves the task to PAUSED, which may block (queued)
         // or free (immediate) the workspace queue. Re-evaluate once.
         spawn_on_task_terminal(&self.coordinator, workspace_key);
+        Ok(())
+    }
+
+    /// `cancelTask`: abort the current actor/health check, clean up the
+    /// task's services, and land in CANCELLED.
+    pub async fn cancel_task(
+        &self,
+        task_id: &str,
+        workspace_key: Option<&str>,
+    ) -> Result<(), ServiceError> {
+        let workspace_key = require_workspace_key(workspace_key)?;
+        self.runner.cancel_task(task_id, workspace_key).await?;
         Ok(())
     }
 
@@ -483,6 +506,13 @@ impl BuddyCoreService {
     /// head.
     pub async fn recover_interrupted_runs(&self) -> Result<(), ServiceError> {
         self.runner.recover_interrupted_runs().await?;
+        // After recovery, continue service cleanup for terminal/deleted or
+        // cleanup-pending tasks before reconciling the queues.
+        self.runner
+            .services()
+            .recover()
+            .await
+            .map_err(ServiceError::msg)?;
         self.coordinator.rebuild_and_reconcile_all().await?;
         Ok(())
     }

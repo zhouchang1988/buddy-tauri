@@ -2042,6 +2042,7 @@ fn default_task_state(
         compact_retries: None,
         execution_mode: Some(ExecutionMode::Immediate),
         queue: None,
+        service_cleanup_pending: None,
     }
 }
 

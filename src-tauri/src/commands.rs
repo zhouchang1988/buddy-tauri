@@ -130,6 +130,18 @@ pub async fn buddy_interrupt(
 }
 
 #[tauri::command]
+pub async fn buddy_cancel_task(
+    service: State<'_, BuddyCoreService>,
+    task_id: String,
+    workspace_key: Option<String>,
+) -> CmdResult<()> {
+    service
+        .cancel_task(&task_id, workspace_key.as_deref())
+        .await
+        .map_err(err)
+}
+
+#[tauri::command]
 pub async fn buddy_enqueue_instruction(
     service: State<'_, BuddyCoreService>,
     task_id: String,

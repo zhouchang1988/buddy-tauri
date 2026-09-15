@@ -266,6 +266,7 @@ impl QueueCoordinator {
             entry.state.queue.as_ref().map(|q| q.state.as_str()) != Some("superseded")
                 && entry.state.status != TaskStatus::Queued
                 && entry.state.status != TaskStatus::Done
+                && entry.state.status != TaskStatus::Cancelled
         });
 
         if has_incomplete_immediate || has_active_queued {
@@ -404,9 +405,9 @@ impl QueueCoordinator {
             if compare_queue_order(&other, &task.task_id, &state, task_id) != Ordering::Less {
                 continue;
             }
-            // Skip tasks already DONE (nothing to do) or already superseded
-            // (idempotent).
-            if other.status == TaskStatus::Done {
+            // Skip tasks already DONE/CANCELLED (nothing to do) or already
+            // superseded (idempotent).
+            if other.status == TaskStatus::Done || other.status == TaskStatus::Cancelled {
                 continue;
             }
             if other.queue.as_ref().map(|q| q.state.as_str()) == Some("superseded") {
@@ -627,6 +628,7 @@ fn find_blocker(
             effective_mode(&entry.state) == ExecutionMode::Queued
                 && entry.state.queue.as_ref().map(|q| q.state.as_str()) != Some("superseded")
                 && entry.state.status != TaskStatus::Done
+                && entry.state.status != TaskStatus::Cancelled
                 && entry.state.status != TaskStatus::Queued
         });
         if let Some(active) = active {
@@ -683,7 +685,7 @@ fn effective_mode(state: &TaskState) -> ExecutionMode {
 fn blocks_queue(state: &TaskState) -> bool {
     match state.execution_mode {
         None => is_actively_running(&state.status),
-        Some(_) => state.status != TaskStatus::Done,
+        Some(_) => state.status != TaskStatus::Done && state.status != TaskStatus::Cancelled,
     }
 }
 
@@ -942,6 +944,20 @@ mod tests {
         assert!(start_calls(&runner).is_empty());
         let state = store.read_task_state("q1", &ws).await.unwrap();
         assert_eq!(state.status, TaskStatus::Queued);
+    }
+
+    #[tokio::test]
+    async fn advances_past_cancelled_immediate_and_queued_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, runner, coordinator) = make_coordinator(dir.path());
+        let ws = create_immediate(&store, "immediate", "/tmp/repo").await;
+        set_status(&store, &ws, "immediate", TaskStatus::Cancelled).await;
+        let queued_ws = create_queued(&store, "cancelled", "/tmp/repo", Some("2026-01-01T00:00:01Z")).await;
+        assert_eq!(ws, queued_ws);
+        set_status(&store, &ws, "cancelled", TaskStatus::Cancelled).await;
+        create_queued(&store, "waiting", "/tmp/repo", Some("2026-01-01T00:00:02Z")).await;
+        coordinator.reconcile(&ws).await.unwrap();
+        assert_eq!(start_calls(&runner), vec!["waiting"]);
     }
 
     #[tokio::test]
