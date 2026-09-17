@@ -6,7 +6,7 @@ This file provides guidance to AI agents (Codex, Claude Code, Kimi Code, etc.) w
 
 **Research experiment, not a stable product.** This repository exists to study **switching development stacks with AI-assisted coding** — having AI agents port a complete Electron app to Tauri 2 (Rust backend). It is experimental; functionality and quality are not guaranteed. For a reliable Buddy experience, use the original project: [davidhoo/buddy](https://github.com/davidhoo/buddy) (official site: https://davidhoo.github.io/buddy/).
 
-Buddy is a macOS desktop app that orchestrates **dual-AI-agent collaborative coding**. Two AI actors (implementer + reviewer) take turns on a task, and the loop ends when both actors confirm "break" (dual-break). Supported actors: Claude Code, Codex, Cursor CLI, OpenCode, Kimi Code.
+Buddy is a macOS desktop app that orchestrates **dual-AI-agent collaborative coding**. Two AI actors (implementer + reviewer) take turns on a task, and the loop ends when both actors confirm "break" (dual-break). Supported actors: Claude Code, Codex, Cursor CLI, Antigravity (agy), OpenCode, Kimi Code.
 
 This repository is the **Tauri 2 port** of the Electron edition. The backend is Rust (`src-tauri/src/`), ported module by module from the Electron main process; the renderer is reused verbatim. Data directories (`~/Library/Application Support/buddy/`) are byte-for-byte compatible with the Electron edition.
 
@@ -26,7 +26,7 @@ pnpm dist:intel             # x86_64 (Intel) DMG
 pnpm dist:universal         # Universal DMG (both arches; needs rustup targets aarch64/x86_64-apple-darwin)
 ```
 
-Both test suites must stay green: `cargo test` (338 tests) **and** `pnpm test` (231 tests).
+Both test suites must stay green: `cargo test` (411 tests) **and** `pnpm test` (262 tests).
 
 ## Architecture
 
@@ -63,8 +63,8 @@ When adding a command: implement `#[tauri::command]` in `src-tauri/src/commands.
 | `events.rs` | `BuddyEventBus` (tokio broadcast) |
 | `coalesce.rs` | `StdoutCoalescer` — merges high-frequency `actor.stdout` chunks before `lib.rs` emits them to the webview (keeps typing responsive during runs) |
 | `redact.rs` | API-key/secret redaction before events are written |
-| `shell_path.rs` | `fix_shell_path()` — repairs PATH for GUI-launched apps |
-| `parsers.rs` | Streaming-output parsers for the 5 actor CLIs |
+| `shell_path.rs` | `fix_shell_path()` — login-shell PATH & proxy-env inheritance for GUI-launched apps (posix/fish/csh) |
+| `parsers.rs` | Streaming-output parsers for the 6 actor CLIs |
 | `prompts.rs` | Byte-faithful prompt construction |
 | `launchers.rs` | Native vs contract launcher detection and spawning (node-pty → `portable-pty`) |
 | `queue_coordinator.rs` | Instruction queue coordination across rounds |

@@ -316,6 +316,11 @@ struct RunControllerEntry {
 pub const CURSOR_MISSING_RESULT_MESSAGE: &str =
     "Cursor actor exited without a successful result event";
 
+/// native_agy finished without a usable SUCCESS result — never auto-retry
+/// (TS `AgyMissingResultError` default message).
+pub const AGY_MISSING_RESULT_MESSAGE: &str =
+    "Antigravity actor exited without a successful result event";
+
 /// The buddy task runner. Cheap to share behind an `Arc`; all mutable hooks
 /// are internally synchronized.
 pub struct BuddyRunner {
@@ -593,6 +598,7 @@ impl BuddyRunner {
             "claude" => TaskStatus::RunningClaude,
             "codex" => TaskStatus::RunningCodex,
             "cursor" => TaskStatus::RunningCursor,
+            "agy" => TaskStatus::RunningAgy,
             "opencode" => TaskStatus::RunningOpencode,
             "kimi" => TaskStatus::RunningKimi,
             other => return Err(RunnerError::msg(format!("Unsupported actor: {other}"))),
@@ -1488,6 +1494,7 @@ impl BuddyRunner {
             task_dir: Some(task_directory.to_string_lossy().to_string()),
             run_id: Some(run_id.clone()),
             session_id: None,
+            timeout_seconds: Some(launcher.timeout_seconds),
         });
 
         let output_lines = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -1711,6 +1718,11 @@ impl BuddyRunner {
                     "cursor" => {
                         if let Some(sid) = &sid {
                             session_updates.push(("cursor_session_id", sid.clone()));
+                        }
+                    }
+                    "agy" => {
+                        if let Some(sid) = &sid {
+                            session_updates.push(("agy_session_id", sid.clone()));
                         }
                     }
                     "opencode" => {
@@ -2167,6 +2179,7 @@ impl BuddyRunner {
             task_dir: Some(task_directory.to_string_lossy().to_string()),
             run_id: Some(run_id.to_string()),
             session_id: session_id.clone(),
+            timeout_seconds: Some(launcher.timeout_seconds),
         });
         let output_lines = Arc::new(Mutex::new(Vec::<String>::new()));
         let stderr_lines = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -2293,6 +2306,96 @@ impl BuddyRunner {
                 });
                 if !has_success_result {
                     return Err((RunnerError::msg(CURSOR_MISSING_RESULT_MESSAGE), true));
+                }
+            }
+
+            // native_agy: require a usable SUCCESS result (TS
+            // `AgyMissingResultError`). Same no-promotion rule as Cursor.
+            if command.kind == LauncherCommandKind::NativeAgy {
+                // agy silently opens a new conversation when --conversation id
+                // is stale. Warn before the success gate so failed rounds
+                // still surface context loss.
+                if let Some(existing) = &existing_session_id {
+                    let returned_id =
+                        last_value(parsed_lines.iter().map(|line| line.session_id.clone()));
+                    if let Some(returned) = returned_id {
+                        if &returned != existing {
+                            self.store
+                                .append_task_event(
+                                    task_id,
+                                    workspace_key,
+                                    EventInput {
+                                        event_type: "session.mismatch".to_string(),
+                                        actor: Some(actor.to_string()),
+                                        run_id: Some(run_id.to_string()),
+                                        payload: payload(serde_json::json!({
+                                            "requested_session_id": existing,
+                                            "returned_session_id": returned,
+                                            "message": "agy resumed with a different conversation_id; prior context may be lost"
+                                        })),
+                                        ..Default::default()
+                                    },
+                                )
+                                .await
+                                .map_err(|error| (RunnerError::msg(error.to_string()), false))?;
+                        }
+                    }
+                }
+
+                let mut explicit_error: Option<String> = None;
+                let has_success_result = parse_jsonl_buffer(&raw_events).iter().any(|event| {
+                    if get_json(event, "event").and_then(Value::as_str) == Some("result") {
+                        let Some(result) = get_json(event, "result").and_then(Value::as_object)
+                        else {
+                            return false;
+                        };
+                        if let Some(error) = result
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|e| !e.is_empty())
+                        {
+                            explicit_error = Some(error.to_string());
+                        }
+                        // Antigravity CLI sets status: 'SUCCESS' on clean runs.
+                        // However, when resuming a conversation where an earlier
+                        // turn encountered an error (such as a temporary quota
+                        // limit), the CLI trajectory metadata retains
+                        // status: 'ERROR' and the stale error text, even though
+                        // the current turn succeeded completely and emitted a
+                        // valid response. A non-empty response means success.
+                        return result
+                            .get("response")
+                            .and_then(Value::as_str)
+                            .map(|r| !r.trim().is_empty())
+                            .unwrap_or(false);
+                    }
+                    // --output-format json fallback (single object)
+                    if let Some(error) = get_json(event, "error")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|e| !e.is_empty())
+                    {
+                        explicit_error = Some(error.to_string());
+                    }
+                    get_json(event, "response")
+                        .and_then(Value::as_str)
+                        .map(|r| !r.trim().is_empty())
+                        .unwrap_or(false)
+                });
+                if !has_success_result {
+                    let event_error = parsed_lines
+                        .iter()
+                        .find(|l| l.raw_type.as_deref() == Some("error") && l.text.is_some())
+                        .and_then(|l| l.text.clone());
+                    let detail = explicit_error.or(event_error);
+                    return Err((
+                        RunnerError::msg(match detail {
+                            Some(d) => format!("Antigravity error: {d}"),
+                            None => AGY_MISSING_RESULT_MESSAGE.to_string(),
+                        }),
+                        true,
+                    ));
                 }
             }
 
@@ -2587,6 +2690,11 @@ impl BuddyRunner {
                     "cursor" => {
                         if let Some(sid) = &session_id {
                             state.cursor_session_id = Some(sid.clone());
+                        }
+                    }
+                    "agy" => {
+                        if let Some(sid) = &session_id {
+                            state.agy_session_id = Some(sid.clone());
                         }
                     }
                     "opencode" => {
@@ -3170,6 +3278,7 @@ impl BuddyRunner {
                     "claude_session_id" => state.claude_session_id = None,
                     "codex_thread_id" => state.codex_thread_id = None,
                     "cursor_session_id" => state.cursor_session_id = None,
+                    "agy_session_id" => state.agy_session_id = None,
                     "opencode_session_id" => state.opencode_session_id = None,
                     "kimi_session_id" => state.kimi_session_id = None,
                     _ => {}
@@ -3271,6 +3380,7 @@ impl BuddyRunner {
             repo_root: Some(cwd.to_string()),
             task_dir: Some(task_directory.to_string_lossy().to_string()),
             run_id: Some(summarize_run_id.clone()),
+            timeout_seconds: Some(launcher.timeout_seconds.min(120)),
             ..Default::default()
         });
 
@@ -3570,6 +3680,7 @@ pub fn session_id_for_actor(
         "claude" => settings.and_then(|s| s.seed_claude_session_id.clone()),
         "codex" => settings.and_then(|s| s.seed_codex_thread_id.clone()),
         "cursor" => settings.and_then(|s| s.seed_cursor_session_id.clone()),
+        "agy" => settings.and_then(|s| s.seed_agy_session_id.clone()),
         "opencode" => settings.and_then(|s| s.seed_opencode_session_id.clone()),
         "kimi" => settings.and_then(|s| s.seed_kimi_session_id.clone()),
         _ => None,
@@ -3579,6 +3690,7 @@ pub fn session_id_for_actor(
         "claude" => state.claude_session_id.clone(),
         "codex" => state.codex_thread_id.clone(),
         "cursor" => state.cursor_session_id.clone(),
+        "agy" => state.agy_session_id.clone(),
         "opencode" => state.opencode_session_id.clone(),
         "kimi" => state.kimi_session_id.clone(),
         _ => None,
@@ -3592,6 +3704,7 @@ fn session_field_for_actor(actor: &str) -> Option<&'static str> {
         "claude" => Some("claude_session_id"),
         "codex" => Some("codex_thread_id"),
         "cursor" => Some("cursor_session_id"),
+        "agy" => Some("agy_session_id"),
         "opencode" => Some("opencode_session_id"),
         "kimi" => Some("kimi_session_id"),
         _ => None,
@@ -3603,6 +3716,7 @@ fn set_session_field(state: &mut TaskState, key: &str, value: String) {
         "claude_session_id" => state.claude_session_id = Some(value),
         "codex_thread_id" => state.codex_thread_id = Some(value),
         "cursor_session_id" => state.cursor_session_id = Some(value),
+        "agy_session_id" => state.agy_session_id = Some(value),
         "opencode_session_id" => state.opencode_session_id = Some(value),
         "kimi_session_id" => state.kimi_session_id = Some(value),
         _ => {}
@@ -3614,6 +3728,7 @@ fn normalize_actor_role(actor: &str) -> &'static str {
         "claude" => "claude",
         "codex" => "codex",
         "cursor" => "cursor",
+        "agy" => "agy",
         "opencode" => "opencode",
         "kimi" => "kimi",
         _ => "system",
@@ -3674,6 +3789,7 @@ pub async fn collect_output_text(
         kind,
         LauncherCommandKind::NativeClaude
             | LauncherCommandKind::NativeCursor
+            | LauncherCommandKind::NativeAgy
             | LauncherCommandKind::NativeOpencode
             | LauncherCommandKind::NativeKimi
     ) {
@@ -6464,6 +6580,111 @@ exit 0
         // No auto-retry of any kind: exactly one launcher invocation.
         let runs = tokio::fs::read_to_string(&runs_file).await.unwrap();
         assert_eq!(runs.trim().lines().count(), 1);
+    }
+
+    // Upstream buddy-runner-launcher.test.ts: explicit Antigravity errors must
+    // surface to the user instead of the generic missing-result message.
+    #[tokio::test]
+    async fn native_agy_explicit_error_result_fails_without_retry() {
+        let root = TempDir::new().unwrap();
+        let store = Arc::new(BuddyStore::new(root.path()));
+        let agy = write_fake(
+            root.path(),
+            "agy",
+            concat!(
+                "#!/bin/sh\n",
+                "printf '%s\\n' '{\"event\":\"init\",\"conversation_id\":\"agy-1\"}'\n",
+                "printf '%s\\n' '{\"event\":\"step_update\",\"step_update\":{\"step_type\":\"agent_response\",\"text_delta\":\"working\"}}'\n",
+                "printf '%s\\n' '{\"event\":\"result\",\"result\":{\"status\":\"ERROR\",\"error\":\"Individual quota reached. Please upgrade your subscription.\"}}'\n",
+            ),
+        )
+        .await;
+        patch_global_settings(&store, json!({ "max_rounds": 1 })).await;
+        let created = create_demo_task(
+            &store,
+            &root,
+            settings_map(&[(
+                "launchers",
+                json!({ "agy": { "command": agy, "env": {}, "timeout_seconds": 5 } }),
+            )]),
+        )
+        .await;
+        let runner = live_runner(&store);
+        let error = runner
+            .start_task(
+                "demo",
+                StartTaskInput {
+                    workspace_key: Some(created.workspace_key.clone()),
+                    actor: Some("agy".to_string()),
+                    message: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("Individual quota reached"),
+            "{error}"
+        );
+        let detail = store
+            .get_task_detail("demo", &created.workspace_key)
+            .await
+            .unwrap();
+        assert_eq!(detail.state.status, TaskStatus::Failed);
+        let failure = detail.state.latest_failure.expect("latest_failure");
+        assert!(failure.message.contains("Individual quota reached"));
+    }
+
+    // Upstream buddy-runner-launcher.test.ts: a resumed turn whose trajectory
+    // keeps a stale ERROR status still counts when a real response was emitted.
+    #[tokio::test]
+    async fn native_agy_resumed_error_status_with_response_completes() {
+        let root = TempDir::new().unwrap();
+        let store = Arc::new(BuddyStore::new(root.path()));
+        let agy = write_fake(
+            root.path(),
+            "agy",
+            concat!(
+                "#!/bin/sh\n",
+                "printf '%s\\n' '{\"event\":\"init\",\"conversation_id\":\"agy-resumed-1\"}'\n",
+                "printf '%s\\n' '{\"event\":\"step_update\",\"step_update\":{\"step_type\":\"agent_response\",\"text_delta\":\"working\"}}'\n",
+                "printf '%s\\n' '{\"event\":\"result\",\"result\":{\"status\":\"ERROR\",\"error\":\"Individual quota reached. Resets in 14m39s.\",\"response\":\"{\\\"type\\\":\\\"break\\\",\\\"content\\\":\\\"done!\\\"}\"}}'\n",
+            ),
+        )
+        .await;
+        patch_global_settings(&store, json!({ "max_rounds": 1 })).await;
+        let created = create_demo_task(
+            &store,
+            &root,
+            settings_map(&[(
+                "launchers",
+                json!({ "agy": { "command": agy, "env": {}, "timeout_seconds": 5 } }),
+            )]),
+        )
+        .await;
+        let runner = live_runner(&store);
+        runner
+            .start_task(
+                "demo",
+                StartTaskInput {
+                    workspace_key: Some(created.workspace_key.clone()),
+                    actor: Some("agy".to_string()),
+                    message: None,
+                },
+            )
+            .await
+            .unwrap();
+        let detail = store
+            .get_task_detail("demo", &created.workspace_key)
+            .await
+            .unwrap();
+        assert_eq!(detail.state.status, TaskStatus::Paused);
+        assert!(event_types(&detail).contains(&"actor.completed"));
+        let agy_entry = detail
+            .transcript
+            .iter()
+            .find(|entry| entry.role == "agy")
+            .expect("agy transcript entry");
+        assert!(agy_entry.content.contains("done!"));
     }
 
     #[tokio::test]

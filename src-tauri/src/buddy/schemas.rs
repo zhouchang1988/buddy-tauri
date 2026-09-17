@@ -107,6 +107,7 @@ struct TaskSettingsWire {
     seed_claude_session_id: Option<String>,
     seed_codex_thread_id: Option<String>,
     seed_cursor_session_id: Option<String>,
+    seed_agy_session_id: Option<String>,
     seed_opencode_session_id: Option<String>,
     seed_kimi_session_id: Option<String>,
 }
@@ -129,6 +130,7 @@ pub fn parse_task_settings(input: &serde_json::Value) -> Result<TaskSettings, Sc
         seed_claude_session_id: wire.seed_claude_session_id,
         seed_codex_thread_id: wire.seed_codex_thread_id,
         seed_cursor_session_id: wire.seed_cursor_session_id,
+        seed_agy_session_id: wire.seed_agy_session_id,
         seed_opencode_session_id: wire.seed_opencode_session_id,
         seed_kimi_session_id: wire.seed_kimi_session_id,
     })
@@ -151,6 +153,7 @@ struct GlobalSettingsWire {
     seed_claude_session_id: Option<String>,
     seed_codex_thread_id: Option<String>,
     seed_cursor_session_id: Option<String>,
+    seed_agy_session_id: Option<String>,
     seed_opencode_session_id: Option<String>,
     seed_kimi_session_id: Option<String>,
     max_compact_retries: Option<u32>,
@@ -203,6 +206,7 @@ pub fn parse_global_settings(input: &serde_json::Value) -> Result<GlobalSettings
         seed_claude_session_id: wire.seed_claude_session_id,
         seed_codex_thread_id: wire.seed_codex_thread_id,
         seed_cursor_session_id: wire.seed_cursor_session_id,
+        seed_agy_session_id: wire.seed_agy_session_id,
         seed_opencode_session_id: wire.seed_opencode_session_id,
         seed_kimi_session_id: wire.seed_kimi_session_id,
         max_compact_retries: wire.max_compact_retries,

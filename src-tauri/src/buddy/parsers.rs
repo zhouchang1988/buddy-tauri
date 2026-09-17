@@ -1,5 +1,5 @@
-//! Parsers for the streaming JSON output of the five actor CLIs
-//! (claude / codex / cursor / opencode / kimi). Port of
+//! Parsers for the streaming JSON output of the six actor CLIs
+//! (claude / codex / cursor / agy / opencode / kimi). Port of
 //! `src/main/buddy/parsers.ts` from the Electron edition.
 
 use regex::Regex;
@@ -599,11 +599,181 @@ fn kimi_raw_type(json: &Value) -> Option<String> {
     get_text(json, "type").or_else(|| get_text(json, "role"))
 }
 
+/// Parse Antigravity CLI (`agy`) --output-format stream-json events.
+pub fn parse_agy_stream_line(line: &str) -> serde_json::Result<ParsedActorLine> {
+    let json: Value = serde_json::from_str(line)?;
+    let event_name = get_text(&json, "event");
+    let session_id = agy_session_id_from_event(&json);
+    let raw_type = event_name.clone().or_else(|| get_text(&json, "type"));
+
+    if event_name.as_deref() == Some("init") {
+        return Ok(ParsedActorLine {
+            session_id,
+            raw_type,
+            noise: true,
+            ..Default::default()
+        });
+    }
+
+    if event_name.as_deref() == Some("result") {
+        let result = get(&json, "result").and_then(object_value);
+        let status = result.and_then(|r| r.get("status")).and_then(text_value);
+        let response = result
+            .and_then(|r| r.get("response"))
+            .and_then(text_value)
+            .map(|r| r.trim().to_string())
+            .filter(|r| !r.is_empty());
+        let error_text = result
+            .and_then(|r| r.get("error"))
+            .and_then(text_value)
+            .map(|e| e.trim().to_string())
+            .filter(|e| !e.is_empty());
+        // Successful results stay non-noise so plain-text replies are not
+        // mistaken for context-exhausted placeholders. Final reply comes from
+        // extract_agy_output.
+        let ok = response.is_some() || status.as_deref() == Some("SUCCESS");
+        if !ok && error_text.is_some() {
+            return Ok(ParsedActorLine {
+                text: error_text,
+                session_id,
+                raw_type: Some("error".to_string()),
+                stream_mode: Some(StreamMode::Line),
+                ..Default::default()
+            });
+        }
+        return Ok(ParsedActorLine {
+            session_id,
+            raw_type,
+            noise: !ok,
+            ..Default::default()
+        });
+    }
+
+    if event_name.as_deref() == Some("step_update") {
+        let step = get(&json, "step_update").and_then(object_value);
+        let step_type = step.and_then(|s| s.get("step_type")).and_then(text_value);
+        match step_type.as_deref() {
+            Some("tool") => {
+                let tool_name = step
+                    .and_then(|s| s.get("tool_name"))
+                    .and_then(text_value)
+                    .unwrap_or_else(|| "tool".to_string());
+                let tool_info = step
+                    .and_then(|s| s.get("tool_info"))
+                    .and_then(object_value);
+                let params = tool_info
+                    .and_then(|info| info.get("parameters"))
+                    .and_then(object_value)
+                    .or(tool_info);
+                let detail = params.and_then(agy_tool_args_detail);
+                return Ok(ParsedActorLine {
+                    text: Some(match detail {
+                        Some(d) => format!("🔧 {} {}", tool_name, d),
+                        None => format!("🔧 {}", tool_name),
+                    }),
+                    session_id,
+                    raw_type: step_type,
+                    stream_mode: Some(StreamMode::Line),
+                    ..Default::default()
+                });
+            }
+            Some("agent_response") => {
+                let delta = step.and_then(|s| s.get("text_delta")).and_then(text_value);
+                if let Some(delta) = delta {
+                    return Ok(ParsedActorLine {
+                        text: Some(delta),
+                        session_id,
+                        raw_type: step_type,
+                        stream_mode: Some(StreamMode::Delta),
+                        ..Default::default()
+                    });
+                }
+                return Ok(ParsedActorLine {
+                    session_id,
+                    raw_type: step_type,
+                    noise: true,
+                    ..Default::default()
+                });
+            }
+            _ => {
+                return Ok(ParsedActorLine {
+                    session_id,
+                    raw_type: step_type.or(raw_type),
+                    noise: true,
+                    ..Default::default()
+                });
+            }
+        }
+    }
+
+    Ok(ParsedActorLine {
+        session_id,
+        raw_type,
+        noise: true,
+        ..Default::default()
+    })
+}
+
+fn agy_session_id_from_event(event: &Value) -> Option<String> {
+    if let Some(top) = get_text(event, "conversation_id") {
+        return Some(top);
+    }
+    if let Some(from_result) = get(event, "result")
+        .and_then(object_value)
+        .and_then(|r| r.get("conversation_id"))
+        .and_then(text_value)
+    {
+        return Some(from_result);
+    }
+    get(event, "step_update")
+        .and_then(object_value)
+        .and_then(|s| s.get("conversation_id"))
+        .and_then(text_value)
+}
+
+fn agy_tool_args_detail(args: &Map<String, Value>) -> Option<String> {
+    let path = [
+        "AbsolutePath",
+        "DirectoryPath",
+        "SearchDirectory",
+        "SearchPath",
+        "TargetFile",
+        "FilePath",
+        "path",
+        "file_path",
+        "file",
+    ]
+    .iter()
+    .find_map(|key| args.get(*key).and_then(text_value));
+    if let Some(path) = path {
+        return Some(truncate(&path, 80));
+    }
+    let cmd = ["CommandLine", "Command", "command", "cmd"]
+        .iter()
+        .find_map(|key| args.get(*key).and_then(text_value));
+    if let Some(cmd) = cmd {
+        return Some(truncate(&cmd, 80));
+    }
+    let query = ["Query", "query", "Pattern", "pattern"]
+        .iter()
+        .find_map(|key| args.get(*key).and_then(text_value));
+    if let Some(query) = query {
+        return Some(truncate(&query, 80));
+    }
+    for value in args.values() {
+        if let Some(s) = text_value(value) {
+            return Some(truncate(&s, 80));
+        }
+    }
+    None
+}
+
 pub fn parse_actor_line(actor: &str, line: &str) -> serde_json::Result<ParsedActorLine> {
     match actor {
         "claude" => parse_claude_stream_line(line),
         "codex" => parse_codex_json_line(line),
         "cursor" => parse_cursor_stream_line(line),
+        "agy" => parse_agy_stream_line(line),
         "opencode" => parse_opencode_json_line(line),
         "kimi" => parse_kimi_json_line(line),
         _ => parse_codex_json_line(line),
@@ -631,6 +801,7 @@ pub fn extract_actor_output(actor: &str, raw_events: &str) -> String {
     match actor {
         "claude" => extract_claude_output(raw_events),
         "cursor" => extract_cursor_output(raw_events),
+        "agy" => extract_agy_output(raw_events),
         "opencode" => extract_opencode_output(raw_events),
         "kimi" => extract_kimi_output(raw_events),
         _ => extract_generic_json_output(raw_events),
@@ -910,6 +1081,33 @@ fn extract_cursor_output(raw_events: &str) -> String {
         if let Some(final_text) = get_text(&event, "result") {
             if !final_text.is_empty() {
                 result = final_text;
+            }
+        }
+    }
+    result.trim().to_string()
+}
+
+fn extract_agy_output(raw_events: &str) -> String {
+    let mut result = String::new();
+    for event in parse_jsonl_buffer(raw_events) {
+        // stream-json: { event: 'result', result: { status, response } }
+        if get(&event, "event").and_then(Value::as_str) == Some("result") {
+            let payload = get(&event, "result").and_then(object_value);
+            let final_text = payload.and_then(|p| p.get("response")).and_then(text_value);
+            if let Some(final_text) = final_text {
+                result = final_text;
+                continue;
+            }
+            continue;
+        }
+        // fallback for --output-format json (single object, no event wrapper)
+        if let Some(final_text) = get_text(&event, "response") {
+            result = final_text;
+            continue;
+        }
+        if get(&event, "status").and_then(Value::as_str) == Some("SUCCESS") {
+            if let Some(fallback_text) = get_text(&event, "response") {
+                result = fallback_text;
             }
         }
     }
@@ -2091,5 +2289,165 @@ mod tests {
             }
             other => panic!("expected message, got {:?}", other),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // agy (Antigravity) stream-json — port of buddy-parsers-agy.test.ts
+    // -----------------------------------------------------------------------
+
+    fn agy_sample() -> String {
+        [
+            stringify(json!({
+                "event": "init",
+                "conversation_id": "agy-conv-1",
+                "init": { "cwd": "/tmp", "tools": ["list_dir"], "permission_mode": "always-proceed" }
+            })),
+            stringify(json!({
+                "event": "step_update",
+                "step_update": {
+                    "conversation_id": "agy-conv-1",
+                    "step_index": 1,
+                    "state": "ACTIVE",
+                    "step_type": "tool",
+                    "tool_name": "list_dir",
+                    "tool_info": { "name": "list_dir", "parameters": { "DirectoryPath": "/tmp" } }
+                }
+            })),
+            stringify(json!({
+                "event": "step_update",
+                "step_update": {
+                    "conversation_id": "agy-conv-1",
+                    "step_index": 2,
+                    "state": "ACTIVE",
+                    "step_type": "agent_response",
+                    "text_delta": "hello "
+                }
+            })),
+            stringify(json!({
+                "event": "step_update",
+                "step_update": {
+                    "conversation_id": "agy-conv-1",
+                    "step_index": 2,
+                    "state": "DONE",
+                    "step_type": "agent_response",
+                    "text_delta": "agy"
+                }
+            })),
+            stringify(json!({
+                "event": "result",
+                "result": {
+                    "conversation_id": "agy-conv-1",
+                    "status": "SUCCESS",
+                    "response": "hello agy\n",
+                    "duration_seconds": 1.5,
+                    "usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 10,
+                        "cache_read_tokens": 50
+                    }
+                }
+            })),
+        ]
+        .join("\n")
+    }
+
+    #[test]
+    fn agy_extracts_conversation_id_tool_lines_and_deltas() {
+        let lines = parse_actor_events("agy", &agy_sample());
+        assert_eq!(lines[0].session_id.as_deref(), Some("agy-conv-1"));
+        assert!(lines[0].noise);
+        assert_eq!(lines[0].raw_type.as_deref(), Some("init"));
+        assert!(lines[1].text.as_deref().unwrap_or("").contains("list_dir"));
+        assert!(lines[1].text.as_deref().unwrap_or("").contains("/tmp"));
+        assert_eq!(lines[2].text.as_deref(), Some("hello "));
+        assert_eq!(lines[2].stream_mode, Some(StreamMode::Delta));
+        assert_eq!(lines[4].session_id.as_deref(), Some("agy-conv-1"));
+        assert_eq!(lines[4].raw_type.as_deref(), Some("result"));
+        assert!(!lines[4].noise);
+    }
+
+    #[test]
+    fn agy_extracts_final_reply_only_from_success_result_response() {
+        assert_eq!(extract_actor_output("agy", &agy_sample()), "hello agy");
+    }
+
+    #[test]
+    fn agy_marks_error_results_as_error_lines_without_promoting_empty_success() {
+        let line = parse_agy_stream_line(&stringify(json!({
+            "event": "result",
+            "result": { "conversation_id": "x", "status": "ERROR", "response": "", "error": "boom" }
+        })))
+        .unwrap();
+        assert_eq!(line.raw_type.as_deref(), Some("error"));
+        assert_eq!(line.text.as_deref(), Some("boom"));
+        assert_eq!(
+            extract_actor_output(
+                "agy",
+                &stringify(json!({
+                    "event": "result",
+                    "result": { "status": "ERROR", "response": "", "error": "boom" }
+                }))
+            ),
+            ""
+        );
+    }
+
+    #[test]
+    fn agy_extracts_non_empty_response_even_if_status_is_error_on_resumed_session() {
+        let output = extract_actor_output(
+            "agy",
+            &stringify(json!({
+                "event": "result",
+                "result": {
+                    "status": "ERROR",
+                    "error": "Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 14m39s.",
+                    "response": "{\"type\":\"chat\",\"content\":\"all done\"}"
+                }
+            })),
+        );
+        assert_eq!(output, "{\"type\":\"chat\",\"content\":\"all done\"}");
+    }
+
+    #[test]
+    fn agy_extracts_tool_detail_for_native_tools() {
+        let view_file = parse_agy_stream_line(&stringify(json!({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "tool",
+                "tool_name": "view_file",
+                "tool_info": {
+                    "parameters": {
+                        "AbsolutePath": "/Users/test/Code/index.ts",
+                        "toolAction": "Viewing file",
+                        "toolSummary": "File view"
+                    }
+                }
+            }
+        })))
+        .unwrap();
+        assert_eq!(
+            view_file.text.as_deref(),
+            Some("🔧 view_file /Users/test/Code/index.ts")
+        );
+
+        let run_command = parse_agy_stream_line(&stringify(json!({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "tool",
+                "tool_name": "run_command",
+                "tool_info": {
+                    "parameters": {
+                        "Cwd": "/Users/test/Code",
+                        "CommandLine": "pnpm test",
+                        "toolAction": "Running tests"
+                    }
+                }
+            }
+        })))
+        .unwrap();
+        assert_eq!(
+            run_command.text.as_deref(),
+            Some("🔧 run_command pnpm test")
+        );
     }
 }

@@ -698,6 +698,7 @@ fn is_actively_running(status: &TaskStatus) -> bool {
             | TaskStatus::RunningClaude
             | TaskStatus::RunningCodex
             | TaskStatus::RunningCursor
+            | TaskStatus::RunningAgy
             | TaskStatus::RunningOpencode
             | TaskStatus::RunningKimi
             | TaskStatus::Countdown

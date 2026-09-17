@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.3.1-tauri] - 2026-09-16
+
+### Fixed
+- 同步上游 Electron 版 v1.3.1（`davidhoo/buddy`，上游提交 `3ec793c`）：从 Finder/Dock 启动时正确继承用户登录 shell 的 PATH。`shell_path.rs` 重写：剥离终端 OSC/CSI/DCS 控制序列（`strip_terminal_decorations`）后再按 `__BUDDY_ENV__:` 标记解析，避免设置页测试报「工具未找到 / spawn xxx ENOENT」；按用户真实登录 shell 提取环境（`resolve_user_shell`：`$SHELL` → macOS `dscl` 读账户登录 shell → 平台默认），posix/fish/csh 各有对应 env 脚本（`shell_kind`/`login_shell_args`/`env_script_for`），不再假定 zsh；PATH 兜底改为扫描已存在的 `~/bin` 与 `$HOME/.<name>/bin`（`discover_user_bin_dirs`），不再为单个 CLI 硬编码安装目录
+
+## [1.3.0-tauri] - 2026-09-16
+
+### Fixed
+- 同步上游 Electron 版 v1.3.0（`davidhoo/buddy`，上游提交 `913549f`）：从 Finder/Dock 启动时继承登录 shell 的代理环境（HTTP(S)_PROXY 等 8 个变量，`PROXY_VARS`/`PROXY_PAIRS`/`apply_shell_proxy_env`），避免 agy 等需网络的 actor 在设置页测试中因无代理而超时；启动器测试超时/信号终止给出明确诊断（timedOut 优先判定为「Actor timed out after N seconds」、信号退出报 `Process terminated by signal SIGxxx`），不再显示含糊的 `Process exited with code null`；测试结果持久化 `runId`/`durationMs`/`timedOut`/`exitCode`/`signal`（落盘 `diagnostics/launcher-test-<actor>.json`）；测试错误信息与响应预览经 `redact` 脱敏；Settings 测试请求携带 `launcher.env`，子进程经 `merge_child_env` 注入
+
+## [1.2.27-tauri] - 2026-09-16
+
+### Added
+- 同步上游 Electron 版 v1.2.27（`davidhoo/buddy`，上游合并 `fe6e139`）：原生 Antigravity（agy）Actor。Rust 端：`launchers.rs` 新增 `NativeAgy`（`--output-format stream-json --input-format stream-json --print-timeout=<buddy 超时>s`，会话恢复 `--conversation`，stdin 走 stream-json user 事件）；`parsers.rs` 新增 agy stream-json 解析（init/result/step_update，SUCCESS 门控完成判定，tool detail 提取）；`runner.rs` 接入 `RUNNING_AGY` 状态机、会话 ID 持久化与 seed 回退；`store.rs` 将 agy 纳入 transcript 保留与 `get_round_events` 用量解析
+- 渲染层端到端暴露 agy：任务创建、设置页 launcher 配置、会话状态、主题派生（`--actor-agy`）与 i18n 三语文案均可选择；会话 conversation 不一致时先告警（session.mismatch 预警事件）再做成功门控
+
+### Fixed
+- 未知 wrapper 在 actor=agy 时仍判定为 `native_agy`，不再误判为 contract launcher
+- 显式 result 错误会提示给用户；恢复轮次若状态仍为 ERROR 但已有真实回复，按有效完成处理，避免误杀
+
 ## [1.2.26-tauri] - 2026-09-14
 
 ### Added

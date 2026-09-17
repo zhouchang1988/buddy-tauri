@@ -91,6 +91,8 @@ async fn detect_model_from_config_in(
         LauncherCommandKind::NativeCursor => {
             read_cursor_model(&home.join(".cursor").join("cli-config.json")).await
         }
+        // agy has no stable model field in settings yet; --model on the command wins above.
+        LauncherCommandKind::NativeAgy => None,
         // contract: model is not knowable before a run.
         _ => None,
     }

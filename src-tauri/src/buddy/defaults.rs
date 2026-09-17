@@ -3,7 +3,7 @@
 use crate::buddy::types::{GlobalSettings, Launcher};
 use std::collections::HashMap;
 
-pub const DEFAULT_LAUNCHER_ORDER: [&str; 5] = ["claude", "codex", "cursor", "opencode", "kimi"];
+pub const DEFAULT_LAUNCHER_ORDER: [&str; 6] = ["claude", "codex", "cursor", "agy", "opencode", "kimi"];
 
 pub const DEFAULT_LAUNCHER_TIMEOUT_SECONDS: u64 = 7200;
 
@@ -12,6 +12,7 @@ pub fn default_launcher_command(actor: &str) -> &str {
         "claude" => "claude",
         "codex" => "codex",
         "cursor" => "cursor-agent",
+        "agy" => "agy",
         "opencode" => "opencode",
         "kimi" => "kimi",
         other => other,
@@ -77,6 +78,7 @@ pub fn normalize_global_settings(settings: Option<&GlobalSettings>) -> GlobalSet
         seed_claude_session_id: Some(s.seed_claude_session_id.clone().unwrap_or_default()),
         seed_codex_thread_id: Some(s.seed_codex_thread_id.clone().unwrap_or_default()),
         seed_cursor_session_id: Some(s.seed_cursor_session_id.clone().unwrap_or_default()),
+        seed_agy_session_id: Some(s.seed_agy_session_id.clone().unwrap_or_default()),
         seed_opencode_session_id: Some(s.seed_opencode_session_id.clone().unwrap_or_default()),
         seed_kimi_session_id: Some(s.seed_kimi_session_id.clone().unwrap_or_default()),
         max_compact_retries: Some(s.max_compact_retries.unwrap_or(3)),

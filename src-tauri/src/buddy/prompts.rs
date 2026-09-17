@@ -37,6 +37,7 @@ impl From<&TranscriptEntry> for TranscriptRow {
 pub const ACTOR_CLAUDE: &str = "claude";
 pub const ACTOR_CODEX: &str = "codex";
 pub const ACTOR_CURSOR: &str = "cursor";
+pub const ACTOR_AGY: &str = "agy";
 pub const ACTOR_OPENCODE: &str = "opencode";
 pub const ACTOR_KIMI: &str = "kimi";
 pub const ROLE_MODE_CODEX_IMPL: &str = "codex_implements";
@@ -383,6 +384,7 @@ pub fn select_recent_transcript(transcript: &[TranscriptRow], window: usize) -> 
         ACTOR_CLAUDE,
         ACTOR_CODEX,
         ACTOR_CURSOR,
+        ACTOR_AGY,
         ACTOR_OPENCODE,
         ACTOR_KIMI,
     ] {
@@ -477,6 +479,7 @@ pub fn actor_display_name(actor: &str) -> String {
         ACTOR_KIMI => "Kimi Code".to_string(),
         ACTOR_CODEX => "Codex".to_string(),
         ACTOR_CURSOR => "Cursor".to_string(),
+        ACTOR_AGY => "Antigravity".to_string(),
         other => {
             if other.is_empty() {
                 "Codex".to_string()

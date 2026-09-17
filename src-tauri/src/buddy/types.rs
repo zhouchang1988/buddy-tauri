@@ -18,6 +18,8 @@ pub enum TaskStatus {
     RunningCodex,
     #[serde(rename = "RUNNING_CURSOR")]
     RunningCursor,
+    #[serde(rename = "RUNNING_AGY")]
+    RunningAgy,
     #[serde(rename = "RUNNING_OPENCODE")]
     RunningOpencode,
     #[serde(rename = "RUNNING_KIMI")]
@@ -44,6 +46,7 @@ impl TaskStatus {
             TaskStatus::RunningClaude => "RUNNING_CLAUDE",
             TaskStatus::RunningCodex => "RUNNING_CODEX",
             TaskStatus::RunningCursor => "RUNNING_CURSOR",
+            TaskStatus::RunningAgy => "RUNNING_AGY",
             TaskStatus::RunningOpencode => "RUNNING_OPENCODE",
             TaskStatus::RunningKimi => "RUNNING_KIMI",
             TaskStatus::Pinging => "PINGING",
@@ -61,6 +64,7 @@ impl TaskStatus {
             "claude" => TaskStatus::RunningClaude,
             "codex" => TaskStatus::RunningCodex,
             "cursor" => TaskStatus::RunningCursor,
+            "agy" => TaskStatus::RunningAgy,
             "opencode" => TaskStatus::RunningOpencode,
             "kimi" => TaskStatus::RunningKimi,
             _ => TaskStatus::Ready,
@@ -73,6 +77,7 @@ impl TaskStatus {
             TaskStatus::RunningClaude
                 | TaskStatus::RunningCodex
                 | TaskStatus::RunningCursor
+                | TaskStatus::RunningAgy
                 | TaskStatus::RunningOpencode
                 | TaskStatus::RunningKimi
                 | TaskStatus::Pinging
@@ -190,6 +195,8 @@ pub struct TaskState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agy_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opencode_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kimi_session_id: Option<String>,
@@ -274,6 +281,8 @@ pub struct TaskSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed_cursor_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_agy_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed_opencode_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed_kimi_session_id: Option<String>,
@@ -289,7 +298,7 @@ pub struct Launcher {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscriptEntry {
-    pub role: String, // 'human' | 'claude' | 'codex' | 'cursor' | 'opencode' | 'kimi' | 'system'
+    pub role: String, // 'human' | 'claude' | 'codex' | 'cursor' | 'agy' | 'opencode' | 'kimi' | 'system'
     pub content: String,
     pub ts: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -378,6 +387,8 @@ pub struct GlobalSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed_cursor_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_agy_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed_opencode_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed_kimi_session_id: Option<String>,
@@ -418,6 +429,16 @@ pub struct TestLauncherResult {
     pub thread_id: Option<String>,
     #[serde(rename = "responsePreview", default, skip_serializing_if = "Option::is_none")]
     pub response_preview: Option<String>,
+    #[serde(rename = "runId", default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(rename = "durationMs", default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(rename = "timedOut", default, skip_serializing_if = "Option::is_none")]
+    pub timed_out: Option<bool>,
+    #[serde(rename = "exitCode", default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

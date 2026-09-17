@@ -33,10 +33,10 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
-const ACTORS: [&str; 5] = ["claude", "codex", "cursor", "opencode", "kimi"];
+const ACTORS: [&str; 6] = ["claude", "codex", "cursor", "agy", "opencode", "kimi"];
 
-const TRANSCRIPT_ROLES: [&str; 7] = [
-    "human", "claude", "codex", "cursor", "opencode", "kimi", "system",
+const TRANSCRIPT_ROLES: [&str; 8] = [
+    "human", "claude", "codex", "cursor", "agy", "opencode", "kimi", "system",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -294,6 +294,20 @@ impl BuddyStore {
         let normalized = normalize_global_settings(Some(settings));
         atomic_write_json(&path, &serde_json::to_value(&normalized)?).await?;
         Ok(normalized)
+    }
+
+    /// Persist the latest launcher self-test report for an actor
+    /// (`diagnostics/launcher-test-<actor>.json`), for post-mortem diagnosis.
+    pub async fn record_launcher_test(
+        &self,
+        actor: &str,
+        report: &Value,
+    ) -> Result<(), StoreError> {
+        let file_path = self
+            .data_root
+            .join("diagnostics")
+            .join(format!("launcher-test-{actor}.json"));
+        atomic_write_json(&file_path, report).await
     }
 
     pub async fn read_global_settings(&self) -> Result<GlobalSettings, StoreError> {
@@ -702,6 +716,8 @@ impl BuddyStore {
             "opencode" => state.opencode_session_id,
             "claude" => state.claude_session_id,
             "codex" => state.codex_thread_id,
+            "cursor" => state.cursor_session_id,
+            "agy" => state.agy_session_id,
             _ => None,
         };
         value.filter(|session_id| !session_id.is_empty())
@@ -868,6 +884,66 @@ impl BuddyStore {
                         if let Some(first_key) = model_usage.keys().next() {
                             model = Some(first_key.clone());
                         }
+                    }
+                }
+            }
+
+            // Antigravity CLI (`agy`) stream-json shape only: top-level key is
+            // `event` (init|step_update|result), not `type`. Other actors use
+            // `type` and will not hit these branches — keep that invariant if
+            // another CLI also emits `event`.
+            if event.get("event").and_then(Value::as_str) == Some("result") {
+                if let Some(result) = event.get("result").and_then(Value::as_object) {
+                    if let Some(usage) = result.get("usage").and_then(Value::as_object) {
+                        input_tokens = json_u64(usage.get("input_tokens")).unwrap_or(input_tokens);
+                        output_tokens =
+                            json_u64(usage.get("output_tokens")).unwrap_or(output_tokens);
+                        cache_read_tokens =
+                            json_u64(usage.get("cache_read_tokens")).unwrap_or(cache_read_tokens);
+                    }
+                    if let Some(seconds) = result.get("duration_seconds").and_then(Value::as_f64)
+                    {
+                        duration_ms = Some((seconds * 1000.0).round());
+                    }
+                    if let Some(response) = result.get("response").and_then(Value::as_str) {
+                        events.push(text_entry(Some(response.to_string())));
+                    }
+                    if let Some(error_text) = result.get("error").and_then(Value::as_str) {
+                        events.push(text_entry(Some(error_text.to_string())));
+                    }
+                }
+            }
+            if event.get("event").and_then(Value::as_str) == Some("step_update") {
+                if let Some(step) = event.get("step_update").and_then(Value::as_object) {
+                    let step_type = step.get("step_type").and_then(Value::as_str);
+                    if step_type == Some("tool") {
+                        let tool_name = step
+                            .get("tool_name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("tool");
+                        let tool_info = step.get("tool_info").and_then(Value::as_object);
+                        let tool_input = tool_info
+                            .and_then(|info| info.get("parameters"))
+                            .and_then(Value::as_object)
+                            .cloned()
+                            .or_else(|| tool_info.cloned());
+                        events.push(tool_use_entry(Some(tool_name.to_string()), tool_input));
+                        let output = tool_info
+                            .and_then(|info| info.get("output"))
+                            .and_then(Value::as_str);
+                        if let Some(output) = output {
+                            events.push(tool_result_entry(take_chars(output, 200), None));
+                        }
+                    }
+                    // Prefer result.response for final text; skip agent_response
+                    // deltas here to avoid duplicating the same reply in the
+                    // round event summary.
+                    if let Some(usage) = step.get("usage").and_then(Value::as_object) {
+                        input_tokens = json_u64(usage.get("input_tokens")).unwrap_or(input_tokens);
+                        output_tokens =
+                            json_u64(usage.get("output_tokens")).unwrap_or(output_tokens);
+                        cache_read_tokens =
+                            json_u64(usage.get("cache_read_tokens")).unwrap_or(cache_read_tokens);
                     }
                 }
             }
@@ -1783,6 +1859,7 @@ fn state_to_json_value(state: &TaskState) -> Value {
     insert_nullable(&mut map, "claude_session_id", &state.claude_session_id);
     insert_nullable(&mut map, "codex_thread_id", &state.codex_thread_id);
     insert_nullable(&mut map, "cursor_session_id", &state.cursor_session_id);
+    insert_nullable(&mut map, "agy_session_id", &state.agy_session_id);
     insert_nullable(&mut map, "opencode_session_id", &state.opencode_session_id);
     insert_nullable(&mut map, "kimi_session_id", &state.kimi_session_id);
     insert_opt(&mut map, "context_hash", &state.context_hash);
@@ -1968,6 +2045,15 @@ fn default_task_settings(
         ),
     );
     map.insert(
+        "seed_agy_session_id".to_string(),
+        Value::String(
+            normalized_global
+                .seed_agy_session_id
+                .clone()
+                .unwrap_or_default(),
+        ),
+    );
+    map.insert(
         "seed_opencode_session_id".to_string(),
         Value::String(String::new()),
     );
@@ -2020,6 +2106,7 @@ fn default_task_state(
         claude_session_id: None,
         codex_thread_id: None,
         cursor_session_id: None,
+        agy_session_id: None,
         opencode_session_id: None,
         kimi_session_id: None,
         context_hash: Some(sha256_hex(context_text)),

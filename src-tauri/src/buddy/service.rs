@@ -14,17 +14,20 @@ use super::defaults::{normalize_global_settings, DEFAULT_LAUNCHER_ORDER};
 use super::events::BuddyEventBus;
 use super::git;
 use super::launchers::{
-    build_launcher_command, kind_needs_pty, parser_actor_for_kind, run_launcher,
-    run_launcher_with_pty, split_command, LauncherCommandInput, PtyRunInput, RunLauncherInput,
+    build_launcher_command, kind_needs_pty, launcher_timeout_message, parser_actor_for_kind,
+    run_launcher, run_launcher_with_pty, split_command, LauncherCommandInput, PtyRunInput,
+    RunLauncherInput,
 };
 use super::model_detect::detect_model_from_config;
 use super::parsers::{parse_actor_events, parse_buddy_message, BuddyMessage};
 use super::prompts::build_ping_prompt;
 use super::queue_coordinator::{CoordinatorError, QueueCoordinator};
+use super::redact::redact_sensitive_text;
 use super::runner::{
     collect_output_text, collect_raw_events, is_cli_warning_only, last_value, BuddyRunner,
     RunnerError, RunnerOptions, TaskNotifier,
 };
+use super::shell_path::merge_child_env;
 use super::store::{BuddyStore, StoreError};
 use super::types::{
     AttachmentMeta, BootstrapResponse, CountdownInput, CreateTaskInput, CreateTaskResult, Event,
@@ -550,7 +553,8 @@ impl BuddyCoreService {
         command: &str,
         env: Option<HashMap<String, String>>,
     ) -> Result<TestLauncherResult, ServiceError> {
-        const PING_TIMEOUT_MS: u64 = 120_000;
+        let start_time = std::time::Instant::now();
+        let ping_timeout_ms = ping_timeout_ms();
         let env = env.unwrap_or_default();
 
         // Phase 1: Tool check — verify the command exists and can be spawned.
@@ -558,9 +562,12 @@ impl BuddyCoreService {
             .into_iter()
             .next()
             .unwrap_or_default();
+        // TS: `env: mergeChildEnv(process.env, env)`.
+        let probe_env = merge_child_env(&std::env::vars().collect(), Some(&env));
         let spawn_result = tokio::process::Command::new(&base_executable)
             .arg("--version")
-            .envs(&env)
+            .env_clear()
+            .envs(&probe_env)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -571,15 +578,22 @@ impl BuddyCoreService {
                 let _ = child.kill().await;
             }
             Err(error) => {
-                return Ok(TestLauncherResult {
+                let result = TestLauncherResult {
                     actor: actor.to_string(),
                     success: false,
                     phase: "tool_check".to_string(),
-                    error: Some(truncate(&error.to_string(), 300)),
+                    error: Some(truncate(&redact_sensitive_text(&error.to_string()), 300)),
                     session_id: None,
                     thread_id: None,
                     response_preview: None,
-                });
+                    run_id: None,
+                    duration_ms: Some(start_time.elapsed().as_millis() as u64),
+                    timed_out: None,
+                    exit_code: None,
+                    signal: None,
+                };
+                self.record_launcher_test_quiet(actor, &result).await;
+                return Ok(result);
             }
         }
 
@@ -589,11 +603,46 @@ impl BuddyCoreService {
             .map(|d| d.as_millis())
             .unwrap_or_default();
         let test_dir = std::env::temp_dir().join(format!("buddy-test-{actor}-{millis}"));
-        let result = run_ping(actor, command, &env, &test_dir, millis, PING_TIMEOUT_MS).await;
+        let result = run_ping(actor, command, &env, &test_dir, millis, ping_timeout_ms, start_time).await;
         // Clean up temp directory (ignore cleanup errors, like the TS finally).
         let _ = tokio::fs::remove_dir_all(&test_dir).await;
+        if let Ok(result) = &result {
+            self.record_launcher_test_quiet(actor, result).await;
+        }
         result
     }
+
+    /// `store.recordLauncherTest(...).catch(() => {})` — diagnostics must
+    /// never fail the launcher test itself.
+    async fn record_launcher_test_quiet(&self, actor: &str, result: &TestLauncherResult) {
+        if let Ok(report) = serde_json::to_value(result) {
+            let _ = self.store.record_launcher_test(actor, &report).await;
+        }
+    }
+}
+
+/// TS: `const PING_TIMEOUT_SECONDS = 120`. Tests can shrink the deadline via
+/// [`set_ping_timeout_override_for_test`] so the timeout branch stays
+/// exercisable. The override is a process-local atomic, not an env var:
+/// mutating the process environment would race with launcher spawns that
+/// snapshot `std::env::vars()` on other test threads.
+#[cfg(not(test))]
+fn ping_timeout_ms() -> u64 {
+    120_000
+}
+
+#[cfg(test)]
+static PING_TIMEOUT_OVERRIDE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(120_000);
+
+#[cfg(test)]
+fn ping_timeout_ms() -> u64 {
+    PING_TIMEOUT_OVERRIDE_MS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(test)]
+fn set_ping_timeout_override_for_test(value: u64) {
+    PING_TIMEOUT_OVERRIDE_MS.store(value, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Phase 2 of `testLauncher`, kept separate so the temp directory is always
@@ -605,6 +654,7 @@ async fn run_ping(
     test_dir: &std::path::Path,
     millis: u128,
     ping_timeout_ms: u64,
+    start_time: std::time::Instant,
 ) -> Result<TestLauncherResult, ServiceError> {
     tokio::fs::create_dir_all(test_dir).await?;
     let uuid = uuid::Uuid::new_v4().simple().to_string();
@@ -626,8 +676,9 @@ async fn run_ping(
         output_file: Some(output_file.to_string_lossy().to_string()),
         repo_root: Some(test_dir_string.clone()),
         task_dir: Some(test_dir_string.clone()),
-        run_id: Some(run_id),
+        run_id: Some(run_id.clone()),
         session_id: None,
+        timeout_seconds: Some(ping_timeout_ms / 1000),
     });
 
     let mut output_lines: Vec<String> = Vec::new();
@@ -675,6 +726,8 @@ async fn run_ping(
         .await
     };
 
+    let duration_ms = || Some(start_time.elapsed().as_millis() as u64);
+
     let result = match run_result {
         Ok(result) => result,
         Err(error) => {
@@ -682,7 +735,7 @@ async fn run_ping(
             let is_only_warning =
                 !stderr_text.is_empty() && is_cli_warning_only(&stderr_text);
             let message = error.to_string();
-            let error_text = if !message.is_empty() {
+            let raw_detail = if !message.is_empty() {
                 message
             } else if !is_only_warning {
                 stderr_text
@@ -693,14 +746,77 @@ async fn run_ping(
                 actor: actor.to_string(),
                 success: false,
                 phase: "ping".to_string(),
-                error: Some(truncate(&error_text, 300)),
+                error: Some(truncate(&redact_sensitive_text(&raw_detail), 300)),
                 session_id: None,
                 thread_id: None,
                 response_preview: None,
+                run_id: Some(run_id),
+                duration_ms: duration_ms(),
+                timed_out: Some(false),
+                exit_code: None,
+                signal: None,
             });
         }
     };
 
+    // 1. Priority check for timeout without executing unnecessary parsing.
+    if result.timed_out {
+        return Ok(TestLauncherResult {
+            actor: actor.to_string(),
+            success: false,
+            phase: "ping".to_string(),
+            error: Some(launcher_timeout_message(ping_timeout_ms)),
+            session_id: None,
+            thread_id: None,
+            response_preview: None,
+            run_id: Some(run_id),
+            duration_ms: duration_ms(),
+            timed_out: Some(true),
+            exit_code: result.exit_code,
+            signal: result.signal.clone(),
+        });
+    }
+
+    // 2. Non-zero or signal exit.
+    if result.exit_code != Some(0) {
+        let stdout_text = output_lines.join("\n");
+        let output_text =
+            collect_output_text(actor, launcher_command.kind, &output_file, &stdout_text).await;
+        let stderr_text = stderr_lines.join("\n").trim().to_string();
+
+        let exit_desc = match result.exit_code {
+            Some(code) => format!("Process exited with code {code}"),
+            None => match result.signal.as_deref() {
+                Some(signal) => format!("Process terminated by signal {signal}"),
+                None => "Process exited unexpectedly".to_string(),
+            },
+        };
+
+        let raw_detail = if !stderr_text.is_empty() {
+            stderr_text
+        } else if !output_text.trim().is_empty() {
+            output_text.trim().to_string()
+        } else {
+            exit_desc
+        };
+        let error = truncate(&redact_sensitive_text(&raw_detail), 300);
+        return Ok(TestLauncherResult {
+            actor: actor.to_string(),
+            success: false,
+            phase: "ping".to_string(),
+            error: Some(error),
+            session_id: None,
+            thread_id: None,
+            response_preview: None,
+            run_id: Some(run_id),
+            duration_ms: duration_ms(),
+            timed_out: Some(false),
+            exit_code: result.exit_code,
+            signal: result.signal.clone(),
+        });
+    }
+
+    // 3. Exit 0: collect output and parse the buddy message.
     let stdout_text = output_lines.join("\n");
     let raw_events = collect_raw_events(&event_file, &stdout_text, launcher_command.kind).await;
     let output_text =
@@ -709,30 +825,6 @@ async fn run_ping(
         &parser_actor_for_kind(actor, launcher_command.kind),
         &raw_events,
     );
-
-    if result.exit_code != Some(0) {
-        let stderr_text = stderr_lines.join("\n").trim().to_string();
-        let error = if !stderr_text.is_empty() {
-            stderr_text
-        } else if !output_text.trim().is_empty() {
-            output_text.trim().to_string()
-        } else {
-            match result.exit_code {
-                Some(code) => format!("Process exited with code {code}"),
-                // TS stringifies a null exit code as "null".
-                None => "Process exited with code null".to_string(),
-            }
-        };
-        return Ok(TestLauncherResult {
-            actor: actor.to_string(),
-            success: false,
-            phase: "ping".to_string(),
-            error: Some(truncate(&error, 300)),
-            session_id: None,
-            thread_id: None,
-            response_preview: None,
-        });
-    }
 
     // Verify the actor responded with a valid buddy message.
     let message = parse_buddy_message(&output_text);
@@ -749,6 +841,11 @@ async fn run_ping(
             session_id: None,
             thread_id: None,
             response_preview: None,
+            run_id: Some(run_id),
+            duration_ms: duration_ms(),
+            timed_out: Some(false),
+            exit_code: Some(0),
+            signal: None,
         });
     }
 
@@ -766,7 +863,12 @@ async fn run_ping(
         error: None,
         session_id,
         thread_id,
-        response_preview: Some(preview),
+        response_preview: Some(redact_sensitive_text(&preview)),
+        run_id: Some(run_id),
+        duration_ms: duration_ms(),
+        timed_out: Some(false),
+        exit_code: Some(0),
+        signal: None,
     })
 }
 
@@ -799,8 +901,13 @@ fn spawn_on_task_terminal(coordinator: &QueueCoordinator, workspace_key: &str) {
     });
 }
 
-/// TS: `join(homedir(), 'Library', 'Application Support', 'buddy')`.
+/// TS: `process.env.BUDDY_DATA_ROOT || join(homedir(), 'Library', 'Application Support', 'buddy')`.
 pub fn default_data_root() -> PathBuf {
+    if let Ok(dir) = std::env::var("BUDDY_DATA_ROOT") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
     dirs::home_dir()
         .unwrap_or_default()
         .join("Library")
@@ -1020,6 +1127,129 @@ mod tests {
         assert!(!result.success);
         assert_eq!(result.phase, "tool_check");
         assert!(result.error.unwrap().len() <= 300);
+    }
+
+    // -----------------------------------------------------------------------
+    // Port of tests/unit/main/buddy-agy-testlauncher.test.ts +
+    // buddy-launcher-timeout.test.ts (testLauncher diagnostics)
+    // -----------------------------------------------------------------------
+
+    #[cfg(unix)]
+    async fn write_fake_cli(dir: &std::path::Path, name: &str, script: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        tokio::fs::write(&path, script).await.unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().to_string()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_launcher_agy_ping_succeeds_without_contract_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = service_in(dir.path());
+        let fake = write_fake_cli(
+            dir.path(),
+            "fake-agy.sh",
+            concat!(
+                "#!/bin/sh\n",
+                "if [ \"$1\" = \"--version\" ]; then exit 0; fi\n",
+                "for arg in \"$@\"; do\n",
+                "  if [ \"$arg\" = \"--actor\" ]; then\n",
+                "    echo \"flags provided but not defined: -actor\" >&2\n",
+                "    exit 1\n",
+                "  fi\n",
+                "done\n",
+                "cat > /dev/null\n",
+                "printf '{\"event\":\"result\",\"result\":{\"status\":\"SUCCESS\",\"response\":\"Hello from Buddy ping test\"}}\\n'\n",
+                "exit 0\n",
+            ),
+        )
+        .await;
+        let result = service.test_launcher("agy", &fake, None).await.unwrap();
+        assert!(result.success, "error: {:?}", result.error);
+        assert_eq!(
+            result.response_preview.as_deref(),
+            Some("Hello from Buddy ping test")
+        );
+        assert!(result.error.is_none());
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.timed_out, Some(false));
+        assert!(result.run_id.is_some());
+        assert!(result.duration_ms.is_some());
+        // The report is persisted for post-mortem diagnosis.
+        let report = dir
+            .path()
+            .join("diagnostics")
+            .join("launcher-test-agy.json");
+        assert!(report.exists(), "missing {report:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_launcher_formats_signal_termination_instead_of_code_null() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = service_in(dir.path());
+        let fake = write_fake_cli(
+            dir.path(),
+            "fake-agy.sh",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exit 0; fi\nkill -TERM $$\n",
+        )
+        .await;
+        let result = service.test_launcher("agy", &fake, None).await.unwrap();
+        assert!(!result.success);
+        let error = result.error.unwrap();
+        assert!(error.contains("SIGTERM"), "{error}");
+        assert!(!error.contains("code null"), "{error}");
+        assert_eq!(result.signal.as_deref(), Some("SIGTERM"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_launcher_formats_non_zero_exit_with_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = service_in(dir.path());
+        let fake = write_fake_cli(
+            dir.path(),
+            "fake-agy.sh",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exit 0; fi\necho \"Authentication error: credentials expired\" >&2\nexit 1\n",
+        )
+        .await;
+        let result = service.test_launcher("agy", &fake, None).await.unwrap();
+        assert!(!result.success);
+        let error = result.error.unwrap();
+        assert!(
+            error.contains("Authentication error: credentials expired"),
+            "{error}"
+        );
+        assert!(!error.contains("code null"), "{error}");
+        assert_eq!(result.exit_code, Some(1));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_launcher_reports_explicit_timeout_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = service_in(dir.path());
+        let fake = write_fake_cli(
+            dir.path(),
+            "fake-agy.sh",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exit 0; fi\nexec sleep 30\n",
+        )
+        .await;
+        set_ping_timeout_override_for_test(1000);
+        let result = service.test_launcher("agy", &fake, None).await;
+        set_ping_timeout_override_for_test(120_000);
+        let result = result.unwrap();
+        assert!(!result.success);
+        assert_eq!(result.phase, "ping");
+        let error = result.error.unwrap();
+        assert!(
+            error.contains("timed out after 1 seconds"),
+            "{error}"
+        );
+        assert!(!error.contains("code null"), "{error}");
+        assert_eq!(result.timed_out, Some(true));
     }
 
     #[tokio::test]

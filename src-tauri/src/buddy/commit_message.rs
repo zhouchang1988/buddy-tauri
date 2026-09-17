@@ -29,7 +29,7 @@ use super::types::{GlobalSettings, Launcher, TaskSettings};
 pub const COMMIT_MESSAGE_TIMEOUT_MS: u64 = 120_000;
 pub const MAX_DIFF_BYTES: usize = 200_000;
 
-pub const SUPPORTED_ACTORS: [&str; 5] = ["claude", "codex", "cursor", "opencode", "kimi"];
+pub const SUPPORTED_ACTORS: [&str; 6] = ["claude", "codex", "cursor", "agy", "opencode", "kimi"];
 
 pub fn is_supported_actor(actor: &str) -> bool {
     SUPPORTED_ACTORS.contains(&actor)
@@ -582,6 +582,7 @@ pub async fn generate_commit_message_with_actor(
         event_file: Some(event_file),
         output_file: Some(output_file),
         repo_root: Some(input.repo_root.clone()),
+        timeout_seconds: Some(commit_message_timeout_ms().div_ceil(1000)),
         ..Default::default()
     });
 
@@ -869,6 +870,7 @@ mod tests {
             seed_claude_session_id: None,
             seed_codex_thread_id: None,
             seed_cursor_session_id: None,
+            seed_agy_session_id: None,
             seed_opencode_session_id: None,
             seed_kimi_session_id: None,
         }
@@ -879,8 +881,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn supported_actors_cover_the_five_and_reject_others() {
-        for actor in ["claude", "codex", "cursor", "opencode", "kimi"] {
+    fn supported_actors_cover_the_six_and_reject_others() {
+        for actor in ["claude", "codex", "cursor", "agy", "opencode", "kimi"] {
             assert!(is_supported_actor(actor), "{actor}");
         }
         for actor in ["human", "", "chatgpt"] {

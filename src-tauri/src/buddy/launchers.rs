@@ -1,8 +1,8 @@
 //! Actor CLI launchers, port of `src/main/buddy/launchers.ts`.
 //!
-//! Builds per-actor command lines (native claude/codex/cursor/opencode/kimi
-//! modes vs. generic "contract" commands driven by `BUDDY_*` env vars) and
-//! runs them: piped stdio via `tokio::process` for most actors, a PTY via
+//! Builds per-actor command lines (native claude/codex/cursor/agy/opencode/
+//! kimi modes vs. generic "contract" commands driven by `BUDDY_*` env vars)
+//! and runs them: piped stdio via `tokio::process` for most actors, a PTY via
 //! `portable-pty` for CLIs (opencode) that hang without a TTY.
 //!
 //! This module exposes the canonical shared helpers (`split_command`,
@@ -10,7 +10,7 @@
 //! `model_detect.rs` currently carry private duplicates that a later
 //! integration wave will rewire to these.
 
-use crate::buddy::shell_path::install_hint_for;
+use crate::buddy::shell_path::{install_hint_for, merge_child_env};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -25,6 +25,7 @@ pub enum LauncherCommandKind {
     NativeClaude,
     NativeCodex,
     NativeCursor,
+    NativeAgy,
     NativeOpencode,
     NativeKimi,
     Contract,
@@ -36,6 +37,7 @@ impl LauncherCommandKind {
             LauncherCommandKind::NativeClaude => "native_claude",
             LauncherCommandKind::NativeCodex => "native_codex",
             LauncherCommandKind::NativeCursor => "native_cursor",
+            LauncherCommandKind::NativeAgy => "native_agy",
             LauncherCommandKind::NativeOpencode => "native_opencode",
             LauncherCommandKind::NativeKimi => "native_kimi",
             LauncherCommandKind::Contract => "contract",
@@ -58,6 +60,8 @@ pub struct LauncherCommandInput {
     pub task_dir: Option<String>,
     pub run_id: Option<String>,
     pub session_id: Option<String>,
+    /// Buddy launcher timeout; native_agy maps this to --print-timeout (agy default is only 5m).
+    pub timeout_seconds: Option<u64>,
 }
 
 /// A fully-built launcher invocation, mirroring `LauncherCommand`.
@@ -110,6 +114,7 @@ pub fn parser_actor_for_kind(actor: &str, kind: LauncherCommandKind) -> String {
         LauncherCommandKind::NativeClaude => "claude".to_string(),
         LauncherCommandKind::NativeCodex => "codex".to_string(),
         LauncherCommandKind::NativeCursor => "cursor".to_string(),
+        LauncherCommandKind::NativeAgy => "agy".to_string(),
         LauncherCommandKind::Contract => actor.to_string(),
     }
 }
@@ -177,6 +182,9 @@ pub fn command_kind_for_tokens(actor: &str, base_cmd: &[String]) -> LauncherComm
     if executable == "cursor-agent" || executable == "agent" {
         return LauncherCommandKind::NativeCursor;
     }
+    if executable == "agy" || executable == "antigravity" {
+        return LauncherCommandKind::NativeAgy;
+    }
     if executable == "opencode" {
         return LauncherCommandKind::NativeOpencode;
     }
@@ -184,11 +192,16 @@ pub fn command_kind_for_tokens(actor: &str, base_cmd: &[String]) -> LauncherComm
         return LauncherCommandKind::NativeKimi;
     }
     // Fallback: when no command is specified, infer from actor name.
-    if executable.is_empty() || executable == "wecode" {
+    // Also: the Antigravity settings card always speaks agy's native protocol.
+    // Never fall through to contract flags (--actor, etc.) just because the
+    // command string used a wrapper basename we do not recognize — that is
+    // exactly what produces "flags provided but not defined: -actor".
+    if executable.is_empty() || executable == "wecode" || actor == "agy" {
         match actor {
             "claude" => return LauncherCommandKind::NativeClaude,
             "codex" => return LauncherCommandKind::NativeCodex,
             "cursor" => return LauncherCommandKind::NativeCursor,
+            "agy" => return LauncherCommandKind::NativeAgy,
             "opencode" => return LauncherCommandKind::NativeOpencode,
             "kimi" => return LauncherCommandKind::NativeKimi,
             _ => {}
@@ -352,6 +365,42 @@ pub fn build_launcher_command(input: &LauncherCommandInput) -> LauncherCommand {
                 env: None,
                 kind,
                 stdin_text: None,
+            }
+        }
+        LauncherCommandKind::NativeAgy => {
+            // agy requires the prompt attached to -p= / --print=. Bare --print
+            // steals the next flag as the prompt. Long Buddy prompts go via
+            // stdin stream-json instead. Default print-timeout is only 5m —
+            // always override from Buddy's timeout.
+            let timeout_seconds = input.timeout_seconds.unwrap_or(7200).max(1);
+            let prompt_text = input.prompt_text.clone().unwrap_or_default();
+            let stdin_payload = format!(
+                "{}\n",
+                serde_json::json!({
+                    "event": "user",
+                    "message": { "content": prompt_text }
+                })
+            );
+            let mut args = prefix_args;
+            args.extend([
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+                "--input-format".to_string(),
+                "stream-json".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+                format!("--print-timeout={timeout_seconds}s"),
+            ]);
+            if let Some(session_id) = &input.session_id {
+                args.push("--conversation".to_string());
+                args.push(session_id.clone());
+            }
+            args.push("-p=".to_string());
+            LauncherCommand {
+                command,
+                args,
+                env: None,
+                kind,
+                stdin_text: Some(stdin_payload),
             }
         }
         LauncherCommandKind::NativeOpencode => {
@@ -589,9 +638,11 @@ where
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    if let Some(env) = &input.env {
-        cmd.envs(env);
-    }
+    // TS: `env: mergeChildEnv(process.env, input.env)` — the child sees the
+    // full process env with the launcher overlay applied and proxy pairs
+    // mirrored across casings.
+    let merged_env = merge_child_env(&std::env::vars().collect(), input.env.as_ref());
+    cmd.env_clear().envs(merged_env);
 
     let mut child = match cmd.spawn() {
         Ok(child) => child,
@@ -940,10 +991,11 @@ where
     cmd.args(prefix_args);
     cmd.args(&input.args);
     cmd.cwd(&input.cwd);
-    if let Some(env) = &input.env {
-        for (key, value) in env {
-            cmd.env(key, value);
-        }
+    // TS: `env: mergeChildEnv(process.env, input.env)` (see run_launcher).
+    let merged_env = merge_child_env(&std::env::vars().collect(), input.env.as_ref());
+    cmd.env_clear();
+    for (key, value) in merged_env {
+        cmd.env(key, value);
     }
 
     let mut child = pair
@@ -1244,6 +1296,76 @@ mod tests {
             command_kind_for("cursor", "agent"),
             LauncherCommandKind::NativeCursor
         );
+    }
+
+    #[test]
+    fn builds_agy_stream_json_stdin_command_with_print_timeout_and_conversation() {
+        let mut i = input("agy", "agy", "/tmp/prompt.md");
+        i.prompt_text = Some("hello from agy".to_string());
+        i.session_id = Some("agy-conversation".to_string());
+        i.timeout_seconds = Some(7200);
+        assert_eq!(
+            build_launcher_command(&i),
+            LauncherCommand {
+                command: "agy".to_string(),
+                args: vec![
+                    "--output-format",
+                    "stream-json",
+                    "--input-format",
+                    "stream-json",
+                    "--dangerously-skip-permissions",
+                    "--print-timeout=7200s",
+                    "--conversation",
+                    "agy-conversation",
+                    "-p="
+                ]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+                env: None,
+                kind: LauncherCommandKind::NativeAgy,
+                stdin_text: Some(
+                    "{\"event\":\"user\",\"message\":{\"content\":\"hello from agy\"}}\n".to_string()
+                ),
+            }
+        );
+    }
+
+    #[test]
+    fn agy_print_timeout_defaults_to_two_hours_and_floors_at_one_second() {
+        let mut i = input("agy", "agy", "/tmp/prompt.md");
+        i.prompt_text = Some("hi".to_string());
+        let command = build_launcher_command(&i);
+        assert!(command.args.contains(&"--print-timeout=7200s".to_string()));
+
+        i.timeout_seconds = Some(0);
+        let command = build_launcher_command(&i);
+        assert!(command.args.contains(&"--print-timeout=1s".to_string()));
+    }
+
+    #[test]
+    fn recognizes_agy_executable_and_actor_fallback() {
+        assert_eq!(
+            command_kind_for("agy", "agy"),
+            LauncherCommandKind::NativeAgy
+        );
+        assert_eq!(
+            command_kind_for("agy", ""),
+            LauncherCommandKind::NativeAgy
+        );
+        assert_eq!(
+            command_kind_for("agy", "antigravity"),
+            LauncherCommandKind::NativeAgy
+        );
+        // Unknown wrapper basename must still use native_agy — never contract --actor
+        assert_eq!(
+            command_kind_for("agy", "my-agy-wrapper"),
+            LauncherCommandKind::NativeAgy
+        );
+        let mut i = input("agy", "my-agy-wrapper", "/tmp/prompt.md");
+        i.prompt_text = Some("hi".to_string());
+        i.timeout_seconds = Some(120);
+        assert!(!build_launcher_command(&i).args.contains(&"--actor".to_string()));
     }
 
     #[test]
