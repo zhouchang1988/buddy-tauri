@@ -404,6 +404,10 @@ pub struct GlobalSettings {
     pub custom_prompt_implementer: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_prompt_reviewer: Option<String>,
+    /// Legacy Electron-edition field: a single custom prompt applied to every
+    /// actor. Kept for read-time backfill only; never written back.
+    #[serde(default, skip_serializing)]
+    pub custom_prompt: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

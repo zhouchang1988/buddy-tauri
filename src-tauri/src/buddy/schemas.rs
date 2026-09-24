@@ -164,6 +164,8 @@ struct GlobalSettingsWire {
     max_upgrade_retries: Option<u32>,
     custom_prompt_implementer: Option<String>,
     custom_prompt_reviewer: Option<String>,
+    /// Legacy Electron-edition single custom prompt (applies to every actor).
+    custom_prompt: Option<String>,
 }
 
 fn default_countdown_seconds() -> u64 {
@@ -215,6 +217,7 @@ pub fn parse_global_settings(input: &serde_json::Value) -> Result<GlobalSettings
         max_upgrade_retries: wire.max_upgrade_retries,
         custom_prompt_implementer: normalize_prompt(wire.custom_prompt_implementer),
         custom_prompt_reviewer: normalize_prompt(wire.custom_prompt_reviewer),
+        custom_prompt: normalize_prompt(wire.custom_prompt),
     })
 }
 
@@ -410,6 +413,33 @@ mod tests {
         assert_eq!(
             settings.custom_prompt_implementer.as_deref(),
             Some("Implement carefully.")
+        );
+        assert_eq!(settings.custom_prompt_reviewer, None);
+    }
+
+    #[test]
+    fn preserves_the_legacy_custom_prompt_for_read_time_backfill() {
+        let settings = parse_global_settings(&json!({
+            "custom_prompt": "  Shared prompt.  "
+        }))
+        .unwrap();
+        assert_eq!(settings.custom_prompt.as_deref(), Some("Shared prompt."));
+        assert_eq!(settings.custom_prompt_implementer, None);
+        assert_eq!(settings.custom_prompt_reviewer, None);
+    }
+
+    #[test]
+    fn keeps_role_specific_prompts_alongside_the_legacy_custom_prompt() {
+        let settings = parse_global_settings(&json!({
+            "custom_prompt": "Shared prompt.",
+            "custom_prompt_implementer": "Implementer prompt.",
+            "custom_prompt_reviewer": "  "
+        }))
+        .unwrap();
+        assert_eq!(settings.custom_prompt.as_deref(), Some("Shared prompt."));
+        assert_eq!(
+            settings.custom_prompt_implementer.as_deref(),
+            Some("Implementer prompt.")
         );
         assert_eq!(settings.custom_prompt_reviewer, None);
     }

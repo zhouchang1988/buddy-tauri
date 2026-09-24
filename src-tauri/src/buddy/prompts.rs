@@ -292,6 +292,10 @@ pub fn build_actor_prompt(input: &BuildActorPromptInput) -> String {
     } else {
         global.and_then(|g| non_empty(g.custom_prompt_reviewer.as_ref()))
     };
+    // Legacy Electron-edition `custom_prompt` applies to every actor on every
+    // round (upstream prompts.ts); the role-specific fields take precedence.
+    let role_prompt =
+        role_prompt.or_else(|| global.and_then(|g| non_empty(g.custom_prompt.as_ref())));
     if let Some(prompt) = role_prompt {
         parts.push(String::new());
         parts.push("## Custom instructions".to_string());
@@ -784,6 +788,50 @@ mod tests {
 
         let implementer_prompt = build_for_actor("claude", settings);
         assert!(!implementer_prompt.contains("Reviewer only."));
+    }
+
+    #[test]
+    fn falls_back_to_the_legacy_custom_prompt_for_every_actor() {
+        let settings = GlobalSettings {
+            custom_prompt: Some("Legacy shared prompt.".to_string()),
+            ..Default::default()
+        };
+
+        let implementer_prompt = build_for_actor("claude", settings.clone());
+        assert!(implementer_prompt.contains("## Custom instructions"));
+        assert!(implementer_prompt.contains("Legacy shared prompt."));
+
+        let reviewer_prompt = build_for_actor("codex", settings);
+        assert!(reviewer_prompt.contains("## Custom instructions"));
+        assert!(reviewer_prompt.contains("Legacy shared prompt."));
+    }
+
+    #[test]
+    fn role_specific_prompts_take_precedence_over_the_legacy_custom_prompt() {
+        let settings = GlobalSettings {
+            custom_prompt: Some("Legacy shared prompt.".to_string()),
+            custom_prompt_implementer: Some("Implementer only.".to_string()),
+            ..Default::default()
+        };
+
+        let implementer_prompt = build_for_actor("claude", settings.clone());
+        assert!(implementer_prompt.contains("Implementer only."));
+        assert!(!implementer_prompt.contains("Legacy shared prompt."));
+
+        // The reviewer has no role-specific prompt, so the legacy one applies.
+        let reviewer_prompt = build_for_actor("codex", settings);
+        assert!(reviewer_prompt.contains("Legacy shared prompt."));
+        assert!(!reviewer_prompt.contains("Implementer only."));
+    }
+
+    #[test]
+    fn legacy_custom_prompt_does_not_leak_into_serialized_settings() {
+        let settings = GlobalSettings {
+            custom_prompt: Some("Legacy shared prompt.".to_string()),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&settings).unwrap();
+        assert!(value.get("custom_prompt").is_none());
     }
 
     #[test]

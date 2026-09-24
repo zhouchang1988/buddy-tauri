@@ -80,7 +80,7 @@ Plus at the crate root: `commands.rs` (43 `#[tauri::command]` handlers), `menu.r
 
 ### `lib.rs` wiring order
 
-`fix_shell_path()` → register plugins (dialog/notification/shell/opener/clipboard-manager/updater) → in `setup`: build `BuddyEventBus` + `BuddyCoreService` (with notifier factory) → spawn task forwarding the bus to `app.emit("buddy:event", ...)` → `block_on(service.recover_interrupted_runs())` (must run before the window is created, matching the Electron edition's `app.whenReady()` ordering) → `app.manage(service)` → `menu::setup_menu` → `updater::init_updater` → `generate_handler!` registers all 43 commands.
+`fix_shell_path()` → register plugins (dialog/notification/shell/opener/clipboard-manager/updater) → in `setup`: build `BuddyEventBus` + `BuddyCoreService` (with notifier factory) → spawn task forwarding the bus to `app.emit("buddy:event", ...)` → `block_on(service.recover_interrupted_runs())` (must run before the window is created, matching the Electron edition's `app.whenReady()` ordering) → `app.manage(service)` → `menu::setup_menu` → `updater::init_updater` → `generate_handler!` registers all 43 commands. On macOS, `CloseRequested` is intercepted to hide the window instead of closing it (so actor runs survive in the background), and `RunEvent::Reopen` (Dock click with no visible window) shows + focuses the main window — the Electron edition's `window-all-closed`/`activate` behavior.
 
 ### Task state machine
 

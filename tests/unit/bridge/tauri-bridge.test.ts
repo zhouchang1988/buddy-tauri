@@ -8,6 +8,7 @@ const invokeMock = vi.fn()
 const listenMock = vi.fn()
 const openDialogMock = vi.fn()
 const openUrlMock = vi.fn()
+const openPathMock = vi.fn()
 
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: (...args: unknown[]) => invokeMock(...args)
@@ -29,7 +30,7 @@ vi.mock('@tauri-apps/plugin-dialog', () => ({
 
 vi.mock('@tauri-apps/plugin-opener', () => ({
   openUrl: (...args: unknown[]) => openUrlMock(...args),
-  revealItemInDir: vi.fn()
+  openPath: (...args: unknown[]) => openPathMock(...args)
 }))
 
 describe('tauri-bridge', () => {
@@ -40,6 +41,8 @@ describe('tauri-bridge', () => {
     openDialogMock.mockReset()
     openUrlMock.mockReset()
     openUrlMock.mockResolvedValue(undefined)
+    openPathMock.mockReset()
+    openPathMock.mockResolvedValue(undefined)
     window.localStorage.clear()
     await import('../../../src/lib/tauri-bridge')
   })
@@ -130,6 +133,17 @@ describe('tauri-bridge', () => {
     expect(openDialogMock).toHaveBeenCalledWith(
       expect.objectContaining({ title: 'Select working directory' })
     )
+  })
+
+  it('opens the item itself in Finder via openPath', async () => {
+    await expect(window.api.openInFinder('/tmp/repo')).resolves.toBeUndefined()
+    expect(openPathMock).toHaveBeenCalledWith('/tmp/repo')
+  })
+
+  it('propagates openInFinder failures', async () => {
+    openPathMock.mockRejectedValue(new Error('no such file'))
+
+    await expect(window.api.openInFinder('/missing')).rejects.toThrow('no such file')
   })
 
   it('subscribes to buddy:event and forwards only the payload', async () => {

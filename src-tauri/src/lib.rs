@@ -4,7 +4,8 @@
 //! fix_shell_path → construct BuddyEventBus/BuddyStore/BuddyRunner/
 //! QueueCoordinator/BuddyCoreService → recover_interrupted_runs +
 //! rebuild_and_reconcile_all → register all commands → forward the event bus
-//! to the frontend as `buddy:event` emits → setup_menu → init_updater.
+//! to the frontend as `buddy:event` emits → setup_menu → init_updater →
+//! macOS window lifecycle (close hides, Dock reopen shows).
 
 pub mod buddy;
 pub mod commands;
@@ -120,6 +121,8 @@ pub fn run() {
                 let was_fullscreen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                     window.is_fullscreen().unwrap_or(false),
                 ));
+                #[cfg(target_os = "macos")]
+                let window_for_close = window.clone();
                 window.on_window_event(move |event| {
                     if let tauri::WindowEvent::Resized(_) = event {
                         if let Some(win) =
@@ -133,6 +136,14 @@ pub fn run() {
                                 let _ = win.emit("window:fullScreenChange", is_fullscreen);
                             }
                         }
+                    }
+                    // TS index.ts `window-all-closed`: on macOS closing the
+                    // window must not quit the app (actor runs continue in
+                    // the background), so hide instead of destroying.
+                    #[cfg(target_os = "macos")]
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = window_for_close.hide();
                     }
                 });
             }
@@ -184,6 +195,25 @@ pub fn run() {
             commands::updater_install,
             commands::updater_dismiss_error,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Buddy application");
+        .build(tauri::generate_context!())
+        .expect("error while building Buddy application")
+        .run(|app, event| {
+            #[cfg(not(target_os = "macos"))]
+            let _ = (app, event);
+            // TS index.ts `activate`: clicking the Dock icon with no visible
+            // window brings the main window back.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen {
+                has_visible_windows,
+                ..
+            } = event
+            {
+                if !has_visible_windows {
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                    }
+                }
+            }
+        });
 }

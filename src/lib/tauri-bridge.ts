@@ -11,7 +11,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
-import { openUrl, revealItemInDir } from '@tauri-apps/plugin-opener'
+import { openPath, openUrl } from '@tauri-apps/plugin-opener'
 import { currentLanguage, translate } from './i18n'
 import type {
   AttachmentMeta,
@@ -123,7 +123,7 @@ const api = {
     return typeof selected === 'string' ? selected : null
   },
   openInFinder: (path: string): Promise<void> =>
-    revealItemInDir(path),
+    openPath(path),
   openExternal: (url: string): Promise<void> =>
     openUrl(url),
   onFullScreenChange: (callback: (isFullScreen: boolean) => void): (() => void) => {

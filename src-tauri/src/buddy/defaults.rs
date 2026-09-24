@@ -90,5 +90,6 @@ pub fn normalize_global_settings(settings: Option<&GlobalSettings>) -> GlobalSet
             .clone()
             .filter(|p| !p.is_empty()),
         custom_prompt_reviewer: s.custom_prompt_reviewer.clone().filter(|p| !p.is_empty()),
+        custom_prompt: s.custom_prompt.clone().filter(|p| !p.is_empty()),
     }
 }
