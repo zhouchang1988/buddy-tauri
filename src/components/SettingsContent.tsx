@@ -1,12 +1,11 @@
-import { useEffect, useState, useMemo, useRef, useCallback } from 'react'
+import { useEffect, useState, useMemo, useRef, useCallback, Fragment } from 'react'
 import { createPortal } from 'react-dom'
 import { HexColorPicker } from 'react-colorful'
 import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, ChevronDown, CircleArrowOutUpLeft, Command, CornerDownLeft, Delete, Monitor, Moon, Option, RotateCcw, Search, Space, Sun } from 'lucide-react'
 import { useTheme, ThemeMode } from '../hooks/useTheme'
 import { getThemesByType, getThemeById, BuddyTheme } from '../themes'
-import { useUpdateGlobalSettings } from '../hooks/useBuddy'
-import { useTestLauncher } from '../hooks/useBuddy'
-import type { TestLauncherResult } from '../shared/types'
+import { useUpdateGlobalSettings, useTestLauncher, useAcpGlobalAdapters } from '../hooks/useBuddy'
+import type { TestLauncherResult, GlobalAcpAdaptersStatus } from '../shared/types'
 import { useLanguagePref, useSendShortcut, useT, TFunction } from '../hooks/useI18n'
 import { LANGUAGE_OPTIONS, LanguagePref, SendShortcut } from '../lib/i18n'
 import {
@@ -26,8 +25,9 @@ import {
   bindingsEqual,
 } from '../lib/keyboard'
 import type { GlobalSettings, Launcher } from '../shared/types'
-import { DEFAULT_LAUNCHER_ORDER, defaultLauncherFor, normalizeGlobalSettings } from '../shared/defaults'
-import { CheckCircle, XCircle, Loader2, Zap } from 'lucide-react'
+import { DEFAULT_LAUNCHER_ORDER, KNOWN_ACP_PRESETS, defaultLauncherFor, normalizeGlobalSettings } from '../shared/defaults'
+import { actorColorVar } from '../lib/format'
+import { CheckCircle, XCircle, Loader2, Zap, AlertCircle, Info, Copy, Check } from 'lucide-react'
 import { Switch } from './Switch'
 
 export type SettingsTab = 'general' | 'appearance' | 'keyboard' | 'prompts'
@@ -45,7 +45,7 @@ function launcherInfoFor(actor: string, t: TFunction): LauncherInfo {
       return {
         title: t('settings.launcher.claude.title'),
         label: t('settings.launcher.claude.label'),
-        placeholder: 'claude --dangerously-skip-permissions',
+        placeholder: 'claude',
         hint: <HintWithCode template={t('settings.launcher.claude.hint')} />
       }
     case 'codex':
@@ -82,6 +82,27 @@ function launcherInfoFor(actor: string, t: TFunction): LauncherInfo {
         label: t('settings.launcher.kimi.label'),
         placeholder: 'kimi',
         hint: <HintWithCode template={t('settings.launcher.kimi.hint')} />
+      }
+    case 'wecode_claude':
+      return {
+        title: t('settings.launcher.wecode_claude.title'),
+        label: t('settings.launcher.wecode_claude.label'),
+        placeholder: 'wecode',
+        hint: <HintWithCode template={t('settings.launcher.wecode_claude.hint')} />
+      }
+    case 'wecode_codex':
+      return {
+        title: t('settings.launcher.wecode_codex.title'),
+        label: t('settings.launcher.wecode_codex.label'),
+        placeholder: 'wecode codex',
+        hint: <HintWithCode template={t('settings.launcher.wecode_codex.hint')} />
+      }
+    case 'wecode_opencode':
+      return {
+        title: t('settings.launcher.wecode_opencode.title'),
+        label: t('settings.launcher.wecode_opencode.label'),
+        placeholder: 'wecode opencode',
+        hint: <HintWithCode template={t('settings.launcher.wecode_opencode.hint')} />
       }
     default:
       return { title: actor, label: actor, placeholder: actor, hint: '' }
@@ -283,6 +304,10 @@ function GeneralSettings({ globalSettings }: { globalSettings: GlobalSettings | 
   const saveLauncher = (actor: string, patch: Partial<Launcher>) => {
     const cur = launchers[actor] ?? defaultLauncherFor(actor)
     const next = { ...cur, ...patch, env: cur.env }
+    if (!patch.protocol) {
+      delete next.protocol
+      delete next.args
+    }
     save({ launchers: { ...launchers, [actor]: next } })
   }
 
@@ -297,6 +322,8 @@ function GeneralSettings({ globalSettings }: { globalSettings: GlobalSettings | 
   const currentTimeout =
     DEFAULT_LAUNCHER_ORDER.map((a) => launchers[a]?.timeout_seconds).find((v) => typeof v === 'number') ?? 7200
 
+  const { data: globalAdapters, refetch: refetchGlobalAdapters } = useAcpGlobalAdapters()
+
   return (
     <div className="space-y-8">
       <GeneralSection />
@@ -309,14 +336,29 @@ function GeneralSettings({ globalSettings }: { globalSettings: GlobalSettings | 
       <SettingsList>
         {DEFAULT_LAUNCHER_ORDER.map((actor) => {
           const launcher = launchers[actor] ?? defaultLauncherFor(actor)
+          const isFirstWecode = actor === 'wecode_claude'
           return (
-            <LauncherSection
-              key={actor}
-              actor={actor}
-              launcher={launcher}
-              info={launcherInfoFor(actor, t)}
-              onSaveCommand={(command) => saveLauncher(actor, { command })}
-            />
+            <Fragment key={actor}>
+              {isFirstWecode && (
+                <div className="px-4 py-2 bg-bg-subtle/50 flex items-center gap-2.5 select-none">
+                  <div className="h-px bg-border-subtle flex-1" />
+                  <span className="text-[11px] text-fg-muted font-medium tracking-wide">
+                    {t('settings.launcher.internalToolsHeader')}
+                  </span>
+                  <div className="h-px bg-border-subtle flex-1" />
+                </div>
+              )}
+              <LauncherSection
+                actor={actor}
+                launcher={launcher}
+                info={launcherInfoFor(actor, t)}
+                onSave={(patch) => saveLauncher(actor, patch)}
+                globalAdapters={globalAdapters}
+                onRefreshAdapters={() => {
+                  void refetchGlobalAdapters()
+                }}
+              />
+            </Fragment>
           )
         })}
       </SettingsList>
@@ -476,29 +518,130 @@ function PromptCard({ label, field, settings }: {
   )
 }
 
-function LauncherSection({ actor, launcher, info, onSaveCommand }: {
+function LauncherSection({
+  actor,
+  launcher,
+  info,
+  onSave,
+  globalAdapters,
+  onRefreshAdapters
+}: {
   actor: string
   launcher: Launcher
   info: LauncherInfo
-  onSaveCommand: (command: string) => void
+  onSave: (patch: Partial<Launcher>) => void
+  globalAdapters?: GlobalAcpAdaptersStatus
+  onRefreshAdapters?: () => void
 }) {
   const t = useT()
-  const saved = launcher.command || ''
-  const [draft, setDraft] = useState(saved)
+  const savedProtocol = launcher.protocol === 'acp' ? 'acp' : 'cli'
+  const savedCommand = launcher.command || ''
+  const savedArgs = (launcher.args ?? []).join(' ')
+
+  const [protocol, setProtocol] = useState<'cli' | 'acp'>(savedProtocol)
+  const [commandDraft, setCommandDraft] = useState(savedCommand)
+  const [argsDraft, setArgsDraft] = useState(savedArgs)
+  const [copied, setCopied] = useState(false)
+
+  const adapter =
+    actor === 'claude' || actor === 'wecode_claude'
+      ? globalAdapters?.claude
+      : actor === 'codex' || actor === 'wecode_codex'
+      ? globalAdapters?.codex
+      : undefined
 
   useEffect(() => {
-    setDraft(saved)
-  }, [saved])
+    setProtocol(savedProtocol)
+    const initialCommand =
+      savedProtocol === 'cli' && (savedCommand === 'npx' || savedCommand.includes('acp') || !savedCommand.trim())
+        ? defaultLauncherFor(actor).command
+        : savedCommand
+    setCommandDraft(initialCommand)
+    setArgsDraft(savedArgs)
+  }, [savedProtocol, savedCommand, savedArgs, actor])
 
-  const dirty = draft !== saved
+  const dirty =
+    protocol !== savedProtocol ||
+    commandDraft !== savedCommand ||
+    (protocol === 'acp' && argsDraft !== savedArgs)
 
   const [testResult, setTestResult] = useState<TestLauncherResult | null>(null)
   const testLauncherMutation = useTestLauncher()
 
+  const directBin =
+    actor === 'claude' || actor === 'wecode_claude'
+      ? 'claude-agent-acp'
+      : actor === 'codex' || actor === 'wecode_codex'
+      ? 'codex-acp'
+      : undefined
+
+  const actorPresets = useMemo(() => {
+    const rawPresets = KNOWN_ACP_PRESETS.filter((p) => p.actor === actor)
+    if (adapter?.installed && directBin) {
+      return rawPresets.map((preset) => {
+        if (preset.command === 'npx') {
+          return {
+            ...preset,
+            command: directBin,
+            args: [],
+            description: `${preset.name} (${directBin})`
+          }
+        }
+        return preset
+      })
+    }
+    return rawPresets
+  }, [actor, adapter?.installed, directBin])
+
+  const applyAcpPreset = useCallback(
+    (preset?: (typeof actorPresets)[number]) => {
+      const target = preset ?? actorPresets[0]
+      if (!target) return
+      setCommandDraft(target.command)
+      setArgsDraft(target.args.join(' '))
+    },
+    [actorPresets]
+  )
+
+  const isNpxAcpDraft =
+    commandDraft === 'npx' || commandDraft.endsWith('/npx') || commandDraft.includes('/npx')
+
+  const commandDraftRef = useRef(commandDraft)
+  commandDraftRef.current = commandDraft
+
+  // If ACP was selected with the npx fallback and a global adapter appears later,
+  // upgrade the draft to the direct binary automatically.
+  useEffect(() => {
+    if (protocol !== 'acp' || !adapter?.installed || !directBin) return
+    const current = commandDraftRef.current
+    const stillNpx = current === 'npx' || current.endsWith('/npx') || current.includes('/npx')
+    if (!stillNpx) return
+    setCommandDraft(directBin)
+    setArgsDraft('')
+  }, [protocol, adapter?.installed, directBin])
+
+  const handleSave = () => {
+    const trimmedCommand = commandDraft.trim()
+    const trimmedArgs = argsDraft.trim()
+    const patch: Partial<Launcher> = {
+      command: trimmedCommand || defaultLauncherFor(actor).command,
+      protocol: protocol === 'acp' ? 'acp' : undefined,
+      args: protocol === 'acp' && trimmedArgs ? trimmedArgs.split(/\s+/) : undefined
+    }
+    onSave(patch)
+  }
+
   const handleTest = () => {
     setTestResult(null)
+    const trimmedArgs = argsDraft.trim()
     testLauncherMutation.mutate(
-      { actor, command: saved, env: launcher.env },
+      {
+        actor,
+        command: commandDraft.trim(),
+        env: launcher.env,
+        protocol,
+        args: protocol === 'acp' && trimmedArgs ? trimmedArgs.split(/\s+/) : undefined
+      },
       {
         onSuccess: (result) => setTestResult(result),
         onError: (err) => {
@@ -518,49 +661,238 @@ function LauncherSection({ actor, launcher, info, onSaveCommand }: {
       <div className="flex items-center gap-2 mb-1">
         <ActorBadge actor={actor} />
         <h2 className="text-base font-semibold text-fg">{info.title}</h2>
+        {savedProtocol === 'acp' && (
+          <span className="px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider rounded bg-purple-500/10 text-purple-600 dark:text-purple-400 border border-purple-500/20">
+            ACP
+          </span>
+        )}
       </div>
-      <p className="text-sm text-fg-secondary mb-3 leading-relaxed">{info.hint}</p>
-      <div className="text-xs font-medium text-fg-secondary mb-1.5">{info.label}</div>
-      <div className="flex items-center gap-2">
-        <input
-          type="text"
-          value={draft}
-          placeholder={info.placeholder}
-          onChange={(e) => setDraft(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' && dirty) {
-              e.preventDefault()
-              onSaveCommand(draft)
-            }
-            if (e.key === 'Escape') {
-              setDraft(saved)
-            }
-          }}
-          className="flex-1 px-3 py-2 text-sm bg-transparent border border-border rounded-lg font-mono focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent transition-colors"
-        />
-        <button
-          type="button"
-          onClick={() => onSaveCommand(draft)}
-          disabled={!dirty}
-          className="px-3 py-2 text-xs font-medium rounded-md bg-accent-primary text-fg-inverse hover:bg-accent-primary-hover disabled:opacity-40 disabled:cursor-not-allowed transition-colors whitespace-nowrap"
-        >
-          {t('common.save')}
-        </button>
-        <button
-          type="button"
-          onClick={handleTest}
-          disabled={!saved || testLauncherMutation.isPending}
-          className="px-3 py-2 text-xs font-medium rounded-md border border-border hover:bg-bg-subtle disabled:opacity-40 disabled:cursor-not-allowed transition-colors whitespace-nowrap flex items-center gap-1.5"
-          title={t('settings.launcher.test')}
-        >
-          {testLauncherMutation.isPending ? (
-            <Loader2 size={12} className="animate-spin" />
-          ) : (
-            <Zap size={12} />
-          )}
-          {testLauncherMutation.isPending ? t('settings.launcher.testing') : t('settings.launcher.test')}
-        </button>
+      <p className="text-sm text-fg-secondary mb-3 leading-relaxed">
+        {protocol === 'acp' ? t('settings.launcher.acpHint') : info.hint}
+      </p>
+
+      <div className="flex items-center justify-between flex-wrap gap-2 mb-3">
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-medium text-fg-secondary">{t('settings.launcher.mode')}:</span>
+          <div className="inline-flex rounded-lg p-0.5 bg-bg-muted border border-border">
+            <button
+              type="button"
+              onClick={() => {
+                setProtocol('cli')
+                if (commandDraft === 'npx' || commandDraft.includes('acp') || !commandDraft.trim()) {
+                  setCommandDraft(defaultLauncherFor(actor).command)
+                }
+              }}
+              className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors ${
+                protocol === 'cli'
+                  ? 'bg-bg-elevated text-fg shadow-sm'
+                  : 'text-fg-secondary hover:text-fg'
+              }`}
+            >
+              {t('settings.launcher.modeCli')}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setProtocol('acp')
+                applyAcpPreset()
+                onRefreshAdapters?.()
+              }}
+              className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors ${
+                protocol === 'acp'
+                  ? 'bg-bg-elevated text-purple-600 dark:text-purple-400 shadow-sm font-semibold'
+                  : 'text-fg-secondary hover:text-fg'
+              }`}
+            >
+              {t('settings.launcher.modeAcp')}
+            </button>
+          </div>
+        </div>
+
+        {actorPresets.length > 0 && (
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <span className="text-[11px] text-fg-muted">{t('settings.launcher.presets')}:</span>
+            {actorPresets.map((preset) => (
+              <button
+                key={preset.id}
+                type="button"
+                onClick={() => {
+                  setProtocol('acp')
+                  applyAcpPreset(preset)
+                }}
+                className="px-2 py-0.5 text-[11px] rounded border border-border/80 hover:border-purple-500/50 hover:bg-purple-500/5 text-fg-secondary hover:text-fg transition-colors"
+                title={preset.description}
+              >
+                {preset.name}
+              </button>
+            ))}
+          </div>
+        )}
       </div>
+
+      {protocol === 'acp' && adapter && (
+        adapter.installed ? (
+          <div className="mb-3 px-3 py-2.5 rounded-lg text-xs bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 border border-emerald-500/20 flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2 flex-1 min-w-0">
+              <Zap size={14} className="shrink-0 text-emerald-500" />
+              <span className="leading-relaxed">
+                {t('settings.launcher.globalAdapterReady', { bin: adapter.binaryPath ?? directBin ?? '' })}
+              </span>
+            </div>
+            {directBin && isNpxAcpDraft && (
+              <button
+                type="button"
+                onClick={() => {
+                  setCommandDraft(directBin)
+                  setArgsDraft('')
+                }}
+                className="shrink-0 px-2.5 py-1 text-[11px] font-medium rounded border border-emerald-500/30 bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-800 dark:text-emerald-200 flex items-center gap-1 transition-colors"
+              >
+                <Zap size={12} />
+                {t('settings.launcher.switchToDirect', { bin: directBin })}
+              </button>
+            )}
+          </div>
+        ) : (
+          <div className="mb-3 p-3 rounded-lg text-xs bg-amber-500/10 dark:bg-amber-500/15 border border-amber-500/30 text-amber-900 dark:text-amber-200">
+            <div className="flex items-center gap-2 font-medium mb-1 text-amber-800 dark:text-amber-300">
+              <Zap size={15} className="text-amber-600 dark:text-amber-400 shrink-0" />
+              <span>{t('settings.launcher.globalInstallPromptTitle')}</span>
+            </div>
+            <p className="text-fg-secondary text-[11px] mb-2 leading-relaxed">
+              {t('settings.launcher.globalInstallPromptDesc')}
+            </p>
+            <div className="flex items-center justify-between gap-2 bg-bg/60 dark:bg-bg/40 border border-amber-500/20 rounded-md px-2.5 py-1.5 font-mono text-[11px]">
+              <span className="text-fg select-all truncate">{adapter.installCommand}</span>
+              <button
+                type="button"
+                onClick={() => {
+                  navigator.clipboard.writeText(adapter.installCommand).then(() => {
+                    setCopied(true)
+                    setTimeout(() => setCopied(false), 3000)
+                  })
+                }}
+                className="shrink-0 px-2 py-1 text-[11px] font-sans font-medium rounded border border-border/80 bg-bg hover:bg-bg-subtle text-fg flex items-center gap-1 transition-colors"
+                title={adapter.installCommand}
+              >
+                {copied ? <Check size={12} className="text-emerald-500" /> : <Copy size={12} />}
+                <span>{copied ? t('common.copied') : t('settings.launcher.copyInstallCmd')}</span>
+              </button>
+            </div>
+          </div>
+        )
+      )}
+
+      {protocol === 'acp' && (actor === 'agy' || actor === 'kimi') && (
+        <div className="mb-3 px-3 py-2 rounded-lg text-xs bg-amber-500/10 text-amber-700 dark:text-amber-300 border border-amber-500/20 flex items-start gap-2">
+          <AlertCircle size={14} className="shrink-0 mt-0.5" />
+          <span>
+            {actor === 'agy'
+              ? t('settings.launcher.agyAcpWarning')
+              : t('settings.launcher.kimiAcpWarning')}
+          </span>
+        </div>
+      )}
+
+      {protocol === 'cli' ? (
+        <>
+          <div className="text-xs font-medium text-fg-secondary mb-1.5">{info.label}</div>
+          <div className="flex items-center gap-2">
+            <input
+              type="text"
+              value={commandDraft}
+              placeholder={info.placeholder}
+              onChange={(e) => setCommandDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && dirty) {
+                  e.preventDefault()
+                  handleSave()
+                }
+                if (e.key === 'Escape') {
+                  setCommandDraft(savedCommand)
+                }
+              }}
+              className="flex-1 px-3 py-2 text-sm bg-transparent border border-border rounded-lg font-mono focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent transition-colors"
+            />
+            <button
+              type="button"
+              onClick={handleSave}
+              disabled={!dirty}
+              className="px-3 py-2 text-xs font-medium rounded-md bg-accent-primary text-fg-inverse hover:bg-accent-primary-hover disabled:opacity-40 disabled:cursor-not-allowed transition-colors whitespace-nowrap"
+            >
+              {t('common.save')}
+            </button>
+            <button
+              type="button"
+              onClick={handleTest}
+              disabled={!commandDraft.trim() || testLauncherMutation.isPending}
+              className="px-3 py-2 text-xs font-medium rounded-md border border-border hover:bg-bg-subtle disabled:opacity-40 disabled:cursor-not-allowed transition-colors whitespace-nowrap flex items-center gap-1.5"
+              title={t('settings.launcher.test')}
+            >
+              {testLauncherMutation.isPending ? (
+                <Loader2 size={12} className="animate-spin" />
+              ) : (
+                <Zap size={12} />
+              )}
+              {testLauncherMutation.isPending ? t('settings.launcher.testing') : t('settings.launcher.test')}
+            </button>
+          </div>
+        </>
+      ) : (
+        <div className="space-y-2">
+          <div>
+            <div className="text-xs font-medium text-fg-secondary mb-1.5">{info.label}</div>
+            <input
+              type="text"
+              value={commandDraft}
+              placeholder={info.placeholder}
+              onChange={(e) => setCommandDraft(e.target.value)}
+              className="w-full px-3 py-2 text-sm bg-transparent border border-border rounded-lg font-mono focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent transition-colors"
+            />
+          </div>
+          <div>
+            <div className="text-xs font-medium text-fg-secondary mb-1.5">{t('settings.launcher.args')}</div>
+            <div className="flex items-center gap-2">
+              <input
+                type="text"
+                value={argsDraft}
+                placeholder={t('settings.launcher.argsPlaceholder')}
+                onChange={(e) => setArgsDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && dirty) {
+                    e.preventDefault()
+                    handleSave()
+                  }
+                }}
+                className="flex-1 px-3 py-2 text-sm bg-transparent border border-border rounded-lg font-mono focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent transition-colors"
+              />
+              <button
+                type="button"
+                onClick={handleSave}
+                disabled={!dirty}
+                className="px-3 py-2 text-xs font-medium rounded-md bg-accent-primary text-fg-inverse hover:bg-accent-primary-hover disabled:opacity-40 disabled:cursor-not-allowed transition-colors whitespace-nowrap"
+              >
+                {t('common.save')}
+              </button>
+              <button
+                type="button"
+                onClick={handleTest}
+                disabled={!commandDraft.trim() || testLauncherMutation.isPending}
+                className="px-3 py-2 text-xs font-medium rounded-md border border-border hover:bg-bg-subtle disabled:opacity-40 disabled:cursor-not-allowed transition-colors whitespace-nowrap flex items-center gap-1.5"
+                title={t('settings.launcher.test')}
+              >
+                {testLauncherMutation.isPending ? (
+                  <Loader2 size={12} className="animate-spin" />
+                ) : (
+                  <Zap size={12} />
+                )}
+                {testLauncherMutation.isPending ? t('settings.launcher.testing') : t('settings.launcher.test')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {testResult && (
         <div className={`mt-3 px-3 py-2 rounded-lg text-xs leading-relaxed ${
           testResult.success
@@ -1246,18 +1578,10 @@ function EditableNumber({ value, min, max, onSave }: {
 }
 
 function ActorBadge({ actor }: { actor: string }) {
-  const map: Record<string, string> = {
-    claude: 'var(--actor-claude)',
-    codex: 'var(--actor-codex)',
-    cursor: 'var(--actor-cursor)',
-    agy: 'var(--actor-agy)',
-    opencode: 'var(--actor-opencode)',
-    kimi: 'var(--actor-kimi)',
-  }
   return (
     <div
       className="w-2.5 h-2.5 rounded-full shrink-0"
-      style={{ backgroundColor: map[actor] ?? 'var(--fg-muted)' }}
+      style={{ backgroundColor: actorColorVar(actor) }}
     />
   )
 }

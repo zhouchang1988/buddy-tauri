@@ -10,6 +10,7 @@ import {
   ACTOR_DISPLAY_NAME,
   ACTOR_LABEL_KEY,
   Actor,
+  actorColorVar,
   buildSessionResumeCommand,
   taskActors,
   formatTimeWithRelativeDate,
@@ -64,7 +65,10 @@ const SESSION_FIELD: Record<Actor, keyof TaskState> = {
   cursor: 'cursor_session_id',
   agy: 'agy_session_id',
   opencode: 'opencode_session_id',
-  kimi: 'kimi_session_id'
+  kimi: 'kimi_session_id',
+  wecode_claude: 'wecode_claude_session_id',
+  wecode_codex: 'wecode_codex_thread_id',
+  wecode_opencode: 'wecode_opencode_session_id'
 }
 
 export function StatusBar({
@@ -349,7 +353,7 @@ function ActorCard({
   const mountedRef = useRef(true)
 
   const sessionField = SESSION_FIELD[actor]
-  const session = (taskState?.[sessionField] as string | undefined) || ''
+  const session = taskState?.actor_sessions?.[actor] || (taskState?.[sessionField] as string | undefined) || ''
 
   useEffect(() => {
     return () => {
@@ -397,7 +401,7 @@ function ActorCard({
     : null
 
   return (
-    <div className={`rounded-lg border p-3 bg-bg-elevated ${running ? '' : 'border-border-subtle'}`} style={running ? { borderColor: `var(--actor-${actor})` } : undefined}>
+    <div className={`rounded-lg border p-3 bg-bg-elevated ${running ? '' : 'border-border-subtle'}`} style={running ? { borderColor: actorColorVar(actor) } : undefined}>
       <div className="flex items-center justify-between mb-1.5">
         <span className="text-sm font-medium">{ACTOR_DISPLAY_NAME[actor]}</span>
         {roleKey && <span className="text-xs text-fg-secondary">{t(roleKey)}</span>}

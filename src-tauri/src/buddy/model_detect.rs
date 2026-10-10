@@ -21,6 +21,7 @@
 use regex::Regex;
 use serde_json::Value;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use crate::buddy::launchers::{
     command_kind_for, is_wecode_claude_command, is_wecode_codex_command, split_command,
@@ -61,7 +62,9 @@ async fn detect_model_from_config_in(
             // When codex is launched via `wecode codex`, the effective model is
             // in ~/.wecode-cli/config.json (codex.model), NOT ~/.codex/config.toml
             // — wecode does not write back to config.toml.
-            if is_wecode_codex_command(command.unwrap_or("")) {
+            // `wecode codex`, or an actor named wecode_codex, reads
+            // ~/.wecode-cli/config.json — wecode does not write config.toml.
+            if is_wecode_codex_command(command.unwrap_or("")) || actor == "wecode_codex" {
                 read_wecode_codex_model(home).await
             } else {
                 read_toml_model(&home.join(".codex").join("config.toml"), "model").await
@@ -82,7 +85,7 @@ async fn detect_model_from_config_in(
             // fall back to ~/.claude/settings.json — otherwise a stale Claude model
             // would be displayed. Detection is by executable basename, not by any
             // permission flag, mirroring commandKindFor.
-            if is_wecode_claude_command(command.unwrap_or("")) {
+            if is_wecode_claude_command(command.unwrap_or("")) || actor == "wecode_claude" {
                 read_wecode_claude_model(&home.join(".wecode-cli").join("config.json")).await
             } else {
                 read_claude_model(&home.join(".claude").join("settings.json")).await
@@ -91,8 +94,7 @@ async fn detect_model_from_config_in(
         LauncherCommandKind::NativeCursor => {
             read_cursor_model(&home.join(".cursor").join("cli-config.json")).await
         }
-        // agy has no stable model field in settings yet; --model on the command wins above.
-        LauncherCommandKind::NativeAgy => None,
+        LauncherCommandKind::NativeAgy => read_agy_model(home).await,
         // contract: model is not knowable before a run.
         _ => None,
     }
@@ -237,6 +239,57 @@ async fn read_cursor_model(file_path: &Path) -> Option<String> {
         .or(selected_model_id)
         .or(configured_model_id)
         .map(str::to_string)
+}
+
+/// Read the selected Antigravity CLI model.
+///
+/// `/model` persists the display label in settings.json. The default model is
+/// not written, so fall back to the latest CLI log line that reports the
+/// selected-model override.
+pub(crate) async fn read_agy_model(home: &Path) -> Option<String> {
+    if let Some(from_settings) = read_json_model(
+        &home.join(".gemini").join("antigravity-cli").join("settings.json"),
+        "model",
+    )
+    .await
+    {
+        return Some(from_settings);
+    }
+    read_agy_model_from_log(&home.join(".gemini").join("antigravity-cli").join("cli.log")).await
+}
+
+fn agy_log_model_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"Propagating selected model override to backend: label="([^"]+)""#).unwrap()
+    })
+}
+
+const AGY_LOG_TAIL_BYTES: u64 = 64 * 1024;
+
+async fn read_agy_model_from_log(file_path: &Path) -> Option<String> {
+    let raw = read_file_tail(file_path, AGY_LOG_TAIL_BYTES).ok()?;
+    let mut last = None;
+    for caps in agy_log_model_re().captures_iter(&raw) {
+        if let Some(label) = caps.get(1) {
+            last = Some(label.as_str().to_string());
+        }
+    }
+    last
+}
+
+fn read_file_tail(file_path: &Path, max_bytes: u64) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(file_path)?;
+    let size = file.metadata()?.len();
+    if size == 0 {
+        return Ok(String::new());
+    }
+    let length = size.min(max_bytes);
+    file.seek(SeekFrom::Start(size - length))?;
+    let mut buffer = vec![0u8; length as usize];
+    file.read_exact(&mut buffer)?;
+    Ok(String::from_utf8_lossy(&buffer).into_owned())
 }
 
 /// Extract a top-level string field from a TOML config file.
@@ -916,6 +969,61 @@ mod tests {
         assert_eq!(
             detect_model_from_config_in(temp.path(), "claude", Some("wecode")).await,
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn wecode_actor_name_reads_wecode_config_even_with_a_plain_cli_command() {
+        let temp = tempfile::tempdir().unwrap();
+        write_wecode_config(temp.path(), "weibo-glm-5.2[1m]");
+        write_claude_config(temp.path(), "stale-claude-model");
+        write(
+            temp.path(),
+            ".wecode-cli/config.json",
+            &serde_json::to_string(&json!({
+                "env": { "ANTHROPIC_MODEL": "weibo-glm-5.2[1m]" },
+                "codex": { "model": "thudm-glm-5.2" }
+            }))
+            .unwrap(),
+        );
+        write(
+            temp.path(),
+            ".codex/config.toml",
+            "model = \"desktop-codex\"\n",
+        );
+
+        assert_eq!(
+            detect_model_from_config_in(temp.path(), "wecode_claude", Some("claude"))
+                .await
+                .as_deref(),
+            Some("weibo-glm-5.2[1m]")
+        );
+        assert_eq!(
+            detect_model_from_config_in(temp.path(), "wecode_codex", Some("codex"))
+                .await
+                .as_deref(),
+            Some("thudm-glm-5.2")
+        );
+    }
+
+    #[tokio::test]
+    async fn agy_prefers_settings_then_the_latest_log_label() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = "noise\nPropagating selected model override to backend: label=\"old-model\"\nPropagating selected model override to backend: label=\"gemini-2.5\"\n";
+        write(temp.path(), ".gemini/antigravity-cli/cli.log", log);
+        assert_eq!(
+            detect_model_from_config_in(temp.path(), "agy", Some("agy")).await.as_deref(),
+            Some("gemini-2.5")
+        );
+
+        write(
+            temp.path(),
+            ".gemini/antigravity-cli/settings.json",
+            &serde_json::to_string(&json!({ "model": "settings-model" })).unwrap(),
+        );
+        assert_eq!(
+            detect_model_from_config_in(temp.path(), "agy", Some("agy")).await.as_deref(),
+            Some("settings-model")
         );
     }
 }

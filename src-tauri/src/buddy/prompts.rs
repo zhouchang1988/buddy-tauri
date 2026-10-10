@@ -40,6 +40,9 @@ pub const ACTOR_CURSOR: &str = "cursor";
 pub const ACTOR_AGY: &str = "agy";
 pub const ACTOR_OPENCODE: &str = "opencode";
 pub const ACTOR_KIMI: &str = "kimi";
+pub const ACTOR_WECODE_CLAUDE: &str = "wecode_claude";
+pub const ACTOR_WECODE_CODEX: &str = "wecode_codex";
+pub const ACTOR_WECODE_OPENCODE: &str = "wecode_opencode";
 pub const ROLE_MODE_CODEX_IMPL: &str = "codex_implements";
 
 pub const BUDDY_MESSAGE_PROTOCOL: &str = r#"## Buddy Message Protocol
@@ -135,12 +138,36 @@ pub fn build_actor_prompt(input: &BuildActorPromptInput) -> String {
     let context_sent = state.get("context_sent").and_then(Value::as_object);
     let pending_break = state.get("pending_break").filter(|v| js_truthy(v));
     let break_rejected_by = state.get("break_rejected_by").filter(|v| js_truthy(v));
+    let implementer = implementer_actor(settings);
+    let reviewer = reviewer_actor(settings);
+    let is_implementer = input.actor == implementer;
+    let other_actor = if is_implementer { &reviewer } else { &implementer };
+    let role_label = if is_implementer {
+        "implementer (执行者)"
+    } else {
+        "reviewer (审查者)"
+    };
 
     let mut parts: Vec<String> = vec![
         "# buddy actor turn".to_string(),
         String::new(),
         "## Actor".to_string(),
         input.actor.clone(),
+        String::new(),
+        "## Role".to_string(),
+        if is_implementer {
+            format!(
+                "- Your role: **Implementer (执行者)**. You are responsible for writing code, executing changes, running tests, and reporting progress.\n- Reviewer: **{other}** ({name}).",
+                other = other_actor,
+                name = actor_display_name(other_actor)
+            )
+        } else {
+            format!(
+                "- Your role: **Reviewer (审查者)**. You inspect the implementer's work, verify tests/changes, and report blocking findings. Do not make direct code changes unless strictly necessary.\n- Implementer: **{other}** ({name}).",
+                other = other_actor,
+                name = actor_display_name(other_actor)
+            )
+        },
         String::new(),
         BUDDY_MESSAGE_PROTOCOL.to_string(),
         String::new(),
@@ -249,23 +276,18 @@ pub fn build_actor_prompt(input: &BuildActorPromptInput) -> String {
             pending_break.get("actor").and_then(Value::as_str).unwrap_or(""),
         );
         parts.push(format!(
-            "{} has requested to end the task. Confirm with `type=break` or continue with `type=chat`.",
-            requester_name
+            "You are the {role_label}. {requester_name} has requested to end the task. Confirm with `type=break` or continue with `type=chat`."
         ));
     } else if let Some(rejected) = break_rejected_by_other {
         let rejected_name =
             actor_display_name(rejected.get("actor").and_then(Value::as_str).unwrap_or(""));
         parts.push(format!(
-            "Your previous break request was rejected by {}, who made changes. Review their changes carefully. Only confirm with `type=break` if you agree the changes are correct and the task is complete.",
-            rejected_name
+            "You are the {role_label}. Your previous break request was rejected by {rejected_name}, who made changes. Review their changes carefully. Only confirm with `type=break` if you agree the changes are correct and the task is complete."
         ));
+    } else if is_implementer {
+        parts.push("You are the implementer (执行者). Continue the implementation work. Report changed files, what you did, and blockers.".to_string());
     } else {
-        let implementer = implementer_actor(settings);
-        if input.actor == implementer {
-            parts.push("Continue the implementation work. Report changed files, what you did, and blockers.".to_string());
-        } else {
-            parts.push("Review the current task state. Report blocking findings first, then concise next action. If you detect that the other actor is making repeated errors or the task is stuck in a circular pattern without progress, signal `type=break` to stop and let a human decide.".to_string());
-        }
+        parts.push("You are the reviewer (审查者). Review the current task state. Report blocking findings first, then concise next action. If you detect that the other actor is making repeated errors or the task is stuck in a circular pattern without progress, signal `type=break` to stop and let a human decide.".to_string());
     }
 
     if !human_lang.is_empty() {
@@ -324,10 +346,20 @@ pub fn runtime_settings_lines(
     } else {
         "unlimited".to_string()
     };
+    let implementer = implementer_actor(settings);
+    let is_implementer = actor == implementer;
     let mut lines = vec![
         format!(
             "- Current total round: {}",
             js_number_string(number_value(state.get("round"), 0.0))
+        ),
+        format!(
+            "- Current actor role: {}",
+            if is_implementer {
+                "Implementer (执行者)"
+            } else {
+                "Reviewer (审查者)"
+            }
         ),
         format!(
             "- Automatic rounds used in this window: {}/{}",
@@ -342,7 +374,11 @@ pub fn runtime_settings_lines(
             "- Automatic rounds remaining in this window: {}",
             remaining
         ),
-        format!("- Next actor after this turn: {}", next_actor(actor, settings)),
+        format!(
+            "- Next actor after this turn: {} ({})",
+            next_actor(actor, settings),
+            if is_implementer { "Reviewer" } else { "Implementer" }
+        ),
     ];
     if !repo_root.is_empty() {
         lines.push(format!("- Repository: {}", repo_root));
@@ -391,6 +427,9 @@ pub fn select_recent_transcript(transcript: &[TranscriptRow], window: usize) -> 
         ACTOR_AGY,
         ACTOR_OPENCODE,
         ACTOR_KIMI,
+        ACTOR_WECODE_CLAUDE,
+        ACTOR_WECODE_CODEX,
+        ACTOR_WECODE_OPENCODE,
     ] {
         if recent.iter().any(|item| item.role == role) {
             continue;
@@ -447,18 +486,12 @@ pub fn detect_human_language(
 }
 
 pub fn next_actor(actor: &str, settings: &Value) -> String {
-    let implementer = settings
-        .get("implementer_actor")
-        .and_then(Value::as_str)
-        .unwrap_or(ACTOR_CLAUDE);
-    let reviewer = settings
-        .get("reviewer_actor")
-        .and_then(Value::as_str)
-        .unwrap_or(ACTOR_CODEX);
+    let implementer = implementer_actor(settings);
+    let reviewer = reviewer_actor(settings);
     if actor == implementer {
-        reviewer.to_string()
+        reviewer
     } else {
-        implementer.to_string()
+        implementer
     }
 }
 
@@ -476,6 +509,20 @@ pub fn implementer_actor(settings: &Value) -> String {
         })
 }
 
+pub fn reviewer_actor(settings: &Value) -> String {
+    settings
+        .get("reviewer_actor")
+        .and_then(Value::as_str)
+        .map(String::from)
+        .unwrap_or_else(|| {
+            if settings.get("role_mode").and_then(Value::as_str) == Some(ROLE_MODE_CODEX_IMPL) {
+                ACTOR_CLAUDE.to_string()
+            } else {
+                ACTOR_CODEX.to_string()
+            }
+        })
+}
+
 pub fn actor_display_name(actor: &str) -> String {
     match actor {
         ACTOR_CLAUDE => "Claude Code".to_string(),
@@ -484,6 +531,9 @@ pub fn actor_display_name(actor: &str) -> String {
         ACTOR_CODEX => "Codex".to_string(),
         ACTOR_CURSOR => "Cursor".to_string(),
         ACTOR_AGY => "Antigravity".to_string(),
+        ACTOR_WECODE_CLAUDE => "WeCode Claude".to_string(),
+        ACTOR_WECODE_CODEX => "WeCode Codex".to_string(),
+        ACTOR_WECODE_OPENCODE => "WeCode OpenCode".to_string(),
         other => {
             if other.is_empty() {
                 "Codex".to_string()

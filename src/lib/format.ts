@@ -12,6 +12,9 @@ export const ACTOR_LABEL_KEY: Record<string, TranslationKey> = {
   agy: 'actor.agy',
   opencode: 'actor.opencode',
   kimi: 'actor.kimi',
+  wecode_claude: 'actor.wecode_claude',
+  wecode_codex: 'actor.wecode_codex',
+  wecode_opencode: 'actor.wecode_opencode',
   human: 'actor.human',
   system: 'actor.system'
 }
@@ -33,7 +36,30 @@ export const ACTOR_DISPLAY_NAME: Record<string, string> = {
   cursor: 'Cursor',
   agy: 'Antigravity',
   opencode: 'OpenCode',
-  kimi: 'Kimi Code'
+  kimi: 'Kimi Code',
+  wecode_claude: 'WeCode Claude',
+  wecode_codex: 'WeCode Codex',
+  wecode_opencode: 'WeCode OpenCode'
+}
+
+/**
+ * CSS color token for an actor. WeCode variants reuse their base actor color.
+ * Unknown actors fall back to `--border` (neutral gray).
+ */
+const ACTOR_COLOR_TOKEN: Record<string, string> = {
+  claude: 'var(--actor-claude)',
+  codex: 'var(--actor-codex)',
+  cursor: 'var(--actor-cursor)',
+  agy: 'var(--actor-agy)',
+  opencode: 'var(--actor-opencode)',
+  kimi: 'var(--actor-kimi)',
+  wecode_claude: 'var(--actor-claude)',
+  wecode_codex: 'var(--actor-codex)',
+  wecode_opencode: 'var(--actor-opencode)'
+}
+
+export function actorColorVar(actor: string): string {
+  return ACTOR_COLOR_TOKEN[actor] ?? 'var(--border)'
 }
 
 const EVENT_TYPE_KEY: Record<string, TranslationKey> = {
@@ -94,7 +120,7 @@ export function eventTypeLabel(type: string, lang: Language): string {
   return key ? translate(lang, key) : type
 }
 
-export type Actor = 'claude' | 'codex' | 'cursor' | 'agy' | 'opencode' | 'kimi'
+export type Actor = 'claude' | 'codex' | 'cursor' | 'agy' | 'opencode' | 'kimi' | 'wecode_claude' | 'wecode_codex' | 'wecode_opencode'
 
 export function taskActors(settings: TaskSettings | null | undefined): {
   impl: Actor
@@ -115,7 +141,11 @@ const SESSION_RESUME_ARG: Record<Actor, (sessionId: string) => string> = {
   cursor: (id) => `--resume ${id}`,
   agy: (id) => `--conversation ${id}`,
   opencode: (id) => `--session ${id}`,
-  kimi: (id) => `-S ${id}`
+  kimi: (id) => `-S ${id}`,
+  // WeCode 包装对应的基础 actor CLI，续跑参数与基础 actor 一致。
+  wecode_claude: (id) => `--resume ${id}`,
+  wecode_codex: (id) => `resume ${id}`,
+  wecode_opencode: (id) => `--session ${id}`
 }
 
 function shellQuoteDouble(text: string): string {

@@ -179,28 +179,28 @@ describe('CommitModal actor selection', () => {
 
   it('defaults to task implementer when no stored actor', () => {
     const { props } = renderModal({ taskSettings: { implementer_actor: 'codex' } })
-    const select = screen.getByDisplayValue('Codex') as HTMLSelectElement
+    const select = screen.getByTitle('git.commitMessageActor') as HTMLSelectElement
     expect(select.value).toBe('codex')
   })
 
   it('uses stored actor from localStorage when valid', () => {
     localStorage.setItem('buddy.lastCommitMessageActor', 'cursor')
     renderModal({ taskSettings: { implementer_actor: 'codex' } })
-    const select = screen.getByDisplayValue('Cursor') as HTMLSelectElement
+    const select = screen.getByTitle('git.commitMessageActor') as HTMLSelectElement
     expect(select.value).toBe('cursor')
   })
 
   it('falls back to task implementer when stored actor is invalid', () => {
     localStorage.setItem('buddy.lastCommitMessageActor', 'invalid_actor')
     renderModal({ taskSettings: { implementer_actor: 'kimi' } })
-    const select = screen.getByDisplayValue('Kimi') as HTMLSelectElement
+    const select = screen.getByTitle('git.commitMessageActor') as HTMLSelectElement
     expect(select.value).toBe('kimi')
   })
 
   it('falls back to claude when both stored and implementer are invalid', () => {
     localStorage.setItem('buddy.lastCommitMessageActor', 'invalid')
     renderModal({ taskSettings: null })
-    const select = screen.getByDisplayValue('Claude') as HTMLSelectElement
+    const select = screen.getByTitle('git.commitMessageActor') as HTMLSelectElement
     expect(select.value).toBe('claude')
   })
 
@@ -239,7 +239,7 @@ describe('CommitModal actor selection', () => {
     fireEvent.click(generateBtn)
 
     // Switch actor while generating
-    const select = screen.getByDisplayValue('Codex') as HTMLSelectElement
+    const select = screen.getByTitle('git.commitMessageActor') as HTMLSelectElement
     fireEvent.change(select, { target: { value: 'claude' } })
 
     expect(mockCancel).toHaveBeenCalled()

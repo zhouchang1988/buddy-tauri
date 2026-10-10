@@ -21,6 +21,9 @@ export type TaskStatus =
   | 'RUNNING_AGY'
   | 'RUNNING_OPENCODE'
   | 'RUNNING_KIMI'
+  | 'RUNNING_WECODE_CLAUDE'
+  | 'RUNNING_WECODE_CODEX'
+  | 'RUNNING_WECODE_OPENCODE'
   | 'PINGING'
   | 'COUNTDOWN'
   | 'PAUSED'
@@ -74,12 +77,16 @@ export interface TaskState {
   countdown?: Countdown | null
   active_run?: ActiveRun | null
   instruction_queue?: InstructionQueueItem[]
+  actor_sessions?: Record<string, string>
   claude_session_id?: string | null
   codex_thread_id?: string | null
   cursor_session_id?: string | null
   agy_session_id?: string | null
   opencode_session_id?: string | null
   kimi_session_id?: string | null
+  wecode_claude_session_id?: string | null
+  wecode_codex_thread_id?: string | null
+  wecode_opencode_session_id?: string | null
   context_hash?: string
   context_sent?: Record<string, boolean>
   event_seq?: number
@@ -130,16 +137,42 @@ export interface TaskSettings {
   seed_agy_session_id?: string
   seed_opencode_session_id?: string
   seed_kimi_session_id?: string
+  seed_wecode_claude_session_id?: string
+  seed_wecode_codex_thread_id?: string
+  seed_wecode_opencode_session_id?: string
 }
 
 export interface Launcher {
+  protocol?: 'acp' | 'cli'
   command: string
+  args?: string[]
   env: Record<string, string>
   timeout_seconds: number
+  /** Per-task ACP model id selected in the create-task modal or composer. */
+  model?: string
+}
+
+export interface AcpModelInfo {
+  id: string
+  name: string
+}
+
+export interface AcpModelList {
+  models: AcpModelInfo[]
+  currentModelId?: string
+}
+
+export interface AcpPreset {
+  id: string
+  name: string
+  actor: string
+  command: string
+  args: string[]
+  description: string
 }
 
 export interface TranscriptEntry {
-  role: 'human' | 'claude' | 'codex' | 'cursor' | 'agy' | 'opencode' | 'kimi' | 'system'
+  role: 'human' | 'claude' | 'codex' | 'cursor' | 'agy' | 'opencode' | 'kimi' | 'wecode_claude' | 'wecode_codex' | 'wecode_opencode' | 'system'
   content: string
   ts: string
   round?: number
@@ -196,6 +229,9 @@ export interface GlobalSettings {
   seed_agy_session_id?: string
   seed_opencode_session_id?: string
   seed_kimi_session_id?: string
+  seed_wecode_claude_session_id?: string
+  seed_wecode_codex_thread_id?: string
+  seed_wecode_opencode_session_id?: string
   max_compact_retries?: number
   auto_generate_commit_message?: boolean
   system_notifications_enabled?: boolean
@@ -224,6 +260,17 @@ export interface TestLauncherResult {
   timedOut?: boolean
   exitCode?: number | null
   signal?: string | null
+}
+
+export interface GlobalAcpAdapterItem {
+  installed: boolean
+  binaryPath: string | null
+  installCommand: string
+}
+
+export interface GlobalAcpAdaptersStatus {
+  claude: GlobalAcpAdapterItem
+  codex: GlobalAcpAdapterItem
 }
 
 export interface TaskEventEnvelope {

@@ -690,19 +690,11 @@ fn blocks_queue(state: &TaskState) -> bool {
 }
 
 /// States where a task is genuinely executing or mid-round, and so genuinely
-/// holds the queue.
+/// holds the queue. `RUNNING_*` is matched by prefix so wecode actors are
+/// covered without enumerating every variant (upstream v2 `startsWith`).
 fn is_actively_running(status: &TaskStatus) -> bool {
-    matches!(
-        status,
-        TaskStatus::Pinging
-            | TaskStatus::RunningClaude
-            | TaskStatus::RunningCodex
-            | TaskStatus::RunningCursor
-            | TaskStatus::RunningAgy
-            | TaskStatus::RunningOpencode
-            | TaskStatus::RunningKimi
-            | TaskStatus::Countdown
-    )
+    status.as_str().starts_with("RUNNING_")
+        || matches!(status, TaskStatus::Pinging | TaskStatus::Countdown)
 }
 
 /// Stable ordering for queued tasks: enqueued_at, then created_at, then

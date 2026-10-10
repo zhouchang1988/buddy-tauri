@@ -1,5 +1,5 @@
 import { memo, useState, useEffect } from 'react'
-import { ChevronDown, ChevronUp, Wrench, Terminal, FilePen, FileText, Brain, FileCode2, File, FileJson, FileArchive, FileSpreadsheet, Image as ImageIcon, RotateCw } from 'lucide-react'
+import { ChevronDown, ChevronUp, Wrench, Terminal, FilePen, FileText, Brain, FileCode2, File, FileJson, FileArchive, FileSpreadsheet, Image as ImageIcon, RotateCw, CheckCircle2 } from 'lucide-react'
 import { AttachmentMeta, TranscriptEntry, RoundEventSummary, RoundEventEntry, TaskStats } from '../shared/types'
 import { renderMarkdown } from '../lib/markdown'
 import { formatDuration, formatTimeWithRelativeDate, decodeErrorText, unescapeText, ACTOR_LABEL_KEY, actorText } from '../lib/format'
@@ -24,6 +24,9 @@ const roleClasses: Record<string, string> = {
   agy: 'msg-agy',
   opencode: 'msg-opencode',
   kimi: 'msg-kimi',
+  wecode_claude: 'msg-wecode_claude',
+  wecode_codex: 'msg-wecode_codex',
+  wecode_opencode: 'msg-wecode_opencode',
   system: 'msg-system'
 }
 
@@ -465,6 +468,7 @@ function RoundEventItem({ entry, lang }: { entry: RoundEventEntry; lang: 'zh-CN'
 
 function toolIcon(name: string) {
   const n = name.toLowerCase()
+  if (n === 'buddy_propose_break') return <CheckCircle2 size={12} className="shrink-0 text-emerald-500" />
   if (n === 'bash') return <Terminal size={12} className="shrink-0" />
   if (n === 'edit' || n === 'write') return <FilePen size={12} className="shrink-0" />
   if (n === 'read') return <FileText size={12} className="shrink-0" />
@@ -474,6 +478,10 @@ function toolIcon(name: string) {
 
 function formatToolInput(name: string, input: Record<string, unknown>, lang: 'zh-CN' | 'zh-TW' | 'en'): string {
   const n = name.toLowerCase()
+  if (n === 'buddy_propose_break') {
+    const reason = input.reason as string | undefined
+    return reason ? truncate(reason, 60) : (lang === 'en' ? 'Task complete' : '提议结束')
+  }
   if (n === 'bash') {
     const cmd = input.command as string | undefined
     return cmd ? truncate(cmd, 80) : ''

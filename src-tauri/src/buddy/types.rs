@@ -24,6 +24,12 @@ pub enum TaskStatus {
     RunningOpencode,
     #[serde(rename = "RUNNING_KIMI")]
     RunningKimi,
+    #[serde(rename = "RUNNING_WECODE_CLAUDE")]
+    RunningWecodeClaude,
+    #[serde(rename = "RUNNING_WECODE_CODEX")]
+    RunningWecodeCodex,
+    #[serde(rename = "RUNNING_WECODE_OPENCODE")]
+    RunningWecodeOpencode,
     #[serde(rename = "PINGING")]
     Pinging,
     #[serde(rename = "COUNTDOWN")]
@@ -49,6 +55,9 @@ impl TaskStatus {
             TaskStatus::RunningAgy => "RUNNING_AGY",
             TaskStatus::RunningOpencode => "RUNNING_OPENCODE",
             TaskStatus::RunningKimi => "RUNNING_KIMI",
+            TaskStatus::RunningWecodeClaude => "RUNNING_WECODE_CLAUDE",
+            TaskStatus::RunningWecodeCodex => "RUNNING_WECODE_CODEX",
+            TaskStatus::RunningWecodeOpencode => "RUNNING_WECODE_OPENCODE",
             TaskStatus::Pinging => "PINGING",
             TaskStatus::Countdown => "COUNTDOWN",
             TaskStatus::Paused => "PAUSED",
@@ -67,6 +76,9 @@ impl TaskStatus {
             "agy" => TaskStatus::RunningAgy,
             "opencode" => TaskStatus::RunningOpencode,
             "kimi" => TaskStatus::RunningKimi,
+            "wecode_claude" => TaskStatus::RunningWecodeClaude,
+            "wecode_codex" => TaskStatus::RunningWecodeCodex,
+            "wecode_opencode" => TaskStatus::RunningWecodeOpencode,
             _ => TaskStatus::Ready,
         }
     }
@@ -80,6 +92,9 @@ impl TaskStatus {
                 | TaskStatus::RunningAgy
                 | TaskStatus::RunningOpencode
                 | TaskStatus::RunningKimi
+                | TaskStatus::RunningWecodeClaude
+                | TaskStatus::RunningWecodeCodex
+                | TaskStatus::RunningWecodeOpencode
                 | TaskStatus::Pinging
         )
     }
@@ -189,6 +204,8 @@ pub struct TaskState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instruction_queue: Option<Vec<InstructionQueueItem>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_sessions: Option<HashMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_thread_id: Option<String>,
@@ -200,6 +217,12 @@ pub struct TaskState {
     pub opencode_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kimi_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wecode_claude_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wecode_codex_thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wecode_opencode_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -286,19 +309,57 @@ pub struct TaskSettings {
     pub seed_opencode_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed_kimi_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_wecode_claude_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_wecode_codex_thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_wecode_opencode_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Launcher {
+    /// 'acp' | 'cli'
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
     pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<Vec<String>>,
     #[serde(default)]
     pub env: HashMap<String, String>,
     pub timeout_seconds: u64,
+    /// Per-task ACP model id selected in the create-task modal or composer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcpModelInfo {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpModelList {
+    pub models: Vec<AcpModelInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_model_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcpPreset {
+    pub id: String,
+    pub name: String,
+    pub actor: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub description: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscriptEntry {
-    pub role: String, // 'human' | 'claude' | 'codex' | 'cursor' | 'agy' | 'opencode' | 'kimi' | 'system'
+    pub role: String, // 'human' | 'claude' | 'codex' | 'cursor' | 'agy' | 'opencode' | 'kimi' | 'wecode_claude' | 'wecode_codex' | 'wecode_opencode' | 'system'
     pub content: String,
     pub ts: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -393,6 +454,12 @@ pub struct GlobalSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed_kimi_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_wecode_claude_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_wecode_codex_thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_wecode_opencode_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_compact_retries: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_generate_commit_message: Option<bool>,
@@ -431,11 +498,19 @@ pub struct TestLauncherResult {
     pub session_id: Option<String>,
     #[serde(rename = "threadId", default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
-    #[serde(rename = "responsePreview", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "responsePreview",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub response_preview: Option<String>,
     #[serde(rename = "runId", default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
-    #[serde(rename = "durationMs", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "durationMs",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub duration_ms: Option<u64>,
     #[serde(rename = "timedOut", default, skip_serializing_if = "Option::is_none")]
     pub timed_out: Option<bool>,
@@ -443,6 +518,20 @@ pub struct TestLauncherResult {
     pub exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signal: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GlobalAcpAdapterItem {
+    pub installed: bool,
+    pub binary_path: Option<String>,
+    pub install_command: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlobalAcpAdaptersStatus {
+    pub claude: GlobalAcpAdapterItem,
+    pub codex: GlobalAcpAdapterItem,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

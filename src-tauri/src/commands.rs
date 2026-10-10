@@ -15,10 +15,10 @@ use tauri::{AppHandle, State};
 use crate::buddy::commit_message::GenerateCommitMessageInput;
 use crate::buddy::service::{BuddyCoreService, EventsResponse};
 use crate::buddy::types::{
-    AttachmentMeta, BootstrapResponse, CountdownInput, CreateTaskInput, CreateTaskResult,
-    GitCommitPushResult, GitPushAvailability, GitPushResult, GlobalSettings, GitStatusResult,
-    InstructionQueueItem, RoundEventSummary,
-    SendMessageInput, StartTaskInput, Task, TaskDetail, TaskStats, TestLauncherResult,
+    AcpModelList, AttachmentMeta, BootstrapResponse, CountdownInput, CreateTaskInput,
+    CreateTaskResult, GitCommitPushResult, GitPushAvailability, GitPushResult, GlobalAcpAdaptersStatus,
+    GlobalSettings, GitStatusResult, InstructionQueueItem, RoundEventSummary,
+    SendMessageInput, StartTaskInput, Task, TaskDetail, TaskSettings, TaskStats, TestLauncherResult,
 };
 use crate::{menu, updater};
 
@@ -387,9 +387,11 @@ pub async fn buddy_test_launcher(
     actor: String,
     command: String,
     env: Option<HashMap<String, String>>,
+    protocol: Option<String>,
+    args: Option<Vec<String>>,
 ) -> CmdResult<TestLauncherResult> {
     service
-        .test_launcher(&actor, &command, env)
+        .test_launcher(&actor, &command, env, protocol.as_deref(), args)
         .await
         .map_err(err)
 }
@@ -399,6 +401,15 @@ pub async fn buddy_detect_actor_models(
     service: State<'_, BuddyCoreService>,
 ) -> CmdResult<HashMap<String, Option<String>>> {
     service.detect_actor_models().await.map_err(err)
+}
+
+#[tauri::command]
+pub async fn buddy_list_acp_models(
+    service: State<'_, BuddyCoreService>,
+    actor: String,
+    cwd: Option<String>,
+) -> CmdResult<AcpModelList> {
+    service.list_acp_models(&actor, cwd).await.map_err(err)
 }
 
 #[tauri::command]
@@ -412,6 +423,27 @@ pub async fn buddy_update_task_text(
         .update_task_text(&task_id, &workspace_key, &task_text)
         .await
         .map_err(err)
+}
+
+#[tauri::command]
+pub async fn buddy_update_task_launcher_model(
+    service: State<'_, BuddyCoreService>,
+    task_id: String,
+    workspace_key: String,
+    actor: String,
+    model: String,
+) -> CmdResult<TaskSettings> {
+    service
+        .update_task_launcher_model(&task_id, &workspace_key, &actor, &model)
+        .await
+        .map_err(err)
+}
+
+#[tauri::command]
+pub fn buddy_check_acp_global_adapters(
+    service: State<'_, BuddyCoreService>,
+) -> CmdResult<GlobalAcpAdaptersStatus> {
+    Ok(service.check_acp_global_adapters())
 }
 
 // ---------------------------------------------------------------------------

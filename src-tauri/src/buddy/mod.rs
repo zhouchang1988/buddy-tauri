@@ -1,6 +1,7 @@
 //! Buddy core: filesystem store, runner state machine, actor launchers,
 //! parsers, git integration — the Rust port of `src/main/buddy/`.
 
+pub mod acp;
 pub mod coalesce;
 pub mod commit_message;
 pub mod defaults;

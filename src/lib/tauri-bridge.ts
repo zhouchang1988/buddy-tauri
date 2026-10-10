@@ -14,6 +14,7 @@ import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import { openPath, openUrl } from '@tauri-apps/plugin-opener'
 import { currentLanguage, translate } from './i18n'
 import type {
+  AcpModelList,
   AttachmentMeta,
   BootstrapResponse,
   CountdownInput,
@@ -23,6 +24,7 @@ import type {
   GitCommitPushResult,
   GitPushAvailability,
   GitPushResult,
+  GlobalAcpAdaptersStatus,
   GlobalSettings,
   InstructionQueueItem,
   RoundEventSummary,
@@ -103,12 +105,18 @@ const buddy = {
     invoke<{ message: string }>('buddy_generate_commit_message', { input }),
   cancelGenerateCommitMessage: (): Promise<void> =>
     invoke<void>('buddy_cancel_generate_commit_message'),
-  testLauncher: (actor: string, command: string, env?: Record<string, string>): Promise<TestLauncherResult> =>
-    invoke<TestLauncherResult>('buddy_test_launcher', { actor, command, env }),
+  testLauncher: (actor: string, command: string, env?: Record<string, string>, protocol?: 'cli' | 'acp', args?: string[]): Promise<TestLauncherResult> =>
+    invoke<TestLauncherResult>('buddy_test_launcher', { actor, command, env, protocol, args }),
   detectActorModels: (): Promise<Record<string, string | undefined>> =>
     invoke<Record<string, string | undefined>>('buddy_detect_actor_models'),
+  listAcpModels: (actor: string, cwd?: string): Promise<AcpModelList> =>
+    invoke<AcpModelList>('buddy_list_acp_models', { actor, cwd }),
   updateTaskText: (taskId: string, workspaceKey: string, taskText: string): Promise<void> =>
     invoke<void>('buddy_update_task_text', { taskId, workspaceKey, taskText }),
+  updateTaskLauncherModel: (taskId: string, workspaceKey: string, actor: string, model: string): Promise<TaskSettings> =>
+    invoke<TaskSettings>('buddy_update_task_launcher_model', { taskId, workspaceKey, actor, model }),
+  checkAcpGlobalAdapters: (): Promise<GlobalAcpAdaptersStatus> =>
+    invoke<GlobalAcpAdaptersStatus>('buddy_check_acp_global_adapters'),
   onTaskEvent: (callback: (payload: TaskEventEnvelope) => void): (() => void) => {
     // Electron callbacks received (event, payload); here the callback gets just the payload.
     const unlisten = listen<TaskEventEnvelope>('buddy:event', (event) => callback(event.payload))

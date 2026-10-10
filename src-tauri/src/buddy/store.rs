@@ -7,7 +7,7 @@
 //! then renamed into place (atomic write convention).
 
 use crate::buddy::defaults::{
-    default_launcher_for, normalize_global_settings, DEFAULT_LAUNCHER_ORDER,
+    default_launcher_for, normalize_global_settings, normalize_launcher, DEFAULT_LAUNCHER_ORDER,
 };
 use crate::buddy::launchers::{
     command_kind_for, is_wecode_claude_command, is_wecode_codex_command, split_command,
@@ -33,10 +33,30 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
-const ACTORS: [&str; 6] = ["claude", "codex", "cursor", "agy", "opencode", "kimi"];
+const ACTORS: [&str; 9] = [
+    "claude",
+    "codex",
+    "cursor",
+    "agy",
+    "opencode",
+    "kimi",
+    "wecode_claude",
+    "wecode_codex",
+    "wecode_opencode",
+];
 
-const TRANSCRIPT_ROLES: [&str; 8] = [
-    "human", "claude", "codex", "cursor", "agy", "opencode", "kimi", "system",
+const TRANSCRIPT_ROLES: [&str; 11] = [
+    "human",
+    "claude",
+    "codex",
+    "cursor",
+    "agy",
+    "opencode",
+    "kimi",
+    "wecode_claude",
+    "wecode_codex",
+    "wecode_opencode",
+    "system",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -543,6 +563,37 @@ impl BuddyStore {
         atomic_write_text(&dir.join("task.md"), &task_markdown_content(task_text)).await
     }
 
+    /// `updateTaskLauncherModel`: set (or clear, on empty) the per-task ACP
+    /// model of one actor's launcher in `settings.json`.
+    pub async fn update_task_launcher_model(
+        &self,
+        task_id: &str,
+        workspace_key: &str,
+        actor: &str,
+        model: &str,
+    ) -> Result<TaskSettings, StoreError> {
+        let actor = actor.trim();
+        if actor.is_empty() {
+            return Err(StoreError::Invalid("actor is required".to_string()));
+        }
+        let mut settings = self.read_task_settings(task_id, workspace_key).await?;
+        let mut launcher = settings
+            .launchers
+            .get(actor)
+            .cloned()
+            .unwrap_or_else(|| normalize_launcher(actor, None));
+        let model = model.trim();
+        if model.is_empty() {
+            launcher.model = None;
+        } else {
+            launcher.model = Some(model.to_string());
+        }
+        settings.launchers.insert(actor.to_string(), launcher);
+        let value = serde_json::to_value(&settings)?;
+        atomic_write_json(&self.settings_path(task_id, workspace_key), &value).await?;
+        Ok(settings)
+    }
+
     pub async fn read_transcript_jsonl(
         &self,
         task_id: &str,
@@ -711,6 +762,11 @@ impl BuddyStore {
         actor: &str,
     ) -> Option<String> {
         let state = self.read_task_state(task_id, workspace_key).await.ok()?;
+        if let Some(sessions) = &state.actor_sessions {
+            if let Some(value) = sessions.get(actor).filter(|value| !value.is_empty()) {
+                return Some(value.clone());
+            }
+        }
         let value = match actor {
             "kimi" => state.kimi_session_id,
             "opencode" => state.opencode_session_id,
@@ -718,6 +774,9 @@ impl BuddyStore {
             "codex" => state.codex_thread_id,
             "cursor" => state.cursor_session_id,
             "agy" => state.agy_session_id,
+            "wecode_claude" => state.wecode_claude_session_id,
+            "wecode_codex" => state.wecode_codex_thread_id,
+            "wecode_opencode" => state.wecode_opencode_session_id,
             _ => None,
         };
         value.filter(|session_id| !session_id.is_empty())
@@ -901,10 +960,11 @@ impl BuddyStore {
                         cache_read_tokens =
                             json_u64(usage.get("cache_read_tokens")).unwrap_or(cache_read_tokens);
                     }
-                    if let Some(seconds) = result.get("duration_seconds").and_then(Value::as_f64)
-                    {
-                        duration_ms = Some((seconds * 1000.0).round());
-                    }
+                    // Do NOT use result.duration_seconds for per-run duration.
+                    // agy reports conversation lifetime (monotonic across
+                    // resumes), not this turn — summing it across rounds
+                    // produced multi-day fake totals in task stats. Wall-clock
+                    // elapsed_ms from the transcript is the source of truth.
                     if let Some(response) = result.get("response").and_then(Value::as_str) {
                         events.push(text_entry(Some(response.to_string())));
                     }
@@ -1128,6 +1188,47 @@ impl BuddyStore {
                     events.push(text_entry(Some(text.to_string())));
                 }
             }
+
+            // ACP format (written by the runner's ACP channel into the run's
+            // events.jsonl)
+            if event_type == Some("acp.thinking") {
+                let length = match event.get("thinking").and_then(Value::as_str) {
+                    Some(thinking) => thinking.chars().count() as u64,
+                    None => json_u64(event.get("thinkingLength")).unwrap_or(0),
+                };
+                events.push(thinking_entry(length));
+            }
+            if event_type == Some("acp.tool_use") {
+                let name = event
+                    .get("toolName")
+                    .or_else(|| event.get("name"))
+                    .and_then(Value::as_str);
+                let input = event
+                    .get("toolInput")
+                    .or_else(|| event.get("input"))
+                    .and_then(Value::as_object)
+                    .cloned();
+                if let Some(name) = name {
+                    events.push(tool_use_entry(Some(name.to_string()), input));
+                }
+            }
+            if event_type == Some("acp.tool_result") {
+                let preview = event
+                    .get("toolResultPreview")
+                    .or_else(|| event.get("preview"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| match event.get("result") {
+                        Some(Value::String(text)) => Some(text.clone()),
+                        Some(other) => serde_json::to_string(other).ok(),
+                        None => None,
+                    });
+                events.push(RoundEventEntry {
+                    tool_result_preview: preview.map(|p| take_chars(&p, 200)),
+                    is_error: event.get("isError").and_then(Value::as_bool),
+                    ..tool_result_entry(String::new(), None)
+                });
+            }
         }
 
         // Fallback: compute duration from event timestamps if not provided by actor
@@ -1249,9 +1350,16 @@ impl BuddyStore {
                     cache_read_tokens += summary.cache_read_tokens;
                     if let Some(summary_duration) = summary.duration_ms {
                         if summary_duration > 0 {
-                            // Use actor-reported duration if available,
-                            // otherwise fall back to elapsed_ms
-                            duration_ms = duration_ms - run.elapsed_ms + summary_duration as f64;
+                            // Prefer actor-reported duration when it looks like
+                            // a per-run value. Reject session-cumulative figures
+                            // (e.g. historical agy duration_seconds) that dwarf
+                            // Buddy's wall-clock elapsed_ms for the same run.
+                            let reported = summary_duration as f64;
+                            let plausible =
+                                run.elapsed_ms <= 0.0 || reported <= run.elapsed_ms * 2.0 + 5_000.0;
+                            if plausible {
+                                duration_ms = duration_ms - run.elapsed_ms + reported;
+                            }
                         }
                     }
                     if let Some(summary_cost) = summary.cost_usd {
@@ -1649,7 +1757,7 @@ async fn detect_model_from_config(home: &Path, actor: &str, command: Option<&str
                 .await
         }
         LauncherCommandKind::NativeCodex => {
-            if is_wecode_codex_command(command) {
+            if is_wecode_codex_command(command) || actor == "wecode_codex" {
                 read_wecode_codex_model(home).await
             } else {
                 read_toml_model(&home.join(".codex").join("config.toml"), "model").await
@@ -1665,12 +1773,13 @@ async fn detect_model_from_config(home: &Path, actor: &str, command: Option<&str
             read_toml_model(&home.join(".kimi").join("config.toml"), "default_model").await
         }
         LauncherCommandKind::NativeClaude => {
-            if is_wecode_claude_command(command) {
+            if is_wecode_claude_command(command) || actor == "wecode_claude" {
                 read_wecode_claude_model(&home.join(".wecode-cli").join("config.json")).await
             } else {
                 read_claude_model(&home.join(".claude").join("settings.json")).await
             }
         }
+        LauncherCommandKind::NativeAgy => crate::buddy::model_detect::read_agy_model(home).await,
         // contract: model is not knowable before a run.
         _ => None,
     }
@@ -1856,12 +1965,32 @@ fn state_to_json_value(state: &TaskState) -> Value {
         serde_json::to_value(state.instruction_queue.clone().unwrap_or_default())
             .unwrap_or(Value::Array(Vec::new())),
     );
+    map.insert(
+        "actor_sessions".to_string(),
+        serde_json::to_value(state.actor_sessions.clone().unwrap_or_default())
+            .unwrap_or(Value::Object(Map::new())),
+    );
     insert_nullable(&mut map, "claude_session_id", &state.claude_session_id);
     insert_nullable(&mut map, "codex_thread_id", &state.codex_thread_id);
     insert_nullable(&mut map, "cursor_session_id", &state.cursor_session_id);
     insert_nullable(&mut map, "agy_session_id", &state.agy_session_id);
     insert_nullable(&mut map, "opencode_session_id", &state.opencode_session_id);
     insert_nullable(&mut map, "kimi_session_id", &state.kimi_session_id);
+    insert_nullable(
+        &mut map,
+        "wecode_claude_session_id",
+        &state.wecode_claude_session_id,
+    );
+    insert_nullable(
+        &mut map,
+        "wecode_codex_thread_id",
+        &state.wecode_codex_thread_id,
+    );
+    insert_nullable(
+        &mut map,
+        "wecode_opencode_session_id",
+        &state.wecode_opencode_session_id,
+    );
     insert_opt(&mut map, "context_hash", &state.context_hash);
     map.insert(
         "context_sent".to_string(),
@@ -1903,29 +2032,63 @@ fn insert_nullable<T: serde::Serialize>(map: &mut Map<String, Value>, key: &str,
 /// A launcher from a task-creation settings override: every field may be
 /// missing, and missing fields fall back to the actor defaults (NOT to the
 /// global settings — the Electron edition spreads `{command: undefined, ...}`
-/// over the global launcher, clobbering it).
+/// over the global launcher, clobbering it). `protocol` / `args` are resolved
+/// by [`coerce_launcher_overrides`], which can recover the ACP protocol from
+/// the global launcher.
 #[derive(Debug, Default)]
 struct PartialLauncher {
     command: Option<String>,
     env: Option<HashMap<String, String>>,
     timeout_seconds: Option<u64>,
+    protocol: Option<String>,
+    args: Option<Vec<String>>,
+    model: Option<String>,
 }
 
 fn launcher_from_partial(actor: &str, partial: &PartialLauncher) -> Launcher {
     let fallback = default_launcher_for(actor);
+    let mut command = partial
+        .command
+        .as_ref()
+        .filter(|command| !command.trim().is_empty())
+        .cloned()
+        .unwrap_or_else(|| fallback.command.clone());
+    // TS normalizeLauncher: a bare `npx` command only survives for ACP.
+    if partial.protocol.as_deref() != Some("acp") && command == "npx" {
+        command = fallback.command.clone();
+    }
+    let protocol = partial
+        .protocol
+        .clone()
+        .filter(|protocol| protocol == "acp");
     Launcher {
-        command: partial
-            .command
-            .as_ref()
-            .filter(|command| !command.trim().is_empty())
-            .cloned()
-            .unwrap_or(fallback.command),
+        args: if protocol.is_some() {
+            partial.args.clone()
+        } else {
+            None
+        },
+        protocol,
+        command,
         env: partial.env.clone().unwrap_or(fallback.env),
         timeout_seconds: partial.timeout_seconds.unwrap_or(fallback.timeout_seconds),
+        model: partial.model.clone(),
     }
 }
 
-fn coerce_launcher_overrides(value: Option<&Value>) -> HashMap<String, PartialLauncher> {
+/// True when the override itself looks like an ACP adapter invocation
+/// (`npx`, a command containing `acp`, or an arg containing `acp`).
+fn is_npx_or_acp(command: Option<&str>, args: Option<&[String]>) -> bool {
+    command == Some("npx")
+        || command.map(|c| c.contains("acp")).unwrap_or(false)
+        || args
+            .map(|args| args.iter().any(|a| a.to_lowercase().contains("acp")))
+            .unwrap_or(false)
+}
+
+fn coerce_launcher_overrides(
+    value: Option<&Value>,
+    global_launchers: &HashMap<String, Launcher>,
+) -> HashMap<String, PartialLauncher> {
     let mut launchers = HashMap::new();
     let Some(overrides) = value.and_then(Value::as_object) else {
         return launchers;
@@ -1934,13 +2097,54 @@ fn coerce_launcher_overrides(value: Option<&Value>) -> HashMap<String, PartialLa
         let Some(candidate) = raw.as_object() else {
             continue;
         };
+        let command = candidate
+            .get("command")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let candidate_args: Option<Vec<String>> = candidate
+            .get("args")
+            .and_then(Value::as_array)
+            .map(|args| {
+                args.iter()
+                    .filter_map(|arg| arg.as_str().map(str::to_string))
+                    .collect()
+            });
+        let model = candidate
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_string);
+        let global = global_launchers.get(actor);
+        let npx_or_acp = is_npx_or_acp(command.as_deref(), candidate_args.as_deref());
+        let protocol = candidate
+            .get("protocol")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                // Recover the ACP protocol from the global launcher when the
+                // task override kept the same command (or is itself an ACP
+                // invocation); a bare npx/acp-looking override also implies it.
+                let global_is_acp = global.and_then(|g| g.protocol.as_deref()) == Some("acp");
+                let same_command =
+                    command.as_deref().is_some() && command.as_deref() == global.map(|g| g.command.as_str());
+                if (global_is_acp && (same_command || npx_or_acp)) || npx_or_acp {
+                    Some("acp".to_string())
+                } else {
+                    None
+                }
+            });
+        let args = match candidate_args.filter(|args| !args.is_empty()) {
+            Some(args) => Some(args),
+            None if protocol.as_deref() == Some("acp") => global
+                .and_then(|g| g.args.clone())
+                .filter(|args| !args.is_empty()),
+            None => None,
+        };
         launchers.insert(
             actor.clone(),
             PartialLauncher {
-                command: candidate
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
+                command,
                 env: candidate.get("env").and_then(Value::as_object).map(|env| {
                     env.iter()
                         .filter_map(|(key, value)| {
@@ -1949,6 +2153,9 @@ fn coerce_launcher_overrides(value: Option<&Value>) -> HashMap<String, PartialLa
                         .collect()
                 }),
                 timeout_seconds: candidate.get("timeout_seconds").and_then(Value::as_u64),
+                protocol,
+                args,
+                model,
             },
         );
     }
@@ -1965,7 +2172,10 @@ fn default_task_settings(
 ) -> Value {
     let normalized_global = normalize_global_settings(Some(global_settings));
     let global_launchers = normalized_global.launchers.clone().unwrap_or_default();
-    let coerced = coerce_launcher_overrides(overrides.and_then(|o| o.get("launchers")));
+    let coerced = coerce_launcher_overrides(
+        overrides.and_then(|o| o.get("launchers")),
+        &global_launchers,
+    );
 
     let mut launchers = Map::new();
     for actor in DEFAULT_LAUNCHER_ORDER {
@@ -2055,11 +2265,48 @@ fn default_task_settings(
     );
     map.insert(
         "seed_opencode_session_id".to_string(),
-        Value::String(String::new()),
+        Value::String(
+            normalized_global
+                .seed_opencode_session_id
+                .clone()
+                .unwrap_or_default(),
+        ),
     );
     map.insert(
         "seed_kimi_session_id".to_string(),
-        Value::String(String::new()),
+        Value::String(
+            normalized_global
+                .seed_kimi_session_id
+                .clone()
+                .unwrap_or_default(),
+        ),
+    );
+    map.insert(
+        "seed_wecode_claude_session_id".to_string(),
+        Value::String(
+            normalized_global
+                .seed_wecode_claude_session_id
+                .clone()
+                .unwrap_or_default(),
+        ),
+    );
+    map.insert(
+        "seed_wecode_codex_thread_id".to_string(),
+        Value::String(
+            normalized_global
+                .seed_wecode_codex_thread_id
+                .clone()
+                .unwrap_or_default(),
+        ),
+    );
+    map.insert(
+        "seed_wecode_opencode_session_id".to_string(),
+        Value::String(
+            normalized_global
+                .seed_wecode_opencode_session_id
+                .clone()
+                .unwrap_or_default(),
+        ),
     );
 
     // Remaining overrides spread last, clobbering the defaults above.
@@ -2103,12 +2350,16 @@ fn default_task_state(
         countdown: None,
         active_run: None,
         instruction_queue: Some(Vec::new()),
+        actor_sessions: Some(HashMap::new()),
         claude_session_id: None,
         codex_thread_id: None,
         cursor_session_id: None,
         agy_session_id: None,
         opencode_session_id: None,
         kimi_session_id: None,
+        wecode_claude_session_id: None,
+        wecode_codex_thread_id: None,
+        wecode_opencode_session_id: None,
         context_hash: Some(sha256_hex(context_text)),
         context_sent: Some(
             ACTORS
@@ -2883,9 +3134,12 @@ mod tests {
         launchers.insert(
             "codex".to_string(),
             Launcher {
+                protocol: None,
                 command: "codex --profile native".to_string(),
+                args: None,
                 env,
                 timeout_seconds: 123,
+                model: None,
             },
         );
         store
@@ -3416,5 +3670,144 @@ mod tests {
         assert_eq!(stats.total_cache_read_tokens, 3_000);
         assert_eq!(stats.total_duration_ms, 4_000);
         assert_eq!(stats.total_rounds, 2);
+    }
+
+    // --- buddy-store-agy-duration.test.ts (v2.0.5 fix) ----------------------
+    // agy `duration_seconds` is conversation lifetime (monotonic across
+    // resumes), not per-run time; round events must ignore it and task stats
+    // must aggregate wall-clock elapsed_ms.
+
+    const AGY_DURATION_WORKSPACE_KEY: &str = "agy-duration-workspace";
+
+    async fn agy_task_dir(root: &TempDir) -> PathBuf {
+        let task_dir = root
+            .path()
+            .join("workspaces")
+            .join(AGY_DURATION_WORKSPACE_KEY)
+            .join("tasks")
+            .join("demo");
+        tokio::fs::create_dir_all(task_dir.join("artifacts"))
+            .await
+            .unwrap();
+        task_dir
+    }
+
+    async fn write_agy_run(
+        task_dir: &Path,
+        run_id: &str,
+        duration_seconds: f64,
+        usage: Value,
+    ) {
+        let events = [
+            json!({
+                "event": "init",
+                "conversation_id": "agy-conv-1",
+                "init": { "cwd": "/tmp" }
+            })
+            .to_string(),
+            json!({
+                "event": "result",
+                "result": {
+                    "conversation_id": "agy-conv-1",
+                    "status": "SUCCESS",
+                    "response": "ok",
+                    "duration_seconds": duration_seconds,
+                    "usage": usage
+                }
+            })
+            .to_string(),
+        ]
+        .join("\n");
+        write_file(
+            &task_dir
+                .join("artifacts")
+                .join(format!("{run_id}-events.jsonl")),
+            &events,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn agy_duration_seconds_is_not_per_run_duration_in_round_events() {
+        let root = TempDir::new().unwrap();
+        let task_dir = agy_task_dir(&root).await;
+        write_agy_run(
+            &task_dir,
+            "run_agy_1",
+            356_359.295869,
+            json!({ "input_tokens": 100, "output_tokens": 10, "cache_read_tokens": 50 }),
+        )
+        .await;
+
+        let store = BuddyStore::new(root.path());
+        let summary = store
+            .get_round_events("demo", "run_agy_1", AGY_DURATION_WORKSPACE_KEY, Some("agy"), None)
+            .await
+            .expect("round events");
+
+        assert_eq!(summary.input_tokens, 100);
+        assert_eq!(summary.output_tokens, 10);
+        assert_eq!(summary.cache_read_tokens, 50);
+        assert_eq!(summary.duration_ms, None);
+    }
+
+    #[tokio::test]
+    async fn agy_task_stats_use_wall_clock_elapsed_ms_not_conversation_lifetime() {
+        let root = TempDir::new().unwrap();
+        let task_dir = agy_task_dir(&root).await;
+        // Mimic real agy: duration_seconds grows across resumes.
+        write_agy_run(
+            &task_dir,
+            "run_agy_1",
+            560.183143,
+            json!({ "input_tokens": 100, "output_tokens": 10, "cache_read_tokens": 50 }),
+        )
+        .await;
+        write_agy_run(
+            &task_dir,
+            "run_agy_2",
+            356_359.295869,
+            json!({ "input_tokens": 200, "output_tokens": 20, "cache_read_tokens": 80 }),
+        )
+        .await;
+        write_file(
+            &task_dir.join("transcript.jsonl"),
+            &[
+                json!({
+                    "role": "agy",
+                    "content": "round one",
+                    "ts": "2026-09-17T04:29:30.000Z",
+                    "meta": { "run_id": "run_agy_1", "elapsed_ms": 105_310, "round": 1 }
+                })
+                .to_string(),
+                json!({
+                    "role": "agy",
+                    "content": "round two",
+                    "ts": "2026-09-21T07:19:29.000Z",
+                    "meta": { "run_id": "run_agy_2", "elapsed_ms": 22_168, "round": 2 }
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .await;
+
+        let store = BuddyStore::new(root.path());
+        let stats = store
+            .get_task_stats("demo", AGY_DURATION_WORKSPACE_KEY)
+            .await
+            .expect("task stats");
+
+        assert_eq!(stats.actors.len(), 1);
+        let agy = &stats.actors[0];
+        assert_eq!(agy.actor, "agy");
+        assert_eq!(agy.input_tokens, 300);
+        assert_eq!(agy.output_tokens, 30);
+        assert_eq!(agy.cache_read_tokens, 130);
+        assert_eq!(agy.duration_ms, 127_478);
+        assert_eq!(agy.rounds, 2);
+        assert_eq!(stats.total_duration_ms, 127_478);
+        // Must not sum conversation-lifetime seconds into ~4 days.
+        assert!(stats.total_duration_ms < 60_000_000);
     }
 }

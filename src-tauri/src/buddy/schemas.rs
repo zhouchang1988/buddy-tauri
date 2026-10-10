@@ -45,6 +45,9 @@ pub fn parse_task_state(input: &serde_json::Value) -> Result<TaskState, SchemaEr
     if state.context_sent.is_none() {
         state.context_sent = Some(HashMap::new());
     }
+    if state.actor_sessions.is_none() {
+        state.actor_sessions = Some(HashMap::new());
+    }
     if let Some(countdown) = state.countdown.as_mut() {
         if countdown.remaining.is_none() {
             countdown.remaining = Some(0);
@@ -72,19 +75,26 @@ fn default_launcher_timeout() -> u64 {
 
 #[derive(Debug, Deserialize)]
 struct LauncherWire {
+    /// 'acp' | 'cli'
+    protocol: Option<String>,
     command: String,
+    args: Option<Vec<String>>,
     #[serde(default)]
     env: HashMap<String, String>,
     #[serde(default = "default_launcher_timeout")]
     timeout_seconds: u64,
+    model: Option<String>,
 }
 
 impl From<LauncherWire> for Launcher {
     fn from(wire: LauncherWire) -> Self {
         Launcher {
+            protocol: wire.protocol,
             command: wire.command,
+            args: wire.args,
             env: wire.env,
             timeout_seconds: wire.timeout_seconds,
+            model: wire.model,
         }
     }
 }
@@ -110,6 +120,9 @@ struct TaskSettingsWire {
     seed_agy_session_id: Option<String>,
     seed_opencode_session_id: Option<String>,
     seed_kimi_session_id: Option<String>,
+    seed_wecode_claude_session_id: Option<String>,
+    seed_wecode_codex_thread_id: Option<String>,
+    seed_wecode_opencode_session_id: Option<String>,
 }
 
 /// Validates raw JSON into `TaskSettings` with the zod schema defaults.
@@ -133,6 +146,9 @@ pub fn parse_task_settings(input: &serde_json::Value) -> Result<TaskSettings, Sc
         seed_agy_session_id: wire.seed_agy_session_id,
         seed_opencode_session_id: wire.seed_opencode_session_id,
         seed_kimi_session_id: wire.seed_kimi_session_id,
+        seed_wecode_claude_session_id: wire.seed_wecode_claude_session_id,
+        seed_wecode_codex_thread_id: wire.seed_wecode_codex_thread_id,
+        seed_wecode_opencode_session_id: wire.seed_wecode_opencode_session_id,
     })
 }
 
@@ -156,6 +172,9 @@ struct GlobalSettingsWire {
     seed_agy_session_id: Option<String>,
     seed_opencode_session_id: Option<String>,
     seed_kimi_session_id: Option<String>,
+    seed_wecode_claude_session_id: Option<String>,
+    seed_wecode_codex_thread_id: Option<String>,
+    seed_wecode_opencode_session_id: Option<String>,
     max_compact_retries: Option<u32>,
     #[serde(default = "default_true")]
     auto_generate_commit_message: bool,
@@ -211,6 +230,9 @@ pub fn parse_global_settings(input: &serde_json::Value) -> Result<GlobalSettings
         seed_agy_session_id: wire.seed_agy_session_id,
         seed_opencode_session_id: wire.seed_opencode_session_id,
         seed_kimi_session_id: wire.seed_kimi_session_id,
+        seed_wecode_claude_session_id: wire.seed_wecode_claude_session_id,
+        seed_wecode_codex_thread_id: wire.seed_wecode_codex_thread_id,
+        seed_wecode_opencode_session_id: wire.seed_wecode_opencode_session_id,
         max_compact_retries: wire.max_compact_retries,
         auto_generate_commit_message: Some(wire.auto_generate_commit_message),
         system_notifications_enabled: Some(wire.system_notifications_enabled),

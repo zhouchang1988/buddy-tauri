@@ -62,7 +62,9 @@ fn buddy_json_re() -> &'static Regex {
 
 fn fenced_json_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)```json\s*(\{[\s\S]*\})\s*```").unwrap())
+    // Non-greedy: the first fence must not stretch across a later degenerate
+    // fence/brace loop.
+    RE.get_or_init(|| Regex::new(r"(?i)```json\s*([\s\S]*?)```").unwrap())
 }
 
 fn type_field_re() -> &'static Regex {
@@ -843,43 +845,38 @@ pub fn parse_buddy_message(text: &str) -> BuddyMessage {
 
 fn parse_buddy_json_message(text: &str) -> Option<BuddyMessage> {
     if let Some(fenced) = fenced_json_re().captures(text) {
-        let inner = fenced.get(1).unwrap().as_str();
-        if let Some(parsed) = parse_buddy_json_candidate(inner) {
+        let inner = fenced.get(1).unwrap().as_str().trim();
+        if let Some(parsed) = parse_buddy_json_body(inner, true) {
             return Some(parsed);
         }
-        if let Some(loose) = loose_extract_buddy_message(inner) {
-            return Some(loose);
-        }
     }
+    parse_buddy_json_body(text, true)
+}
 
+fn parse_buddy_json_body(text: &str, allow_unescape: bool) -> Option<BuddyMessage> {
     if let Some(parsed) = parse_buddy_json_candidate(text) {
         return Some(parsed);
     }
 
-    if let Some(loose) = loose_extract_buddy_message(text) {
-        return Some(loose);
-    }
-
+    // A balanced object stops at the first complete buddy envelope. If that
+    // slice parses, trust it — trailing prose must not veto it.
     if let Some(obj) = find_buddy_json_object(text) {
         if let Some(parsed) = parse_buddy_json_candidate(obj) {
             return Some(parsed);
         }
-        if let Some(loose) = loose_extract_buddy_message(obj) {
-            return Some(loose);
+    }
+
+    // Unescape before loose extraction so a fully-escaped envelope is not
+    // half-matched.
+    if allow_unescape {
+        if let Some(unescaped) = try_unescape_json(text) {
+            if let Some(parsed) = parse_buddy_json_body(&unescaped, false) {
+                return Some(parsed);
+            }
         }
     }
 
-    if let Some(unescaped) = try_unescape_json(text) {
-        let uobj = find_buddy_json_object(&unescaped).unwrap_or(&unescaped);
-        if let Some(parsed) = parse_buddy_json_candidate(uobj) {
-            return Some(parsed);
-        }
-        if let Some(loose) = loose_extract_buddy_message(uobj) {
-            return Some(loose);
-        }
-    }
-
-    None
+    loose_extract_buddy_message(text)
 }
 
 fn find_buddy_json_object(text: &str) -> Option<&str> {
@@ -889,19 +886,11 @@ fn find_buddy_json_object(text: &str) -> Option<&str> {
 
     let mut depth: i32 = 0;
     let mut in_string = false;
-    let mut in_backtick = false;
     let mut escape = false;
 
     let mut i = start;
     while i < bytes.len() {
         let ch = bytes[i];
-        if in_backtick {
-            if ch == b'`' {
-                in_backtick = false;
-            }
-            i += 1;
-            continue;
-        }
         if escape {
             escape = false;
             i += 1;
@@ -912,10 +901,18 @@ fn find_buddy_json_object(text: &str) -> Option<&str> {
             i += 1;
             continue;
         }
-        if ch == b'`' && !in_string {
-            in_backtick = true;
-            i += 1;
-            continue;
+        // Markdown inline code is same-line only. Skip a matched `...` span so
+        // an unescaped `"}` inside it does not break depth tracking. An
+        // unpaired backtick stays a normal character.
+        if ch == b'`' {
+            let rest = &text[i + 1..];
+            if let Some(rel_bt) = rest.find('`') {
+                let next_newline = rest.find('\n');
+                if next_newline.map(|rel_nl| rel_bt < rel_nl).unwrap_or(true) {
+                    i = i + 1 + rel_bt + 1;
+                    continue;
+                }
+            }
         }
         if ch == b'"' {
             in_string = !in_string;
@@ -991,21 +988,23 @@ fn parse_buddy_json_candidate(text: &str) -> Option<BuddyMessage> {
 }
 
 fn loose_extract_buddy_message(text: &str) -> Option<BuddyMessage> {
-    let type_match = type_field_re().captures(text)?;
+    // Prefer the brace-balanced slice so end-scanning cannot swallow trailing noise.
+    let scope = find_buddy_json_object(text).unwrap_or(text);
+    let type_match = type_field_re().captures(scope)?;
     let kind = type_match.get(1).unwrap().as_str();
     let type_start = type_match.get(0).unwrap().start();
 
     // Search for "content":" AFTER the "type" match to avoid picking up
     // "content" keys from unrelated JSON structures (e.g. tool_result)
     // that appear before the buddy JSON in the text.
-    let after_type = &text[type_start..];
+    let after_type = &scope[type_start..];
     let content_key_match = content_key_re().find(after_type)?;
 
     let content_start = type_start + content_key_match.end();
-    let closing_quote = find_closing_content_quote(text);
+    let closing_quote = find_closing_content_quote(scope);
     let raw = match closing_quote {
-        Some(pos) if pos > content_start => &text[content_start..pos],
-        _ => &text[content_start..],
+        Some(pos) if pos > content_start => &scope[content_start..pos],
+        _ => &scope[content_start..],
     };
     let content = unescape_json_string(raw);
 
@@ -1923,15 +1922,78 @@ mod tests {
 
     #[test]
     fn extracts_content_containing_quote_brace_pattern_inside_backticks() {
-        let text = "{\"type\": \"chat\", \"content\": \"Example closing: `\"} at the end\"}";
+        // Matched inline-code backticks around `"}` so brace scanning skips them.
+        let text = "{\"type\": \"chat\", \"content\": \"Example closing: `\"}` at the end\"}";
         let message = parse_buddy_message(text);
 
         assert_eq!(
             message,
             BuddyMessage::Message {
-                text: "Example closing: `\"} at the end".to_string()
+                text: "Example closing: `\"}` at the end".to_string()
             }
         );
+    }
+
+    #[test]
+    fn ignores_trailing_degeneration_after_a_complete_buddy_envelope() {
+        let valid = "{\"type\":\"chat\",\"content\":\"agy，S3 写完了。commit 等你 approval。\"}";
+        let garbage = "\n\"\n}\n```".repeat(200);
+        let message = parse_buddy_message(&format!("{valid}{garbage}"));
+        match message {
+            BuddyMessage::Message { text } => {
+                assert_eq!(text, "agy，S3 写完了。commit 等你 approval。");
+                assert!(text.len() < 100);
+            }
+            other => panic!("expected message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ignores_trailing_degeneration_after_a_fenced_buddy_json_block() {
+        let valid = "```json\n{\"type\":\"chat\",\"content\":\"正常收尾\"}\n```";
+        let garbage = "\n\"\n}\n```".repeat(200);
+        let message = parse_buddy_message(&format!("{valid}{garbage}"));
+        assert_eq!(
+            message,
+            BuddyMessage::Message {
+                text: "正常收尾".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn loose_extracts_unescaped_quotes_without_swallowing_trailing_loops() {
+        let text = "{\"type\": \"chat\", \"content\": \"含有\"引号\"的摘要\"}\n\"\n}\n```\n\"\n}\n```\n\"\n}\n```";
+        assert_eq!(
+            parse_buddy_message(text),
+            BuddyMessage::Message {
+                text: "含有\"引号\"的摘要".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn keeps_parsed_buddy_json_when_trailing_prose_contains_quote_brace_examples() {
+        let text = "{\"type\":\"chat\",\"content\":\"这是第一段\"}\n后面的补充说明：配置形如 {\"key\": \"val\"}";
+        assert_eq!(
+            parse_buddy_message(text),
+            BuddyMessage::Message {
+                text: "这是第一段".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn ignores_trailing_noise_when_content_has_an_unpaired_backtick() {
+        let valid = "{\"type\": \"chat\", \"content\": \"注意：反引号 ` 未闭合\"}";
+        let garbage = "\n\"\n}\n```".repeat(200);
+        match parse_buddy_message(&format!("{valid}{garbage}")) {
+            BuddyMessage::Message { text } => {
+                assert_eq!(text, "注意：反引号 ` 未闭合");
+                assert!(!text.contains("```"));
+            }
+            other => panic!("expected message, got {other:?}"),
+        }
     }
 
     #[test]

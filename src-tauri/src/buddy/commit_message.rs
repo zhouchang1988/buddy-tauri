@@ -1,12 +1,15 @@
 //! Commit-message generation — Rust port of
-//! `src/main/buddy/commit-message.ts` (added upstream in v1.2.11).
+//! `src/main/buddy/commit-message.ts` (added upstream in v1.2.11, ACP channel
+//! added in v2.0).
 //!
 //! Collects the real diff for the selected files (staged + unstaged vs HEAD,
 //! synthesized all-added diffs for untracked files), builds the Chinese
-//! commit-message prompt verbatim, runs the resolved actor launcher once
-//! (piped stdio or PTY, 120s timeout, cancellable via a process-wide slot),
-//! and parses the actor's final output as a `{"type":"commit_message",...}`
-//! JSON payload with a Conventional-Commits plain-text fallback.
+//! commit-message prompt verbatim, runs the resolved actor launcher once —
+//! via the ACP one-shot channel when the launcher's `protocol` is `acp`,
+//! otherwise a CLI spawn (piped stdio or PTY, 120s timeout, cancellable via a
+//! process-wide slot) — and parses the actor's final output as a
+//! `{"type":"commit_message",...}` JSON payload with a Conventional-Commits
+//! plain-text fallback.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,7 +20,13 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
-use super::defaults::{normalize_global_settings, normalize_launcher};
+use super::acp::{
+    apply_acp_session_model, default_acp_args, extract_acp_session_models,
+    prepare_acp_environment, resolve_acp_binary, AcpClient, AcpClientOptions, AcpError,
+    AcpNewSessionParams, AcpPromptHandlers, AcpPromptInput, AcpPromptParams, AcpStdioTransport,
+    AcpTransport, StdioTransportOptions,
+};
+use super::defaults::{default_launcher_for, normalize_global_settings, normalize_launcher};
 use super::launchers::{
     build_launcher_command, kind_needs_pty, parser_actor_for_kind, run_launcher,
     run_launcher_with_pty, LauncherCommandInput, LauncherCommandKind, LauncherError, PtyRunInput,
@@ -29,7 +38,17 @@ use super::types::{GlobalSettings, Launcher, TaskSettings};
 pub const COMMIT_MESSAGE_TIMEOUT_MS: u64 = 120_000;
 pub const MAX_DIFF_BYTES: usize = 200_000;
 
-pub const SUPPORTED_ACTORS: [&str; 6] = ["claude", "codex", "cursor", "agy", "opencode", "kimi"];
+pub const SUPPORTED_ACTORS: [&str; 9] = [
+    "claude",
+    "codex",
+    "cursor",
+    "agy",
+    "opencode",
+    "kimi",
+    "wecode_claude",
+    "wecode_codex",
+    "wecode_opencode",
+];
 
 pub fn is_supported_actor(actor: &str) -> bool {
     SUPPORTED_ACTORS.contains(&actor)
@@ -360,26 +379,17 @@ fn normalize_newlines(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n").trim().to_string()
 }
 
-/// Parse the actor's final output to extract the commit message.
-/// 1. Use the existing actor parser to extract final assistant/result output.
-/// 2. Try JSON with `type = commit_message` and a `message` field.
-/// 3. Fallback: accept plain text only if the entire output is a valid
-///    Conventional Commit.
-/// 4. Validate: reject outputs with think tags, tool calls, code fences, etc.
-pub fn parse_commit_message_output(
-    actor: &str,
-    kind: LauncherCommandKind,
-    raw_events: &str,
-) -> Option<String> {
-    let parser_actor = parser_actor_for_kind(actor, kind);
-    let final_text = extract_actor_output(&parser_actor, raw_events).trim().to_string();
-
-    if final_text.is_empty() {
+/// Parse already-extracted assistant text into a commit message. Used by both
+/// CLI stream parsers ([`parse_commit_message_output`]) and ACP content
+/// deltas (the `generateViaAcp` path).
+pub fn parse_commit_message_text(final_text: &str) -> Option<String> {
+    let text = final_text.trim();
+    if text.is_empty() {
         return None;
     }
 
     // Try JSON parse first.
-    if let Some(json_match) = commit_message_json_re().find(&final_text) {
+    if let Some(json_match) = commit_message_json_re().find(text) {
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_match.as_str()) {
             let message = parsed
                 .get("message")
@@ -400,15 +410,31 @@ pub fn parse_commit_message_output(
     }
 
     // Fallback: accept plain text only if it looks like a valid Conventional Commit.
-    let first_line = final_text.split('\n').next().unwrap_or("").trim();
-    if !has_invalid_markers(&final_text)
+    let first_line = text.split('\n').next().unwrap_or("").trim();
+    if !has_invalid_markers(text)
         && conventional_commit_re().is_match(first_line)
-        && !final_text.starts_with('{')
+        && !text.starts_with('{')
     {
-        return Some(normalize_newlines(&final_text));
+        return Some(normalize_newlines(text));
     }
 
     None
+}
+
+/// Parse the actor's final output to extract the commit message.
+/// 1. Use the existing actor parser to extract final assistant/result output.
+/// 2. Try JSON with `type = commit_message` and a `message` field.
+/// 3. Fallback: accept plain text only if the entire output is a valid
+///    Conventional Commit.
+/// 4. Validate: reject outputs with think tags, tool calls, code fences, etc.
+pub fn parse_commit_message_output(
+    actor: &str,
+    kind: LauncherCommandKind,
+    raw_events: &str,
+) -> Option<String> {
+    let parser_actor = parser_actor_for_kind(actor, kind);
+    let final_text = extract_actor_output(&parser_actor, raw_events);
+    parse_commit_message_text(&final_text)
 }
 
 // ---------------------------------------------------------------------------
@@ -437,6 +463,9 @@ pub struct GenerateCommitMessageActorInput {
     pub lang: Option<String>,
     pub paths: Vec<String>,
     pub launcher: Launcher,
+    /// Buddy data root — needed for the ACP channel's WeCode env wrappers and
+    /// per-actor codex-home isolation (upstream `dataRoot`).
+    pub data_root: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug)]
@@ -445,13 +474,30 @@ pub struct GenerateCommitMessageResult {
     pub log: CommitMessageLog,
 }
 
+/// `LauncherCommandKind | 'acp'` in TS: the ACP one-shot channel has no CLI
+/// command kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitMessageLauncherKind {
+    Cli(LauncherCommandKind),
+    Acp,
+}
+
+impl Serialize for CommitMessageLauncherKind {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            CommitMessageLauncherKind::Cli(kind) => kind.serialize(serializer),
+            CommitMessageLauncherKind::Acp => serializer.serialize_str("acp"),
+        }
+    }
+}
+
 /// Port of `CommitMessageLog`. Serialized to stderr as one JSON line; the log
 /// records metadata only — never the diff, message, or secrets.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommitMessageLog {
     pub actor: String,
-    pub launcher_kind: LauncherCommandKind,
+    pub launcher_kind: CommitMessageLauncherKind,
     pub file_count: usize,
     pub diff_bytes: usize,
     pub diff_truncated: bool,
@@ -486,6 +532,10 @@ pub enum CommitMessageError {
     /// `runLauncher` error without log metadata.
     #[error("{0}")]
     Launcher(#[from] LauncherError),
+    /// ACP-channel failure (client/transport error); TS rethrows the raw ACP
+    /// error without log metadata.
+    #[error("{0}")]
+    Acp(#[from] AcpError),
 }
 
 /// Handle for the in-flight commit-message generation. Only one generation
@@ -551,6 +601,141 @@ pub async fn generate_commit_message_with_actor(
         lang: input.lang.as_deref(),
     });
 
+    let mut message = String::new();
+    let mut valid = false;
+    let mut timed_out = false;
+    let mut cancelled: bool;
+    let mut exit_code: Option<i32> = None;
+    let mut stderr_text = String::new();
+    // TS: `let launcherKind: LauncherCommandKind | 'acp' = 'contract'`.
+    let mut launcher_kind = CommitMessageLauncherKind::Cli(LauncherCommandKind::Contract);
+
+    if input.launcher.protocol.as_deref() == Some("acp") {
+        launcher_kind = CommitMessageLauncherKind::Acp;
+        match generate_via_acp(input, &prompt_text, &abort).await {
+            Ok(outcome) => {
+                exit_code = outcome.exit_code;
+                timed_out = outcome.timed_out;
+                cancelled = outcome.cancelled;
+                if !cancelled && !timed_out && exit_code == Some(0) {
+                    message =
+                        parse_commit_message_text(&outcome.output_text).unwrap_or_default();
+                    valid = !message.is_empty();
+                }
+            }
+            Err(error) => {
+                // TS rethrows raw errors unless the abort fired meanwhile.
+                if abort.load(Ordering::SeqCst) {
+                    cancelled = true;
+                } else {
+                    clear_active_generation(&token);
+                    return Err(error);
+                }
+            }
+        }
+    } else {
+        match generate_via_cli(input, &prompt_text, &abort).await {
+            Ok(outcome) => {
+                launcher_kind = CommitMessageLauncherKind::Cli(outcome.kind);
+                exit_code = outcome.exit_code;
+                timed_out = outcome.timed_out;
+                cancelled = outcome.cancelled;
+                stderr_text = outcome.stderr_text;
+                if !cancelled && !timed_out && exit_code == Some(0) {
+                    message = parse_commit_message_output(
+                        &input.actor,
+                        outcome.kind,
+                        &outcome.stdout_text,
+                    )
+                    .unwrap_or_default();
+                    valid = !message.is_empty();
+                }
+            }
+            Err(error) => {
+                if abort.load(Ordering::SeqCst) {
+                    cancelled = true;
+                } else {
+                    clear_active_generation(&token);
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    if abort.load(Ordering::SeqCst) {
+        cancelled = true;
+    }
+
+    let log = CommitMessageLog {
+        actor: input.actor.clone(),
+        launcher_kind,
+        file_count: input.paths.len(),
+        diff_bytes: diff_result.total_bytes,
+        diff_truncated: diff_result.truncated,
+        start_time,
+        end_time: iso_now(),
+        duration_ms: start.elapsed().as_millis(),
+        exit_code,
+        timed_out,
+        cancelled,
+        valid,
+    };
+
+    // Metadata only — never the diff, the message, or secrets.
+    eprintln!(
+        "[commit-message] {}",
+        serde_json::to_string(&log).unwrap_or_default()
+    );
+
+    clear_active_generation(&token);
+
+    if cancelled {
+        return Err(CommitMessageError::Cancelled { log });
+    }
+    if timed_out {
+        return Err(CommitMessageError::Timeout { log });
+    }
+    if let Some(code) = exit_code {
+        if code != 0 {
+            return Err(CommitMessageError::Process {
+                log,
+                exit_code: code,
+                stderr: stderr_text,
+            });
+        }
+    }
+    if !valid || message.is_empty() {
+        return Err(CommitMessageError::InvalidOutput { log });
+    }
+
+    Ok(GenerateCommitMessageResult { message, log })
+}
+
+/// Clears the process-wide slot if it still belongs to `token` (TS:
+/// `if (activeController === controller) activeController = null`).
+fn clear_active_generation(token: &Arc<()>) {
+    let mut guard = ACTIVE_GENERATION.lock();
+    if matches!(guard.as_ref(), Some(a) if Arc::ptr_eq(&a.token, token)) {
+        *guard = None;
+    }
+}
+
+struct GenerateViaCliOutcome {
+    kind: LauncherCommandKind,
+    stdout_text: String,
+    stderr_text: String,
+    exit_code: Option<i32>,
+    timed_out: bool,
+    cancelled: bool,
+}
+
+/// Port of `generateViaCli`: spawn the actor CLI once (piped stdio or PTY)
+/// with the prompt on a temp file, collecting stdout/stderr lines.
+async fn generate_via_cli(
+    input: &GenerateCommitMessageActorInput,
+    prompt_text: &str,
+    abort: &Arc<AtomicBool>,
+) -> Result<GenerateViaCliOutcome, CommitMessageError> {
     // mkdtemp(join(tmpdir(), 'buddy-commit-'))
     let temp_dir = std::env::temp_dir().join(format!(
         "buddy-commit-{}",
@@ -568,7 +753,7 @@ pub async fn generate_commit_message_with_actor(
     let event_file = format!("{temp_dir_string}/{run_id}-events.jsonl");
     let output_file = format!("{temp_dir_string}/{run_id}-output.md");
     let prompt_file = format!("{temp_dir_string}/{run_id}-prompt.md");
-    if let Err(error) = tokio::fs::write(&prompt_file, &prompt_text).await {
+    if let Err(error) = tokio::fs::write(&prompt_file, prompt_text).await {
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
         return Err(CommitMessageError::Launcher(LauncherError::Io(error)));
     }
@@ -578,7 +763,7 @@ pub async fn generate_commit_message_with_actor(
         command: input.launcher.command.clone(),
         mode: Some("start".to_string()),
         prompt_file: prompt_file.clone(),
-        prompt_text: Some(prompt_text),
+        prompt_text: Some(prompt_text.to_string()),
         event_file: Some(event_file),
         output_file: Some(output_file),
         repo_root: Some(input.repo_root.clone()),
@@ -645,18 +830,10 @@ pub async fn generate_commit_message_with_actor(
             // log); we still clean up the temp dir.
             if !abort.load(Ordering::SeqCst) {
                 let _ = tokio::fs::remove_dir_all(&temp_dir).await;
-                let mut guard = ACTIVE_GENERATION.lock();
-                if matches!(guard.as_ref(), Some(a) if Arc::ptr_eq(&a.token, &token)) {
-                    *guard = None;
-                }
-                drop(guard);
                 return Err(CommitMessageError::Launcher(error));
             }
         }
     }
-
-    let end_time = iso_now();
-    let duration_ms = start.elapsed().as_millis();
 
     // run_launcher/run_launcher_with_pty resolve normally after an abort, so
     // the abort flag must be checked explicitly. A SIGTERM/15 termination with
@@ -666,64 +843,191 @@ pub async fn generate_commit_message_with_actor(
         && matches!(exit_signal.as_deref(), Some("SIGTERM") | Some("15"))
         && exit_code.is_none();
 
-    let stdout_text = output_lines.join("\n");
-    let mut message = String::new();
-    let mut valid = false;
-    if !cancelled && !timed_out && exit_code == Some(0) {
-        message =
-            parse_commit_message_output(&input.actor, launcher_command.kind, &stdout_text)
-                .unwrap_or_default();
-        valid = !message.is_empty();
-    }
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 
-    let log = CommitMessageLog {
-        actor: input.actor.clone(),
-        launcher_kind: launcher_command.kind,
-        file_count: input.paths.len(),
-        diff_bytes: diff_result.total_bytes,
-        diff_truncated: diff_result.truncated,
-        start_time,
-        end_time,
-        duration_ms,
+    Ok(GenerateViaCliOutcome {
+        kind: launcher_command.kind,
+        stdout_text: output_lines.join("\n"),
+        stderr_text: stderr_lines.join("\n").trim().to_string(),
         exit_code,
         timed_out,
         cancelled,
-        valid,
+    })
+}
+
+struct GenerateViaAcpOutcome {
+    output_text: String,
+    exit_code: Option<i32>,
+    timed_out: bool,
+    cancelled: bool,
+}
+
+/// One-shot ACP session for commit-message generation (port of
+/// `generateViaAcp`). Never resumes a task session — always session/new, then
+/// close. Model priority: launcher.model → session currentModelId → adapter
+/// default.
+async fn generate_via_acp(
+    input: &GenerateCommitMessageActorInput,
+    prompt_text: &str,
+    abort: &Arc<AtomicBool>,
+) -> Result<GenerateViaAcpOutcome, CommitMessageError> {
+    if abort.load(Ordering::SeqCst) {
+        return Ok(GenerateViaAcpOutcome {
+            output_text: String::new(),
+            exit_code: None,
+            timed_out: false,
+            cancelled: true,
+        });
+    }
+    let launcher = &input.launcher;
+    let base_args = launcher
+        .args
+        .clone()
+        .filter(|args| !args.is_empty())
+        .unwrap_or_else(|| default_acp_args(&launcher.command, Some(&input.actor)));
+    let resolved = resolve_acp_binary(&launcher.command, &base_args);
+    let acp_env = prepare_acp_environment(
+        &input.actor,
+        launcher.env.clone(),
+        input.data_root.as_deref(),
+        None,
+    )
+    .await?;
+
+    let transport = Arc::new(AcpStdioTransport::new(StdioTransportOptions {
+        command: resolved.command,
+        args: resolved.args,
+        cwd: Some(input.repo_root.clone()),
+        env: Some(acp_env),
+        on_stderr: None,
+    }));
+    // Subscribe (via the client) before starting the transport so no message
+    // is missed.
+    let client = AcpClient::new(
+        transport.clone() as Arc<dyn AcpTransport>,
+        AcpClientOptions {
+            timeout_ms: Some(commit_message_timeout_ms()),
+            client_info: None,
+        },
+    );
+    transport.start().await;
+
+    // TS: `signal.addEventListener('abort', () => client.close())`.
+    let abort_watcher = {
+        let client = client.clone();
+        let abort = abort.clone();
+        tokio::spawn(async move {
+            loop {
+                if abort.load(Ordering::SeqCst) {
+                    client.close().await;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
     };
 
-    // Metadata only — never the diff, the message, or secrets.
-    eprintln!(
-        "[commit-message] {}",
-        serde_json::to_string(&log).unwrap_or_default()
-    );
+    let output = Arc::new(Mutex::new(String::new()));
+    let result: Result<(), AcpError> = async {
+        client.initialize(None).await?;
 
-    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
-    let mut guard = ACTIVE_GENERATION.lock();
-    if matches!(guard.as_ref(), Some(a) if Arc::ptr_eq(&a.token, &token)) {
-        *guard = None;
-    }
-    drop(guard);
+        // Always create a fresh session — never session/load a task
+        // conversation.
+        let created = client
+            .new_session(&AcpNewSessionParams {
+                cwd: input.repo_root.clone(),
+                ..Default::default()
+            })
+            .await?;
+        let session_id = created.session_id.clone();
+        if session_id.is_empty() {
+            return Err(AcpError::Message(
+                "ACP session/new returned no sessionId".to_string(),
+            ));
+        }
 
-    if cancelled {
-        return Err(CommitMessageError::Cancelled { log });
+        let session_value = serde_json::to_value(&created)?;
+        let extracted = extract_acp_session_models(&session_value);
+        let model_id = launcher
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_string)
+            .or(extracted.current_model_id)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if !model_id.is_empty() {
+            // TS: applyAcpSessionModel(...).catch(() => {})
+            let _ = apply_acp_session_model(&client, &session_id, &model_id, &session_value).await;
+        }
+
+        let handlers = AcpPromptHandlers {
+            on_content_delta: Some(Arc::new({
+                let output = output.clone();
+                move |text: String| output.lock().push_str(&text)
+            })),
+            ..Default::default()
+        };
+        client
+            .prompt(
+                &AcpPromptParams {
+                    session_id,
+                    prompt: AcpPromptInput::Text(prompt_text.to_string()),
+                    tools: None,
+                    meta: None,
+                },
+                Some(handlers),
+            )
+            .await?;
+        Ok(())
     }
-    if timed_out {
-        return Err(CommitMessageError::Timeout { log });
-    }
-    if let Some(code) = exit_code {
-        if code != 0 {
-            return Err(CommitMessageError::Process {
-                log,
-                exit_code: code,
-                stderr: stderr_lines.join("\n").trim().to_string(),
-            });
+    .await;
+
+    client.close().await;
+    abort_watcher.abort();
+
+    let output_text = output.lock().clone();
+    match result {
+        Ok(()) => {
+            if abort.load(Ordering::SeqCst) {
+                Ok(GenerateViaAcpOutcome {
+                    output_text,
+                    exit_code: None,
+                    timed_out: false,
+                    cancelled: true,
+                })
+            } else {
+                Ok(GenerateViaAcpOutcome {
+                    output_text,
+                    exit_code: Some(0),
+                    timed_out: false,
+                    cancelled: false,
+                })
+            }
+        }
+        Err(error) => {
+            if abort.load(Ordering::SeqCst) {
+                return Ok(GenerateViaAcpOutcome {
+                    output_text,
+                    exit_code: None,
+                    timed_out: false,
+                    cancelled: true,
+                });
+            }
+            // TS: /timeout/i.test(message)
+            if error.to_string().to_lowercase().contains("timeout") {
+                return Ok(GenerateViaAcpOutcome {
+                    output_text,
+                    exit_code: None,
+                    timed_out: true,
+                    cancelled: false,
+                });
+            }
+            Err(CommitMessageError::Acp(error))
         }
     }
-    if !valid || message.is_empty() {
-        return Err(CommitMessageError::InvalidOutput { log });
-    }
-
-    Ok(GenerateCommitMessageResult { message, log })
 }
 
 // ---------------------------------------------------------------------------
@@ -754,30 +1058,97 @@ pub fn resolve_commit_message_actor(
     "claude"
 }
 
-/// Task launchers → global launchers → per-actor default.
+/// Port of the v2.0 `resolveLauncher`: prefer the raw task entry (same as
+/// `runner.resolveEffectiveLauncher`, so an incomplete task snapshot that
+/// still says `npx` can inherit the global ACP protocol/args), sniff
+/// npx/acp commands, and bypass `normalize_launcher`'s command collapse for
+/// ACP launchers.
 pub fn resolve_launcher(
     actor: &str,
     task_settings: Option<&TaskSettings>,
     global_settings: Option<&GlobalSettings>,
 ) -> Launcher {
-    let task_launcher = task_settings.and_then(|s| s.launchers.get(actor));
-    if let Some(launcher) = task_launcher {
-        // TS truthiness check on `taskLauncher.command`.
-        if !launcher.command.is_empty() {
-            return normalize_launcher(actor, Some(launcher));
-        }
-    }
+    let from_task = task_settings.and_then(|s| s.launchers.get(actor));
     let global_settings = normalize_global_settings(global_settings);
-    if let Some(launcher) = global_settings
+    let from_global = global_settings
         .launchers
         .as_ref()
-        .and_then(|launchers| launchers.get(actor))
-    {
-        if !launcher.command.is_empty() {
-            return launcher.clone();
+        .and_then(|launchers| launchers.get(actor));
+    let fallback = default_launcher_for(actor);
+
+    let base: Launcher = match from_task {
+        Some(task) => Launcher {
+            protocol: task.protocol.clone(),
+            command: if task.command.trim().is_empty() {
+                fallback.command.clone()
+            } else {
+                task.command.clone()
+            },
+            args: task.args.clone(),
+            env: task.env.clone(),
+            timeout_seconds: task.timeout_seconds,
+            model: task
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .map(str::to_string),
+        },
+        None => from_global.cloned().unwrap_or_else(|| fallback.clone()),
+    };
+
+    let is_npx_or_acp = base.command == "npx"
+        || base.command.contains("acp")
+        || base
+            .args
+            .as_ref()
+            .is_some_and(|args| args.iter().any(|a| a.to_lowercase().contains("acp")));
+
+    let protocol: Option<String> = base.protocol.clone().or_else(|| {
+        let inherits_global_acp = from_global.is_some_and(|global| {
+            global.protocol.as_deref() == Some("acp")
+                && (base.command == global.command || is_npx_or_acp)
+        });
+        if inherits_global_acp || is_npx_or_acp {
+            Some("acp".to_string())
+        } else {
+            None
         }
+    });
+
+    let args = match base.args.clone().filter(|args| !args.is_empty()) {
+        Some(args) => Some(args),
+        None if protocol.as_deref() == Some("acp") => from_global
+            .and_then(|global| global.args.clone())
+            .filter(|args| !args.is_empty()),
+        None => None,
+    };
+
+    // The CLI path still goes through normalize_launcher so empty/`npx`
+    // commands collapse to the actor default; ACP keeps the adapter command
+    // intact.
+    if protocol.as_deref() != Some("acp") {
+        return normalize_launcher(
+            actor,
+            Some(&Launcher {
+                protocol: None,
+                command: base.command,
+                args: None,
+                env: base.env,
+                timeout_seconds: base.timeout_seconds,
+                model: base.model,
+            }),
+        );
     }
-    normalize_launcher(actor, None)
+
+    Launcher {
+        protocol: Some("acp".to_string()),
+        command: base.command,
+        args,
+        env: base.env,
+        timeout_seconds: base.timeout_seconds,
+        model: base.model,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -833,9 +1204,12 @@ mod tests {
 
     fn launcher_for(command: &str) -> Launcher {
         Launcher {
+            protocol: None,
             command: command.to_string(),
+            args: None,
             env: HashMap::new(),
             timeout_seconds: 120,
+            model: None,
         }
     }
 
@@ -846,6 +1220,7 @@ mod tests {
             lang: None,
             paths: paths.iter().map(|p| p.to_string()).collect(),
             launcher: launcher_for(command),
+            data_root: None,
         }
     }
 
@@ -854,9 +1229,12 @@ mod tests {
         launchers.insert(
             actor.to_string(),
             Launcher {
+                protocol: None,
                 command: command.to_string(),
+                args: None,
                 env: HashMap::new(),
                 timeout_seconds: 100,
+                model: None,
             },
         );
         TaskSettings {
@@ -873,6 +1251,9 @@ mod tests {
             seed_agy_session_id: None,
             seed_opencode_session_id: None,
             seed_kimi_session_id: None,
+            seed_wecode_claude_session_id: None,
+            seed_wecode_codex_thread_id: None,
+            seed_wecode_opencode_session_id: None,
         }
     }
 
@@ -881,8 +1262,18 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn supported_actors_cover_the_six_and_reject_others() {
-        for actor in ["claude", "codex", "cursor", "agy", "opencode", "kimi"] {
+    fn supported_actors_cover_the_nine_and_reject_others() {
+        for actor in [
+            "claude",
+            "codex",
+            "cursor",
+            "agy",
+            "opencode",
+            "kimi",
+            "wecode_claude",
+            "wecode_codex",
+            "wecode_opencode",
+        ] {
             assert!(is_supported_actor(actor), "{actor}");
         }
         for actor in ["human", "", "chatgpt"] {
@@ -908,9 +1299,12 @@ mod tests {
         global_launchers.insert(
             "claude".to_string(),
             Launcher {
+                protocol: None,
                 command: "claude --global".to_string(),
+                args: None,
                 env: HashMap::new(),
                 timeout_seconds: 7200,
+                model: None,
             },
         );
         let global = GlobalSettings {
@@ -922,6 +1316,87 @@ mod tests {
 
         let launcher = resolve_launcher("kimi", None, None);
         assert_eq!(launcher.command, "kimi");
+    }
+
+    #[test]
+    fn resolve_launcher_inherits_acp_protocol_and_model_from_task() {
+        let mut task = task_settings_with_launcher("claude", "npx");
+        let entry = task.launchers.get_mut("claude").unwrap();
+        entry.protocol = Some("acp".to_string());
+        entry.args = Some(vec![
+            "-y".to_string(),
+            "@agentclientprotocol/claude-agent-acp".to_string(),
+        ]);
+        entry.model = Some("sonnet-4.5".to_string());
+
+        let launcher = resolve_launcher("claude", Some(&task), None);
+        assert_eq!(launcher.protocol.as_deref(), Some("acp"));
+        assert_eq!(launcher.model.as_deref(), Some("sonnet-4.5"));
+        assert_eq!(
+            launcher.args,
+            Some(vec![
+                "-y".to_string(),
+                "@agentclientprotocol/claude-agent-acp".to_string()
+            ])
+        );
+        // ACP keeps the adapter command intact (no npx → default collapse).
+        assert_eq!(launcher.command, "npx");
+    }
+
+    #[test]
+    fn resolve_launcher_inherits_acp_protocol_and_args_from_global() {
+        // Task entry kept only the command (protocol/args dropped); the
+        // global launcher carries the full ACP configuration.
+        let mut task = task_settings_with_launcher("claude", "npx");
+        task.launchers.get_mut("claude").unwrap().model = Some("opus-4.6".to_string());
+
+        let mut global_launchers = HashMap::new();
+        global_launchers.insert(
+            "claude".to_string(),
+            Launcher {
+                protocol: Some("acp".to_string()),
+                command: "npx".to_string(),
+                args: Some(vec![
+                    "-y".to_string(),
+                    "@agentclientprotocol/claude-agent-acp".to_string(),
+                ]),
+                env: HashMap::new(),
+                timeout_seconds: 7200,
+                model: None,
+            },
+        );
+        let global = GlobalSettings {
+            launchers: Some(global_launchers),
+            ..Default::default()
+        };
+
+        let launcher = resolve_launcher("claude", Some(&task), Some(&global));
+        assert_eq!(launcher.protocol.as_deref(), Some("acp"));
+        assert_eq!(launcher.model.as_deref(), Some("opus-4.6"));
+        assert_eq!(
+            launcher.args,
+            Some(vec![
+                "-y".to_string(),
+                "@agentclientprotocol/claude-agent-acp".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn resolve_launcher_sniffs_acp_from_npx_command_without_protocol() {
+        let task = task_settings_with_launcher("claude", "npx");
+        let launcher = resolve_launcher("claude", Some(&task), None);
+        assert_eq!(launcher.protocol.as_deref(), Some("acp"));
+        assert_eq!(launcher.command, "npx");
+    }
+
+    #[test]
+    fn resolve_launcher_cli_protocol_collapses_npx_to_default() {
+        let mut task = task_settings_with_launcher("claude", "npx");
+        task.launchers.get_mut("claude").unwrap().protocol = Some("cli".to_string());
+        let launcher = resolve_launcher("claude", Some(&task), None);
+        assert_eq!(launcher.protocol, None);
+        assert_eq!(launcher.command, "claude");
     }
 
     // -----------------------------------------------------------------------
@@ -1072,6 +1547,35 @@ mod tests {
         let result = parse_commit_message_output("codex", KIND, &raw).expect("parsed");
         assert!(result.contains("- removed dead code"));
         assert!(result.contains("- fixed imports"));
+    }
+
+    // -----------------------------------------------------------------------
+    // parseCommitMessageText (ACP path shares this parser)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_text_parses_bare_json_commit_message() {
+        let result = parse_commit_message_text(
+            "{\"type\":\"commit_message\",\"message\":\"feat: via acp\"}",
+        );
+        assert_eq!(result.as_deref(), Some("feat: via acp"));
+    }
+
+    #[test]
+    fn parse_text_accepts_plain_conventional_commit() {
+        let result = parse_commit_message_text("fix(api): handle null response\n\n- Added null check");
+        assert_eq!(
+            result.as_deref(),
+            Some("fix(api): handle null response\n\n- Added null check")
+        );
+    }
+
+    #[test]
+    fn parse_text_rejects_empty_and_non_conventional_text() {
+        assert_eq!(parse_commit_message_text(""), None);
+        assert_eq!(parse_commit_message_text("   "), None);
+        assert_eq!(parse_commit_message_text("just some text"), None);
+        assert_eq!(parse_commit_message_text("<think>hmm</think>\nfeat: x"), None);
     }
 
     // -----------------------------------------------------------------------
@@ -1318,6 +1822,229 @@ mod tests {
         assert!(matches!(error, CommitMessageError::Cancelled { .. }), "{error:?}");
         // Cancelling with nothing in flight is a no-op.
         cancel_generate_commit_message();
+    }
+
+    // -----------------------------------------------------------------------
+    // ACP one-shot channel (fake shell-script agents)
+    // -----------------------------------------------------------------------
+
+    /// Same line-oriented JSON-RPC preamble as the runner's ACP fakes: read
+    /// newline-delimited requests, extract the numeric id.
+    const ACP_FAKE_PREAMBLE: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    '{'*) ;;
+    *) exit 0 ;;
+  esac
+  id=$(printf '%s' "$line" | sed -n 's/^{"jsonrpc":"2\.0","id":\([0-9][0-9]*\),.*/\1/p')
+"#;
+
+    /// Fake that answers initialize/session/new and completes the prompt with
+    /// a content delta carrying the commit-message JSON payload.
+    fn acp_commit_fake_body() -> String {
+        ACP_FAKE_PREAMBLE.to_string()
+            + r#"  case "$line" in
+    *'"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"1.0","agentInfo":{"name":"commit-acp","version":"1.0.0"},"capabilities":{}}}\n' "$id" ;;
+    *'"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"commit_sess"}}\n' "$id" ;;
+    *'"session/prompt"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","method":"session/contentDelta","params":{"text":"{\"type\":\"commit_message\",\"message\":\"feat: via acp\"}"}}'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"status":"completed"}}\n' "$id" ;;
+  esac
+done
+"#
+    }
+
+    /// Fake that logs every request line to $ACP_METHODS_LOG and advertises a
+    /// model list on session/new.
+    fn acp_model_fake_body() -> String {
+        ACP_FAKE_PREAMBLE.to_string()
+            + r#"  case "$line" in
+    *'"initialize"'*)
+      printf '%s\n' "$line" >> "$ACP_METHODS_LOG"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"1.0","agentInfo":{"name":"commit-model"},"capabilities":{}}}\n' "$id" ;;
+    *'"session/new"'*)
+      printf '%s\n' "$line" >> "$ACP_METHODS_LOG"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"fresh_sess","models":{"currentModelId":"sonnet-4.5","availableModels":[{"modelId":"opus-4.6","name":"Opus"},{"modelId":"sonnet-4.5","name":"Sonnet"}]}}}\n' "$id" ;;
+    *'"session/set_model"'* | *'"session/set_config_option"'*)
+      printf '%s\n' "$line" >> "$ACP_METHODS_LOG"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+    *'"session/prompt"'*)
+      printf '%s\n' "$line" >> "$ACP_METHODS_LOG"
+      printf '%s\n' '{"jsonrpc":"2.0","method":"session/contentDelta","params":{"text":"{\"type\":\"commit_message\",\"message\":\"feat: modeled acp\"}"}}'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"status":"completed"}}\n' "$id" ;;
+  esac
+done
+"#
+    }
+
+    /// Fake that answers initialize/session/new but never session/prompt.
+    fn acp_silent_prompt_fake_body() -> String {
+        ACP_FAKE_PREAMBLE.to_string()
+            + r#"  case "$line" in
+    *'"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"1.0","agentInfo":{"name":"commit-silent"},"capabilities":{}}}\n' "$id" ;;
+    *'"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"silent_sess"}}\n' "$id" ;;
+  esac
+done
+"#
+    }
+
+    fn acp_input(
+        repo_root: &str,
+        command: &str,
+        model: Option<&str>,
+        env: HashMap<String, String>,
+    ) -> GenerateCommitMessageActorInput {
+        GenerateCommitMessageActorInput {
+            repo_root: repo_root.to_string(),
+            actor: "claude".to_string(),
+            lang: None,
+            paths: vec!["a.txt".to_string()],
+            launcher: Launcher {
+                protocol: Some("acp".to_string()),
+                command: command.to_string(),
+                args: None,
+                env,
+                timeout_seconds: 30,
+                model: model.map(str::to_string),
+            },
+            data_root: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn acp_generates_message_via_fake_agent() {
+        let _guard = GENERATE_TEST_LOCK.lock();
+        let dir = init_repo();
+        let cwd = path(&dir);
+        std::fs::write(dir.path().join("a.txt"), "hello\nworld\n").unwrap();
+        let script = write_script(dir.path(), "fake-agent.sh", &acp_commit_fake_body());
+        let result =
+            generate_commit_message_with_actor(&acp_input(&cwd, &script, None, HashMap::new()))
+                .await
+                .unwrap();
+        assert_eq!(result.message, "feat: via acp");
+        assert!(result.log.valid);
+        assert_eq!(result.log.exit_code, Some(0));
+        assert_eq!(result.log.launcher_kind, CommitMessageLauncherKind::Acp);
+        assert_eq!(
+            serde_json::to_value(&result.log).unwrap()["launcherKind"],
+            serde_json::json!("acp")
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_applies_task_model_and_never_loads_a_session() {
+        let _guard = GENERATE_TEST_LOCK.lock();
+        let dir = init_repo();
+        let cwd = path(&dir);
+        std::fs::write(dir.path().join("a.txt"), "hello\nworld\n").unwrap();
+        let methods_log = dir.path().join("methods.jsonl");
+        let script = write_script(dir.path(), "fake-agent-model.sh", &acp_model_fake_body());
+        let mut env = HashMap::new();
+        env.insert(
+            "ACP_METHODS_LOG".to_string(),
+            methods_log.to_string_lossy().to_string(),
+        );
+        let result =
+            generate_commit_message_with_actor(&acp_input(&cwd, &script, Some("opus-4.6"), env))
+                .await
+                .unwrap();
+        assert_eq!(result.message, "feat: modeled acp");
+        let log = std::fs::read_to_string(&methods_log).unwrap();
+        assert!(log.contains("\"session/new\""), "{log}");
+        assert!(!log.contains("session/load"), "{log}");
+        let set_model = log
+            .lines()
+            .find(|line| line.contains("session/set_model"))
+            .expect("session/set_model request");
+        assert!(set_model.contains("\"sessionId\":\"fresh_sess\""), "{set_model}");
+        assert!(set_model.contains("\"modelId\":\"opus-4.6\""), "{set_model}");
+    }
+
+    #[tokio::test]
+    async fn acp_falls_back_to_session_current_model_without_round_trip() {
+        let _guard = GENERATE_TEST_LOCK.lock();
+        let dir = init_repo();
+        let cwd = path(&dir);
+        std::fs::write(dir.path().join("a.txt"), "hello\nworld\n").unwrap();
+        let methods_log = dir.path().join("methods.jsonl");
+        let script = write_script(dir.path(), "fake-agent-model.sh", &acp_model_fake_body());
+        let mut env = HashMap::new();
+        env.insert(
+            "ACP_METHODS_LOG".to_string(),
+            methods_log.to_string_lossy().to_string(),
+        );
+        let result =
+            generate_commit_message_with_actor(&acp_input(&cwd, &script, None, env))
+                .await
+                .unwrap();
+        assert_eq!(result.message, "feat: modeled acp");
+        let log = std::fs::read_to_string(&methods_log).unwrap();
+        // launcher.model absent → session currentModelId already applies, so
+        // apply_acp_session_model skips the round-trip.
+        assert!(!log.contains("set_model"), "{log}");
+        assert!(!log.contains("set_config_option"), "{log}");
+    }
+
+    #[tokio::test]
+    async fn acp_timeout_when_agent_never_answers_prompt() {
+        let _guard = GENERATE_TEST_LOCK.lock();
+        TEST_TIMEOUT_MS.store(300, Ordering::SeqCst);
+        let dir = init_repo();
+        let cwd = path(&dir);
+        std::fs::write(dir.path().join("a.txt"), "hello\nworld\n").unwrap();
+        let script = write_script(dir.path(), "fake-agent-silent.sh", &acp_silent_prompt_fake_body());
+        let started = std::time::Instant::now();
+        let error =
+            generate_commit_message_with_actor(&acp_input(&cwd, &script, None, HashMap::new()))
+                .await
+                .unwrap_err();
+        TEST_TIMEOUT_MS.store(0, Ordering::SeqCst);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(matches!(error, CommitMessageError::Timeout { .. }), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn acp_cancel_interrupts_in_flight_generation() {
+        let _guard = GENERATE_TEST_LOCK.lock();
+        let dir = init_repo();
+        let cwd = path(&dir);
+        std::fs::write(dir.path().join("a.txt"), "hello\nworld\n").unwrap();
+        let script = write_script(dir.path(), "fake-agent-silent.sh", &acp_silent_prompt_fake_body());
+        let cwd_clone = cwd.clone();
+        let script_clone = script.clone();
+        let handle = tokio::spawn(async move {
+            generate_commit_message_with_actor(&acp_input(
+                &cwd_clone,
+                &script_clone,
+                None,
+                HashMap::new(),
+            ))
+            .await
+        });
+        // Wait until the generation has actually registered in the
+        // process-wide slot before cancelling.
+        let registered = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if ACTIVE_GENERATION.lock().is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(registered.is_ok(), "generation did not start in time");
+        cancel_generate_commit_message();
+        let error = tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .expect("generation did not finish after cancel")
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(error, CommitMessageError::Cancelled { .. }), "{error:?}");
     }
 
     // -----------------------------------------------------------------------

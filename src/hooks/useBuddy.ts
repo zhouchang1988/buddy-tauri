@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { api } from '../lib/api'
 import { appendActorStreamLine, type ActorStreamLine } from '../lib/actor-stream'
-import type { GlobalSettings, GitCommitPushResult, GitDiffStats, GitRemote, GitStatusResult, RoundEventSummary, TaskEventEnvelope, TaskStats } from '../shared/types'
+import type { GlobalSettings, GitCommitPushResult, GitDiffStats, GitRemote, GitStatusResult, RoundEventSummary, TaskEventEnvelope, TaskStats, GlobalAcpAdaptersStatus } from '../shared/types'
 import type { TestLauncherResult } from '../shared/types'
 import type { GitPushAvailability, GitPushResult } from '../shared/types'
 
@@ -225,8 +225,19 @@ export function useUpdateGlobalSettings() {
 
 export function useTestLauncher() {
   return useMutation({
-    mutationFn: ({ actor, command, env }: { actor: string; command: string; env?: Record<string, string> }) =>
-      api.testLauncher(actor, command, env)
+    mutationFn: ({
+      actor,
+      command,
+      env,
+      protocol,
+      args
+    }: {
+      actor: string
+      command: string
+      env?: Record<string, string>
+      protocol?: 'cli' | 'acp'
+      args?: string[]
+    }) => api.testLauncher(actor, command, env, protocol, args)
   })
 }
 
@@ -370,4 +381,12 @@ export function useActorStream(taskId: string | null, runId: string | null) {
   }, [taskId, runId])
 
   return lines
+}
+
+export function useAcpGlobalAdapters() {
+  return useQuery<GlobalAcpAdaptersStatus>({
+    queryKey: ['acpGlobalAdapters'],
+    queryFn: () => api.checkAcpGlobalAdapters(),
+    staleTime: 5000
+  })
 }

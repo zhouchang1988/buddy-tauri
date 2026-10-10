@@ -16,6 +16,13 @@
 //! `active_run.run_id` guards, and the aborted attempt returns normally
 //! instead of marking the task FAILED.
 
+use crate::buddy::acp::{
+    apply_acp_session_model, default_acp_args, prepare_acp_environment, resolve_acp_binary,
+    AcpClient, AcpClientOptions, AcpError, AcpLoadSessionParams, AcpNewSessionParams,
+    AcpPromptHandlers, AcpPromptInput, AcpPromptParams, AcpPromptResult, AcpStdioTransport,
+    AcpTransport, StdioTransportOptions,
+};
+use crate::buddy::defaults::default_launcher_for;
 use crate::buddy::events::BuddyEventBus;
 use crate::buddy::launchers::{
     build_launcher_command, command_kind_for, kind_needs_pty, launcher_timeout_message,
@@ -126,6 +133,9 @@ fn context_window_limit_patterns() -> &'static [Regex] {
             r"context window limit",
             r"context length exceeded",
             r"context\.length\.exceeded",
+            r"context[_ .]+length",
+            r"context[_ .]+window",
+            r"context[_ .]+overflow",
             r"maximum context length",
             r"max.*context.*length",
             r"token limit",
@@ -133,7 +143,9 @@ fn context_window_limit_patterns() -> &'static [Regex] {
             r"exceeds.*token",
             r"exceeded.*token",
             r"input.*too long",
+            r"prompt[_ ]too[_ ]long",
             r"request too large",
+            r"max_tokens",
             r"context window.*exhausted",
             // Chinese error messages from models like GLM, Qwen, DeepSeek
             r"对话内容太长",
@@ -187,6 +199,18 @@ fn cli_warning_patterns() -> &'static [Regex] {
     })
 }
 
+/// Bare ACP/LLM prompt stopReason values that mean the input/context overflowed.
+const ACP_OVERFLOW_STOP_REASONS: [&str; 8] = [
+    "max_tokens",
+    "max_token",
+    "context_length",
+    "context_length_exceeded",
+    "context_window",
+    "context_window_exceeded",
+    "context_overflow",
+    "prompt_too_long",
+];
+
 /// Check if an error/stderr message indicates the child exited for an auto-upgrade.
 /// Inspected line by line: CLI upgrade banners are plain diagnostics, while
 /// stream-json records contain prompts, assistant replies and tool output —
@@ -206,9 +230,40 @@ pub fn is_upgrade_exit_error(message: &str) -> bool {
 
 /// Check if an error message indicates a context window limit error.
 pub fn is_context_window_limit_error(message: &str) -> bool {
-    context_window_limit_patterns()
+    if message.is_empty() {
+        return false;
+    }
+    if context_window_limit_patterns()
         .iter()
         .any(|p| p.is_match(message))
+    {
+        return true;
+    }
+    ACP_OVERFLOW_STOP_REASONS.contains(&message.trim().to_lowercase().as_str())
+}
+
+/// True when an ACP `session/prompt` result signals a context overflow.
+/// Cancelled turns never count as overflow.
+fn is_acp_prompt_context_overflow(result: &AcpPromptResult) -> bool {
+    if result.status.as_deref() == Some("cancelled")
+        || result.stop_reason.as_deref() == Some("cancelled")
+    {
+        return false;
+    }
+    is_context_window_limit_error(&describe_acp_prompt_overflow(result))
+}
+
+/// Human-readable one-liner for an ACP prompt result, matching the TS
+/// `describeAcpPromptOverflow` shape (`ACP prompt stopReason … status …`).
+fn describe_acp_prompt_overflow(result: &AcpPromptResult) -> String {
+    let mut parts = vec!["ACP prompt".to_string()];
+    if let Some(stop_reason) = &result.stop_reason {
+        parts.push(format!("stopReason {stop_reason}"));
+    }
+    if let Some(status) = &result.status {
+        parts.push(format!("status {status}"));
+    }
+    parts.join(" ")
 }
 
 /// Check if stderr text contains only known CLI warnings (not real errors).
@@ -601,6 +656,9 @@ impl BuddyRunner {
             "agy" => TaskStatus::RunningAgy,
             "opencode" => TaskStatus::RunningOpencode,
             "kimi" => TaskStatus::RunningKimi,
+            "wecode_claude" => TaskStatus::RunningWecodeClaude,
+            "wecode_codex" => TaskStatus::RunningWecodeCodex,
+            "wecode_opencode" => TaskStatus::RunningWecodeOpencode,
             other => return Err(RunnerError::msg(format!("Unsupported actor: {other}"))),
         };
         if !can_start_from(&detail.state.status) {
@@ -1449,6 +1507,57 @@ impl BuddyRunner {
         }
     }
 
+    /// `resolveEffectiveLauncher`: task launcher → global launcher → actor
+    /// default. Recovers the ACP protocol from the global launcher when the
+    /// task launcher kept the same command (or itself looks like an ACP
+    /// invocation), and inherits global args for ACP launchers that carry
+    /// none of their own.
+    fn resolve_effective_launcher(
+        actor: &str,
+        task_launcher: Option<&Launcher>,
+        global_launcher: Option<&Launcher>,
+    ) -> Launcher {
+        let fallback = default_launcher_for(actor);
+        let base = task_launcher.or(global_launcher).unwrap_or(&fallback);
+        let npx_or_acp = base.command == "npx"
+            || base.command.contains("acp")
+            || base
+                .args
+                .as_ref()
+                .map(|args| args.iter().any(|a| a.to_lowercase().contains("acp")))
+                .unwrap_or(false);
+
+        let protocol = base.protocol.clone().or_else(|| {
+            let global_is_acp =
+                global_launcher.and_then(|g| g.protocol.as_deref()) == Some("acp");
+            let same_command = global_launcher
+                .map(|g| g.command == base.command)
+                .unwrap_or(false);
+            if (global_is_acp && (same_command || npx_or_acp)) || npx_or_acp {
+                Some("acp".to_string())
+            } else {
+                None
+            }
+        });
+
+        let args = match base.args.clone().filter(|args| !args.is_empty()) {
+            Some(args) => Some(args),
+            None if protocol.as_deref() == Some("acp") => global_launcher
+                .and_then(|g| g.args.clone())
+                .filter(|args| !args.is_empty()),
+            None => None,
+        };
+
+        Launcher {
+            command: base.command.clone(),
+            env: base.env.clone(),
+            timeout_seconds: base.timeout_seconds,
+            protocol,
+            args,
+            model: base.model.clone(),
+        }
+    }
+
     /// `executePingAttempt`: a single connectivity ping. Store/fs setup errors
     /// propagate (TS: they reject the promise); run failures are captured in
     /// the returned outcome (TS: try/catch around the run).
@@ -1460,16 +1569,69 @@ impl BuddyRunner {
         abort: Option<Arc<AtomicBool>>,
     ) -> Result<PingOutcome, RunnerError> {
         let detail = self.store.get_task_detail(task_id, workspace_key).await?;
-        let launcher = detail
-            .settings
-            .launchers
-            .get(actor)
-            .cloned()
-            .unwrap_or(Launcher {
-                command: actor.to_string(),
-                env: HashMap::new(),
-                timeout_seconds: PING_TIMEOUT_SECONDS,
-            });
+        let global_settings = self.store.read_global_settings().await?;
+        let launcher = Self::resolve_effective_launcher(
+            actor,
+            detail.settings.launchers.get(actor),
+            global_settings
+                .launchers
+                .as_ref()
+                .and_then(|launchers| launchers.get(actor)),
+        );
+
+        // ACP launcher: the ping is the initialize handshake alone.
+        if launcher.protocol.as_deref() == Some("acp") {
+            let cwd = existing_cwd(detail.state.repo_root.as_deref()).await;
+            let base_args = launcher
+                .args
+                .clone()
+                .filter(|args| !args.is_empty())
+                .unwrap_or_else(|| default_acp_args(&launcher.command, Some(actor)));
+            let resolved = resolve_acp_binary(&launcher.command, &base_args);
+            let attempt = async {
+                let acp_env = prepare_acp_environment(
+                    actor,
+                    launcher.env.clone(),
+                    Some(&self.store.data_root),
+                    None,
+                )
+                .await
+                .map_err(|error| RunnerError::msg(error.to_string()))?;
+                let transport = Arc::new(AcpStdioTransport::new(StdioTransportOptions {
+                    command: resolved.command,
+                    args: resolved.args,
+                    cwd: Some(cwd),
+                    env: Some(acp_env),
+                    on_stderr: None,
+                }));
+                // Subscribe (via the client) before starting the transport so
+                // the initialize response is not missed.
+                let client = AcpClient::new(
+                    transport.clone() as Arc<dyn AcpTransport>,
+                    AcpClientOptions {
+                        timeout_ms: Some(launcher.timeout_seconds.saturating_mul(1000)),
+                        client_info: None,
+                    },
+                );
+                transport.start().await;
+                let result = client.initialize(None).await;
+                client.close().await;
+                result.map_err(|error| RunnerError::msg(error.to_string()))
+            }
+            .await;
+            return match attempt {
+                Ok(_) => Ok(PingOutcome {
+                    success: true,
+                    ..Default::default()
+                }),
+                Err(error) => Ok(PingOutcome {
+                    success: false,
+                    error: Some(error.to_string()),
+                    ..Default::default()
+                }),
+            };
+        }
+
         let task_directory = self.store.task_directory(task_id, workspace_key);
         let artifacts_dir = task_directory.join("artifacts");
         tokio::fs::create_dir_all(&artifacts_dir).await?;
@@ -1695,6 +1857,8 @@ impl BuddyRunner {
         let mut final_results = running_results.clone();
         // (state field, value) session updates collected from passed actors.
         let mut session_updates: Vec<(&'static str, String)> = Vec::new();
+        // (actor, display id) entries merged into `actor_sessions`.
+        let mut actor_session_updates: Vec<(String, String)> = Vec::new();
 
         for (index, actor) in actors.iter().enumerate() {
             let settled = &ping_results[index];
@@ -1735,13 +1899,31 @@ impl BuddyRunner {
                             session_updates.push(("kimi_session_id", sid.clone()));
                         }
                     }
+                    "wecode_claude" => {
+                        if let Some(sid) = &sid {
+                            session_updates.push(("wecode_claude_session_id", sid.clone()));
+                        }
+                    }
+                    "wecode_codex" => {
+                        if let Some(id) = tid.clone().or_else(|| sid.clone()) {
+                            session_updates.push(("wecode_codex_thread_id", id));
+                        }
+                    }
+                    "wecode_opencode" => {
+                        if let Some(sid) = &sid {
+                            session_updates.push(("wecode_opencode_session_id", sid.clone()));
+                        }
+                    }
                     _ => {}
                 }
-                let display_id = if actor == "codex" {
+                let display_id = if actor == "codex" || actor == "wecode_codex" {
                     tid.or(sid)
                 } else {
                     sid
                 };
+                if let Some(display_id) = &display_id {
+                    actor_session_updates.push((actor.clone(), display_id.clone()));
+                }
                 self.store
                     .append_task_event(
                         task_id,
@@ -1783,12 +1965,19 @@ impl BuddyRunner {
 
         if all_passed {
             let updates = session_updates.clone();
+            let actor_updates = actor_session_updates.clone();
             self.store
                 .update_task_state(task_id, workspace_key, move |mut state| {
                     state.status = TaskStatus::Ready;
                     state.health_check = None;
                     for (key, value) in &updates {
                         set_session_field(&mut state, key, value.clone());
+                    }
+                    if !actor_updates.is_empty() {
+                        let sessions = state.actor_sessions.get_or_insert_with(HashMap::new);
+                        for (actor, value) in &actor_updates {
+                            sessions.insert(actor.clone(), value.clone());
+                        }
                     }
                     state.updated_at = Some(utc_now());
                     state
@@ -1810,7 +1999,13 @@ impl BuddyRunner {
                     let sid = session_updates
                         .iter()
                         .find(|(key, _)| session_field_for_actor(actor) == Some(*key))
-                        .map(|(_, value)| value.clone());
+                        .map(|(_, value)| value.clone())
+                        .or_else(|| {
+                            actor_session_updates
+                                .iter()
+                                .find(|(name, _)| name == actor)
+                                .map(|(_, value)| value.clone())
+                        });
                     serde_json::json!({ "actor": actor, "session_id": sid })
                 })
                 .collect();
@@ -1856,6 +2051,7 @@ impl BuddyRunner {
             event_file: None,
         };
         let updates = session_updates.clone();
+        let actor_updates = actor_session_updates.clone();
         let failure_for_state = failure_record.clone();
         let failed_actor_for_state = failed_actor.clone();
         let failed_reason_for_state = failed_reason.clone();
@@ -1872,6 +2068,12 @@ impl BuddyRunner {
                 });
                 for (key, value) in &updates {
                     set_session_field(&mut state, key, value.clone());
+                }
+                if !actor_updates.is_empty() {
+                    let sessions = state.actor_sessions.get_or_insert_with(HashMap::new);
+                    for (actor, value) in &actor_updates {
+                        sessions.insert(actor.clone(), value.clone());
+                    }
                 }
                 state.updated_at = Some(failed_at);
                 state
@@ -1931,9 +2133,532 @@ impl BuddyRunner {
     }
 
     /// `executeActor` — runs the actor with compact/upgrade retry handling.
-    /// The TS original recurses; here a loop carries the retry counters.
+    /// ACP-protocol launchers go through [`BuddyRunner::execute_acp_actor`]
+    /// (JSON-RPC channel) instead of the CLI streaming path. The TS original
+    /// recurses; here a loop carries the retry counters.
     /// Returns the follow-up start produced by `completeActor` (auto-advance).
     async fn execute_actor(
+        &self,
+        task_id: &str,
+        workspace_key: &str,
+        actor: &str,
+        run_id: &str,
+        user_message: String,
+        abort: Arc<AtomicBool>,
+    ) -> Result<Option<StartTaskInput>, RunnerError> {
+        let detail = self.store.get_task_detail(task_id, workspace_key).await?;
+        let global_settings = self.store.read_global_settings().await?;
+        let launcher = Self::resolve_effective_launcher(
+            actor,
+            detail.settings.launchers.get(actor),
+            global_settings
+                .launchers
+                .as_ref()
+                .and_then(|launchers| launchers.get(actor)),
+        );
+        if launcher.protocol.as_deref() == Some("acp") {
+            return self
+                .execute_acp_actor(task_id, workspace_key, actor, run_id, &user_message, abort)
+                .await;
+        }
+        self.execute_actor_cli(task_id, workspace_key, actor, run_id, user_message, abort)
+            .await
+    }
+
+    /// `executeAcpActor` — one actor turn over the ACP (Agent Client Protocol)
+    /// JSON-RPC channel instead of a streaming CLI: initialize, `session/load`
+    /// with `session/new` fallback, auto permission mode, per-task model via
+    /// `applyAcpSessionModel`, then a streaming `session/prompt` whose
+    /// `buddy_propose_break` tool feeds the dual-break state machine through
+    /// `completeActor`. Context-window overflow resets the session and retries
+    /// (compact retries), like the CLI path; user interrupts return quietly.
+    async fn execute_acp_actor(
+        &self,
+        task_id: &str,
+        workspace_key: &str,
+        actor: &str,
+        run_id: &str,
+        user_message: &str,
+        abort: Arc<AtomicBool>,
+    ) -> Result<Option<StartTaskInput>, RunnerError> {
+        let mut compact_retries = 0u32;
+        loop {
+            // Re-read the task each iteration: a reset rewrites context.md and
+            // clears the session, and the TS original recursed (fresh detail).
+            let detail = self.store.get_task_detail(task_id, workspace_key).await?;
+            let global_settings = self.store.read_global_settings().await?;
+            let launcher = Self::resolve_effective_launcher(
+                actor,
+                detail.settings.launchers.get(actor),
+                global_settings
+                    .launchers
+                    .as_ref()
+                    .and_then(|launchers| launchers.get(actor)),
+            );
+            let cwd = existing_cwd(detail.state.repo_root.as_deref()).await;
+            let existing_session_id =
+                session_id_for_actor(actor, &detail.state, Some(&detail.settings));
+
+            let prompt = build_actor_prompt(&BuildActorPromptInput {
+                actor: actor.to_string(),
+                round: detail.state.round,
+                repo_root: detail.state.repo_root.clone().unwrap_or_default(),
+                task_text: detail.task_text.clone(),
+                context_text: detail.context_text.clone(),
+                transcript: detail.transcript.iter().map(TranscriptRow::from).collect(),
+                settings: Some(
+                    serde_json::to_value(&detail.settings).map_err(RunnerError::from)?,
+                ),
+                state: Some(serde_json::to_value(&detail.state).map_err(RunnerError::from)?),
+                global_settings: Some(global_settings.clone()),
+                user_message: Some(user_message.to_string()),
+                cursor_single_turn: Some(false),
+                managed_services: Some(true),
+            });
+
+            // Setup errors (lock creation) escape like the TS pre-try code —
+            // no markFailed.
+            let lock_path = create_run_lock(
+                &self.store.data_root,
+                workspace_key,
+                task_id,
+                run_id,
+                std::process::id(),
+            )
+            .await?;
+
+            let attempt = self
+                .run_acp_attempt(
+                    task_id,
+                    workspace_key,
+                    actor,
+                    run_id,
+                    &launcher,
+                    &cwd,
+                    existing_session_id,
+                    &prompt,
+                    abort.clone(),
+                )
+                .await;
+            // TS finally: removeRunLock (client/serviceRun cleanup happens
+            // inside run_acp_attempt).
+            remove_run_lock(&lock_path).await.ok();
+
+            match attempt {
+                Ok(advance) => return Ok(advance),
+                Err(error) => {
+                    // User interrupt: pause_and_abort_run already cleared
+                    // active_run and aborted the run (TS: `if (signal.aborted)
+                    // return`).
+                    if abort.load(Ordering::SeqCst) {
+                        return Ok(None);
+                    }
+
+                    let failure_message = error.to_string();
+                    let max_compact_retries = global_settings
+                        .max_compact_retries
+                        .unwrap_or(DEFAULT_MAX_COMPACT_RETRIES);
+                    if is_context_window_limit_error(&failure_message)
+                        && compact_retries < max_compact_retries
+                        && session_id_for_actor(actor, &detail.state, Some(&detail.settings))
+                            .is_some()
+                    {
+                        self.store
+                            .append_task_event(
+                                task_id,
+                                workspace_key,
+                                EventInput {
+                                    event_type: "actor.context_limit_detected".to_string(),
+                                    actor: Some(actor.to_string()),
+                                    run_id: Some(run_id.to_string()),
+                                    payload: payload(serde_json::json!({
+                                        "error": failure_message,
+                                        "reset_attempt": compact_retries + 1,
+                                        "max_reset_attempts": max_compact_retries,
+                                    })),
+                                    ..Default::default()
+                                },
+                            )
+                            .await?;
+                        let mut meta = Map::new();
+                        meta.insert("kind".to_string(), Value::from("session_reset"));
+                        meta.insert(
+                            "reset_attempt".to_string(),
+                            Value::from(compact_retries + 1),
+                        );
+                        self.store
+                            .append_transcript(
+                                task_id,
+                                workspace_key,
+                                "system",
+                                &format!(
+                                    "{} 达到上下文窗口限制，正在重置会话并注入精简上下文 ({}/{})...",
+                                    actor_display_name(actor),
+                                    compact_retries + 1,
+                                    max_compact_retries
+                                ),
+                                meta,
+                            )
+                            .await?;
+                        self.reset_session_for_actor(task_id, workspace_key, actor, &detail)
+                            .await?;
+                        compact_retries += 1;
+                        continue;
+                    }
+
+                    self.mark_failed(task_id, workspace_key, actor, &failure_message, Some(run_id))
+                        .await?;
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    /// The try-block body of `executeAcpActor`: open the service run, spawn
+    /// the ACP agent, drive initialize/session/prompt, and complete the round.
+    /// Cleanup (client close, service run close) happens on every exit path.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_acp_attempt(
+        &self,
+        task_id: &str,
+        workspace_key: &str,
+        actor: &str,
+        run_id: &str,
+        launcher: &Launcher,
+        cwd: &str,
+        existing_session_id: Option<String>,
+        prompt: &str,
+        abort: Arc<AtomicBool>,
+    ) -> Result<Option<StartTaskInput>, RunnerError> {
+        if abort.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        let mut service_run = self
+            .services
+            .open_run(task_id, workspace_key, run_id, &launcher.env)
+            .await
+            .map_err(RunnerError::msg)?;
+        let started = std::time::Instant::now();
+
+        let mut base_env = launcher.env.clone();
+        base_env.extend(service_run.env.clone());
+        let acp_env = prepare_acp_environment(
+            actor,
+            base_env,
+            Some(&self.store.data_root),
+            existing_session_id.as_deref(),
+        )
+        .await
+        .map_err(|error| {
+            service_run.close();
+            RunnerError::msg(error.to_string())
+        })?;
+        let base_args = launcher
+            .args
+            .clone()
+            .filter(|args| !args.is_empty())
+            .unwrap_or_else(|| default_acp_args(&launcher.command, Some(actor)));
+        let resolved = resolve_acp_binary(&launcher.command, &base_args);
+        let transport = Arc::new(AcpStdioTransport::new(StdioTransportOptions {
+            command: resolved.command,
+            args: resolved.args,
+            cwd: Some(cwd.to_string()),
+            env: Some(acp_env),
+            on_stderr: None,
+        }));
+        // Subscribe (via the client) before starting the transport so no
+        // message is missed.
+        let client = AcpClient::new(
+            transport.clone() as Arc<dyn AcpTransport>,
+            AcpClientOptions {
+                timeout_ms: Some(launcher.timeout_seconds.saturating_mul(1000)),
+                client_info: None,
+            },
+        );
+        transport.start().await;
+
+        // TS: `signal.addEventListener('abort', () => client.close())`.
+        let abort_watcher = {
+            let client = client.clone();
+            let abort = abort.clone();
+            tokio::spawn(async move {
+                loop {
+                    if abort.load(Ordering::SeqCst) {
+                        client.close().await;
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+        };
+
+        let result = async {
+            // 1. Initialize
+            client.initialize(None).await.map_err(acp_runner_error)?;
+
+            // 2. Session: resume when possible, else create.
+            let (session_id, session_value) = match &existing_session_id {
+                Some(existing) => match client
+                    .load_session(&AcpLoadSessionParams {
+                        session_id: existing.clone(),
+                        cwd: cwd.to_string(),
+                        ..Default::default()
+                    })
+                    .await
+                {
+                    Ok(loaded) => {
+                        let id = if loaded.session_id.is_empty() {
+                            existing.clone()
+                        } else {
+                            loaded.session_id.clone()
+                        };
+                        (id, serde_json::to_value(&loaded)?)
+                    }
+                    Err(_) => {
+                        let created = client
+                            .new_session(&AcpNewSessionParams {
+                                cwd: cwd.to_string(),
+                                ..Default::default()
+                            })
+                            .await
+                            .map_err(acp_runner_error)?;
+                        (created.session_id.clone(), serde_json::to_value(&created)?)
+                    }
+                },
+                None => {
+                    let created = client
+                        .new_session(&AcpNewSessionParams {
+                            cwd: cwd.to_string(),
+                            ..Default::default()
+                        })
+                        .await
+                        .map_err(acp_runner_error)?;
+                    (created.session_id.clone(), serde_json::to_value(&created)?)
+                }
+            };
+
+            // Auto permission mode (bypassPermissions / acceptEdits).
+            let auto_mode = session_value
+                .get("modes")
+                .and_then(|modes| modes.get("availableModes"))
+                .and_then(Value::as_array)
+                .and_then(|modes| {
+                    modes.iter().filter_map(|mode| mode.get("id").and_then(Value::as_str)).find(
+                        |id| *id == "bypassPermissions" || *id == "acceptEdits",
+                    )
+                })
+                .map(str::to_string);
+            if let Some(mode) = auto_mode {
+                let _ = client.set_session_mode(&session_id, &mode).await;
+            }
+
+            // Task-level model selection.
+            if let Some(model) = launcher
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+            {
+                let _ = apply_acp_session_model(&client, &session_id, model, &session_value).await;
+            }
+
+            // 3. Prompt turn
+            let task_directory = self.store.task_directory(task_id, workspace_key);
+            let artifacts_dir = task_directory.join("artifacts");
+            tokio::fs::create_dir_all(&artifacts_dir).await?;
+            let prompt_file = artifacts_dir.join(format!("{run_id}-prompt.md"));
+            let output_file = artifacts_dir.join(format!("{run_id}-output.md"));
+            let event_file = artifacts_dir.join(format!("{run_id}-events.jsonl"));
+            tokio::fs::write(&prompt_file, prompt).await?;
+
+            let output_text = Arc::new(Mutex::new(String::new()));
+            let break_reason = Arc::new(Mutex::new(Option::<String>::None));
+            let handlers = self.acp_prompt_handlers(
+                workspace_key,
+                task_id,
+                run_id,
+                actor,
+                event_file.clone(),
+                output_text.clone(),
+                break_reason.clone(),
+            );
+
+            let prompt_result = client
+                .prompt(
+                    &AcpPromptParams {
+                        session_id: session_id.clone(),
+                        prompt: AcpPromptInput::Text(prompt.to_string()),
+                        tools: None,
+                        meta: None,
+                    },
+                    Some(handlers),
+                )
+                .await
+                .map_err(acp_runner_error)?;
+            if is_acp_prompt_context_overflow(&prompt_result) {
+                return Err(RunnerError::msg(describe_acp_prompt_overflow(
+                    &prompt_result,
+                )));
+            }
+
+            let raw_output = output_text.lock().clone();
+            tokio::fs::write(&output_file, &raw_output).await?;
+
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            let mut final_text = output_text.lock().clone();
+            if let Some(reason) = break_reason.lock().clone() {
+                final_text = serde_json::json!({ "type": "break", "content": reason }).to_string();
+            }
+            let parsed_lines = vec![ParsedActorLine {
+                text: Some(final_text.clone()),
+                session_id: Some(session_id),
+                ..Default::default()
+            }];
+            self.complete_actor(
+                task_id,
+                workspace_key,
+                actor,
+                run_id,
+                &final_text,
+                &parsed_lines,
+                elapsed_ms,
+                0,
+            )
+            .await
+        }
+        .await;
+
+        // TS finally: client.close(); serviceRun.close().
+        abort_watcher.abort();
+        client.close().await;
+        service_run.close();
+        result
+    }
+
+    /// Build the streaming callbacks for one ACP prompt turn: content deltas
+    /// append to the output buffer and publish `actor.stdout` (`stream:
+    /// "delta"`), thinking deltas append `acp.thinking` to the run's
+    /// events.jsonl and publish `actor.thinking`, tool calls append
+    /// `acp.tool_use` and publish a `🔧 name` stdout line, and
+    /// `buddy_propose_break` records the break reason.
+    #[allow(clippy::too_many_arguments)]
+    fn acp_prompt_handlers(
+        &self,
+        workspace_key: &str,
+        task_id: &str,
+        run_id: &str,
+        actor: &str,
+        event_file: std::path::PathBuf,
+        output_text: Arc<Mutex<String>>,
+        break_reason: Arc<Mutex<Option<String>>>,
+    ) -> AcpPromptHandlers {
+        let publish = {
+            let events = self.events.clone();
+            let workspace_key = workspace_key.to_string();
+            let task_id = task_id.to_string();
+            move |actor: &str, run_id: &str, event_type: &str, payload_value: Value| {
+                if let Some(events) = &events {
+                    events.publish(TaskEventEnvelope {
+                        workspace_key: workspace_key.clone(),
+                        task_id: task_id.clone(),
+                        event: Event {
+                            seq: 0,
+                            task_id: Some(task_id.clone()),
+                            event_type: event_type.to_string(),
+                            actor: Some(actor.to_string()),
+                            ts: utc_now(),
+                            run_id: Some(run_id.to_string()),
+                            payload: payload(payload_value),
+                        },
+                    });
+                }
+            }
+        };
+
+        let on_content_delta = {
+            let publish = publish.clone();
+            let actor = actor.to_string();
+            let run_id = run_id.to_string();
+            Arc::new(move |text: String| {
+                output_text.lock().push_str(&text);
+                publish(
+                    &actor,
+                    &run_id,
+                    "actor.stdout",
+                    serde_json::json!({ "text": text, "stream": "delta" }),
+                );
+            })
+        };
+
+        let on_thinking_delta = {
+            let publish = publish.clone();
+            let actor = actor.to_string();
+            let run_id = run_id.to_string();
+            let event_file = event_file.clone();
+            Arc::new(move |thinking: String| {
+                append_acp_event_line(
+                    &event_file,
+                    &serde_json::json!({ "type": "acp.thinking", "thinking": thinking }).to_string(),
+                );
+                publish(
+                    &actor,
+                    &run_id,
+                    "actor.thinking",
+                    serde_json::json!({ "thinking": thinking }),
+                );
+            })
+        };
+
+        let on_tool_call = {
+            let publish = publish.clone();
+            let actor = actor.to_string();
+            let run_id = run_id.to_string();
+            let event_file = event_file.clone();
+            Arc::new(move |_id: String, name: String, input: Map<String, Value>| {
+                append_acp_event_line(
+                    &event_file,
+                    &serde_json::json!({ "type": "acp.tool_use", "toolName": name, "toolInput": input })
+                        .to_string(),
+                );
+                publish(
+                    &actor,
+                    &run_id,
+                    "actor.stdout",
+                    serde_json::json!({ "text": format!("🔧 {name}\n"), "stream": "line" }),
+                );
+            })
+        };
+
+        let on_break = {
+            let event_file = event_file;
+            Arc::new(move |reason: Option<String>| {
+                let reason = reason
+                    .filter(|reason| !reason.is_empty())
+                    .unwrap_or_else(|| "Task completed".to_string());
+                *break_reason.lock() = Some(reason.clone());
+                append_acp_event_line(
+                    &event_file,
+                    &serde_json::json!({
+                        "type": "acp.tool_use",
+                        "toolName": "buddy_propose_break",
+                        "toolInput": { "reason": reason },
+                    })
+                    .to_string(),
+                );
+            })
+        };
+
+        AcpPromptHandlers {
+            on_content_delta: Some(on_content_delta),
+            on_thinking_delta: Some(on_thinking_delta),
+            on_tool_call: Some(on_tool_call),
+            on_break: Some(on_break),
+            ..Default::default()
+        }
+    }
+
+    /// The CLI (streaming-parser) execution path — the pre-ACP `executeActor`.
+    async fn execute_actor_cli(
         &self,
         task_id: &str,
         workspace_key: &str,
@@ -2118,9 +2843,12 @@ impl BuddyRunner {
             .get(actor)
             .cloned()
             .unwrap_or(Launcher {
+                protocol: None,
                 command: actor.to_string(),
+                args: None,
                 env: HashMap::new(),
                 timeout_seconds: 600,
+                model: None,
             });
         let task_directory = self.store.task_directory(task_id, workspace_key);
         let artifacts_dir = task_directory.join("artifacts");
@@ -2676,6 +3404,12 @@ impl BuddyRunner {
                 state.consecutive_failures = Some(0);
                 state.compact_retries = Some(0);
                 state.updated_at = Some(now.clone());
+                if let Some(session_id) = &session_id {
+                    state
+                        .actor_sessions
+                        .get_or_insert_with(HashMap::new)
+                        .insert(actor.to_string(), session_id.clone());
+                }
                 match actor {
                     "claude" => {
                         if let Some(sid) = &session_id {
@@ -2683,8 +3417,8 @@ impl BuddyRunner {
                         }
                     }
                     "codex" => {
-                        if let Some(tid) = &thread_id {
-                            state.codex_thread_id = Some(tid.clone());
+                        if let Some(id) = thread_id.clone().or_else(|| session_id.clone()) {
+                            state.codex_thread_id = Some(id);
                         }
                     }
                     "cursor" => {
@@ -2705,6 +3439,21 @@ impl BuddyRunner {
                     "kimi" => {
                         if let Some(sid) = &session_id {
                             state.kimi_session_id = Some(sid.clone());
+                        }
+                    }
+                    "wecode_claude" => {
+                        if let Some(sid) = &session_id {
+                            state.wecode_claude_session_id = Some(sid.clone());
+                        }
+                    }
+                    "wecode_codex" => {
+                        if let Some(id) = thread_id.clone().or_else(|| session_id.clone()) {
+                            state.wecode_codex_thread_id = Some(id);
+                        }
+                    }
+                    "wecode_opencode" => {
+                        if let Some(sid) = &session_id {
+                            state.wecode_opencode_session_id = Some(sid.clone());
                         }
                     }
                     _ => {}
@@ -3253,9 +4002,12 @@ impl BuddyRunner {
             .get(actor)
             .cloned()
             .unwrap_or(Launcher {
+                protocol: None,
                 command: actor.to_string(),
+                args: None,
                 env: HashMap::new(),
                 timeout_seconds: 600,
+                model: None,
             });
         let summary_context = self
             .summarize_context_via_llm(task_id, workspace_key, actor, detail, &cwd, &launcher)
@@ -3281,7 +4033,13 @@ impl BuddyRunner {
                     "agy_session_id" => state.agy_session_id = None,
                     "opencode_session_id" => state.opencode_session_id = None,
                     "kimi_session_id" => state.kimi_session_id = None,
+                    "wecode_claude_session_id" => state.wecode_claude_session_id = None,
+                    "wecode_codex_thread_id" => state.wecode_codex_thread_id = None,
+                    "wecode_opencode_session_id" => state.wecode_opencode_session_id = None,
                     _ => {}
+                }
+                if let Some(sessions) = state.actor_sessions.as_mut() {
+                    sessions.remove(actor);
                 }
                 state.context_sent = Some(context_sent);
                 state
@@ -3669,13 +4427,19 @@ pub fn needs_health_check(state: &TaskState, settings: &TaskSettings) -> bool {
     impl_session.is_none() && rev_session.is_none()
 }
 
-/// `sessionIdForActor`: current session id, falling back to the seed from
-/// task settings (empty strings count as unset).
+/// `sessionIdForActor`: current session id — the `actor_sessions` map wins —
+/// falling back to the per-actor state field and then the seed from task
+/// settings (empty strings count as unset).
 pub fn session_id_for_actor(
     actor: &str,
     state: &TaskState,
     settings: Option<&TaskSettings>,
 ) -> Option<String> {
+    if let Some(sessions) = &state.actor_sessions {
+        if let Some(value) = sessions.get(actor).filter(|value| !value.is_empty()) {
+            return Some(value.clone());
+        }
+    }
     let seed = match actor {
         "claude" => settings.and_then(|s| s.seed_claude_session_id.clone()),
         "codex" => settings.and_then(|s| s.seed_codex_thread_id.clone()),
@@ -3683,6 +4447,9 @@ pub fn session_id_for_actor(
         "agy" => settings.and_then(|s| s.seed_agy_session_id.clone()),
         "opencode" => settings.and_then(|s| s.seed_opencode_session_id.clone()),
         "kimi" => settings.and_then(|s| s.seed_kimi_session_id.clone()),
+        "wecode_claude" => settings.and_then(|s| s.seed_wecode_claude_session_id.clone()),
+        "wecode_codex" => settings.and_then(|s| s.seed_wecode_codex_thread_id.clone()),
+        "wecode_opencode" => settings.and_then(|s| s.seed_wecode_opencode_session_id.clone()),
         _ => None,
     }
     .filter(|value| !value.is_empty());
@@ -3693,6 +4460,9 @@ pub fn session_id_for_actor(
         "agy" => state.agy_session_id.clone(),
         "opencode" => state.opencode_session_id.clone(),
         "kimi" => state.kimi_session_id.clone(),
+        "wecode_claude" => state.wecode_claude_session_id.clone(),
+        "wecode_codex" => state.wecode_codex_thread_id.clone(),
+        "wecode_opencode" => state.wecode_opencode_session_id.clone(),
         _ => None,
     };
     current.or(seed)
@@ -3707,6 +4477,9 @@ fn session_field_for_actor(actor: &str) -> Option<&'static str> {
         "agy" => Some("agy_session_id"),
         "opencode" => Some("opencode_session_id"),
         "kimi" => Some("kimi_session_id"),
+        "wecode_claude" => Some("wecode_claude_session_id"),
+        "wecode_codex" => Some("wecode_codex_thread_id"),
+        "wecode_opencode" => Some("wecode_opencode_session_id"),
         _ => None,
     }
 }
@@ -3719,6 +4492,9 @@ fn set_session_field(state: &mut TaskState, key: &str, value: String) {
         "agy_session_id" => state.agy_session_id = Some(value),
         "opencode_session_id" => state.opencode_session_id = Some(value),
         "kimi_session_id" => state.kimi_session_id = Some(value),
+        "wecode_claude_session_id" => state.wecode_claude_session_id = Some(value),
+        "wecode_codex_thread_id" => state.wecode_codex_thread_id = Some(value),
+        "wecode_opencode_session_id" => state.wecode_opencode_session_id = Some(value),
         _ => {}
     }
 }
@@ -3731,6 +4507,9 @@ fn normalize_actor_role(actor: &str) -> &'static str {
         "agy" => "agy",
         "opencode" => "opencode",
         "kimi" => "kimi",
+        "wecode_claude" => "wecode_claude",
+        "wecode_codex" => "wecode_codex",
+        "wecode_opencode" => "wecode_opencode",
         _ => "system",
     }
 }
@@ -3745,6 +4524,23 @@ async fn existing_cwd(path: Option<&str>) -> String {
     std::env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| ".".to_string())
+}
+
+fn acp_runner_error(error: AcpError) -> RunnerError {
+    RunnerError::msg(error.to_string())
+}
+
+/// Append one JSON line to a run's events.jsonl from a synchronous ACP
+/// callback. Best-effort, like the TS fire-and-forget `appendFile`.
+fn append_acp_event_line(event_file: &Path, line: &str) {
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(event_file)
+    {
+        let _ = writeln!(file, "{line}");
+    }
 }
 
 /// `collectRawEvents`: raw JSONL event stream for the parser, from the event
@@ -6114,6 +6910,31 @@ exit 0
         assert!(!is_context_window_limit_error(""));
     }
 
+    /// buddy-compact-retry.test.ts v2: ACP-wrapped overflow errors and bare
+    /// stopReason values.
+    #[test]
+    fn context_window_limit_error_detection_acp_variants() {
+        assert!(is_context_window_limit_error("ACP Error -32603: 超出上下文"));
+        assert!(is_context_window_limit_error(
+            "ACP Error -32000: 对话内容太长，已超出当前模型的处理能力"
+        ));
+        assert!(is_context_window_limit_error(
+            "ACP Error -32603: context window limit"
+        ));
+        assert!(is_context_window_limit_error(
+            "ACP Error -32603: {\"error\":{\"message\":\"超出上下文\"}}"
+        ));
+        assert!(is_context_window_limit_error("ACP prompt stopReason max_tokens"));
+        assert!(is_context_window_limit_error(
+            "ACP prompt stopReason context_length_exceeded"
+        ));
+        assert!(is_context_window_limit_error("max_tokens"));
+        assert!(is_context_window_limit_error("context_overflow"));
+        assert!(!is_context_window_limit_error("ACP Error -32600: Invalid Request"));
+        assert!(!is_context_window_limit_error("ACP Client closed"));
+        assert!(!is_context_window_limit_error("ACP prompt stopReason cancelled"));
+    }
+
     async fn make_context_limit_task(
         root: &TempDir,
         session_id: Option<&str>,
@@ -6997,5 +7818,807 @@ exit 0
             .unwrap();
         assert_eq!(state.status, TaskStatus::Cancelled);
         assert!(!process_alive(worker_pid as i32));
+    }
+
+    // -----------------------------------------------------------------------
+    // buddy-runner-acp.test.ts — ACP protocol channel
+    //
+    // The TS tests spawn a Node fake ACP server; here the fakes are POSIX sh
+    // scripts driven by the same launcher path (`protocol: "acp"`, the script
+    // as `command`). ACP requests always start with `{`; a non-JSON stdin line
+    // (the summarize prompt piped by the contract-launcher path during a
+    // session reset) makes the fake exit 0 so LLM summarization falls back to
+    // truncation instead of hanging.
+    // -----------------------------------------------------------------------
+
+    /// sh helper preamble: read loop + numeric JSON-RPC id extraction.
+    const ACP_FAKE_PREAMBLE: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    '{'*) ;;
+    *) exit 0 ;;
+  esac
+  id=$(printf '%s' "$line" | sed -n 's/^{"jsonrpc":"2\.0","id":\([0-9][0-9]*\),.*/\1/p')
+"#;
+
+    /// Fake that streams one content delta and completes the prompt.
+    fn acp_chat_fake_body() -> String {
+        ACP_FAKE_PREAMBLE.to_string()
+            + r#"  case "$line" in
+    *'"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"1.0","agentInfo":{"name":"fake-acp","version":"1.0.0"},"capabilities":{}}}\n' "$id" ;;
+    *'"session/new"'* | *'"session/load"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"acp_session_999"}}\n' "$id" ;;
+    *'"session/prompt"'*)
+      printf '{"jsonrpc":"2.0","method":"session/contentDelta","params":{"text":"Hello from ACP agent!"}}\n'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"status":"completed"}}\n' "$id" ;;
+  esac
+done
+"#
+    }
+
+    fn acp_launcher_override(command: &str, env: Value) -> Value {
+        json!({
+            "opencode": {
+                "protocol": "acp",
+                "command": command,
+                "args": [],
+                "env": env,
+                "timeout_seconds": 10
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn acp_round_streams_events_and_saves_session() {
+        let root = TempDir::new().unwrap();
+        let fake = write_fake(root.path(), "fake-acp-chat.sh", &acp_chat_fake_body()).await;
+        let store = Arc::new(BuddyStore::new(root.path()));
+        patch_global_settings(&store, json!({ "max_rounds": 1 })).await;
+        let events = BuddyEventBus::new();
+        let mut rx = events.subscribe();
+        let stdout_deltas = Arc::new(Mutex::new(Vec::<String>::new()));
+        {
+            let stdout_deltas = stdout_deltas.clone();
+            tokio::spawn(async move {
+                while let Ok(envelope) = rx.recv().await {
+                    if envelope.event.event_type == "actor.stdout" {
+                        if let Some(text) = envelope
+                            .event
+                            .payload
+                            .get("text")
+                            .and_then(Value::as_str)
+                        {
+                            stdout_deltas.lock().push(text.to_string());
+                        }
+                    }
+                }
+            });
+        }
+        let created = create_demo_task(
+            &store,
+            &root,
+            settings_map(&[("launchers", acp_launcher_override(&fake, json!({})))]),
+        )
+        .await;
+        let runner = BuddyRunner::new(
+            store.clone(),
+            RunnerOptions {
+                events: Some(events),
+                ..Default::default()
+            },
+        );
+
+        runner
+            .start_task(
+                "demo",
+                StartTaskInput {
+                    workspace_key: Some(created.workspace_key.clone()),
+                    actor: Some("opencode".to_string()),
+                    message: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let detail = store
+            .get_task_detail("demo", &created.workspace_key)
+            .await
+            .unwrap();
+        assert_eq!(detail.state.status, TaskStatus::Paused);
+        assert_eq!(
+            detail
+                .state
+                .actor_sessions
+                .as_ref()
+                .and_then(|sessions| sessions.get("opencode"))
+                .map(String::as_str),
+            Some("acp_session_999")
+        );
+        assert_eq!(
+            detail.state.opencode_session_id.as_deref(),
+            Some("acp_session_999")
+        );
+        assert!(stdout_deltas
+            .lock()
+            .iter()
+            .any(|text| text == "Hello from ACP agent!"));
+        assert_eq!(
+            detail.transcript.first().map(|entry| entry.content.as_str()),
+            Some("Hello from ACP agent!")
+        );
+    }
+
+    /// Fake that proposes a break via the host tool, then completes once the
+    /// host answers the `tools/call` request.
+    fn acp_break_fake_body() -> String {
+        ACP_FAKE_PREAMBLE.to_string()
+            + r#"  case "$line" in
+    *'"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"1.0","agentInfo":{"name":"break-agent"},"capabilities":{}}}\n' "$id" ;;
+    *'"session/new"'* | *'"session/load"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess_break"}}\n' "$id" ;;
+    *'"session/prompt"'*)
+      prompt_id=$id
+      printf '{"jsonrpc":"2.0","id":"call_1","method":"tools/call","params":{"name":"buddy_propose_break","input":{"reason":"Implementation complete and all tests passing."}}}\n' ;;
+    *'"id":"call_1"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"status":"completed"}}\n' "$prompt_id" ;;
+  esac
+done
+"#
+    }
+
+    #[tokio::test]
+    async fn acp_break_tool_marks_pending_break() {
+        let root = TempDir::new().unwrap();
+        let fake = write_fake(root.path(), "fake-acp-break.sh", &acp_break_fake_body()).await;
+        let store = Arc::new(BuddyStore::new(root.path()));
+        patch_global_settings(&store, json!({ "max_rounds": 1 })).await;
+        let created = create_demo_task(
+            &store,
+            &root,
+            settings_map(&[("launchers", acp_launcher_override(&fake, json!({})))]),
+        )
+        .await;
+        let runner = live_runner(&store);
+
+        runner
+            .start_task(
+                "demo",
+                StartTaskInput {
+                    workspace_key: Some(created.workspace_key.clone()),
+                    actor: Some("opencode".to_string()),
+                    message: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let detail = store
+            .get_task_detail("demo", &created.workspace_key)
+            .await
+            .unwrap();
+        let pending = detail.state.pending_break.expect("pending_break");
+        assert_eq!(pending.actor.as_deref(), Some("opencode"));
+        assert_eq!(pending.round, Some(1));
+    }
+
+    #[tokio::test]
+    async fn acp_dual_break_reaches_done() {
+        let root = TempDir::new().unwrap();
+        let fake = write_fake(root.path(), "fake-acp-dual.sh", &acp_break_fake_body()).await;
+        let store = Arc::new(BuddyStore::new(root.path()));
+        patch_global_settings(&store, json!({ "max_rounds": 10 })).await;
+        let launcher = json!({
+            "protocol": "acp",
+            "command": fake,
+            "args": [],
+            "env": {},
+            "timeout_seconds": 10
+        });
+        let created = create_demo_task(
+            &store,
+            &root,
+            settings_map(&[
+                ("implementer_actor", json!("opencode")),
+                ("reviewer_actor", json!("kimi")),
+                (
+                    "launchers",
+                    json!({ "opencode": launcher.clone(), "kimi": launcher }),
+                ),
+            ]),
+        )
+        .await;
+        let runner = live_runner(&store);
+
+        runner
+            .start_task(
+                "demo",
+                StartTaskInput {
+                    workspace_key: Some(created.workspace_key.clone()),
+                    actor: Some("opencode".to_string()),
+                    message: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let detail = store
+            .get_task_detail("demo", &created.workspace_key)
+            .await
+            .unwrap();
+        assert_eq!(detail.state.status, TaskStatus::Done);
+        assert!(event_types(&detail).contains(&"task.done"));
+    }
+
+    /// Fake that streams thinking + tool call + text before completing.
+    fn acp_artifacts_fake_body() -> String {
+        ACP_FAKE_PREAMBLE.to_string()
+            + r#"  case "$line" in
+    *'"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"1.0","agentInfo":{"name":"artifacts-agent"},"capabilities":{}}}\n' "$id" ;;
+    *'"session/new"'* | *'"session/load"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"art_session_123"}}\n' "$id" ;;
+    *'"session/prompt"'*)
+      printf '{"jsonrpc":"2.0","method":"session/thinkingDelta","params":{"thinking":"Deep reasoning in ACP mode..."}}\n'
+      printf '{"jsonrpc":"2.0","method":"session/toolCall","params":{"id":"call_1","name":"bash","input":{"command":"pnpm test"}}}\n'
+      printf '{"jsonrpc":"2.0","method":"session/contentDelta","params":{"text":"Done running tests."}}\n'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"status":"completed"}}\n' "$id" ;;
+  esac
+done
+"#
+    }
+
+    #[tokio::test]
+    async fn acp_persists_artifacts_and_extracts_round_events() {
+        let root = TempDir::new().unwrap();
+        let fake = write_fake(root.path(), "fake-acp-artifacts.sh", &acp_artifacts_fake_body()).await;
+        let store = Arc::new(BuddyStore::new(root.path()));
+        patch_global_settings(&store, json!({ "max_rounds": 1 })).await;
+        let created = create_demo_task(
+            &store,
+            &root,
+            settings_map(&[("launchers", acp_launcher_override(&fake, json!({})))]),
+        )
+        .await;
+        let runner = live_runner(&store);
+
+        runner
+            .start_task(
+                "demo",
+                StartTaskInput {
+                    workspace_key: Some(created.workspace_key.clone()),
+                    actor: Some("opencode".to_string()),
+                    message: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let detail = store
+            .get_task_detail("demo", &created.workspace_key)
+            .await
+            .unwrap();
+        let run_id = detail.transcript[0]
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("run_id"))
+            .and_then(Value::as_str)
+            .expect("run_id in transcript meta")
+            .to_string();
+
+        let summary = store
+            .get_round_events("demo", &run_id, &created.workspace_key, Some("opencode"), None)
+            .await
+            .expect("round events");
+        assert!(summary.events.iter().any(|entry| entry.entry_type == "thinking"
+            && entry.thinking_length.unwrap_or(0) > 0));
+        assert!(summary
+            .events
+            .iter()
+            .any(|entry| entry.entry_type == "tool_use" && entry.tool_name.as_deref() == Some("bash")));
+
+        let task_dir = store.task_directory("demo", &created.workspace_key);
+        let output_md = tokio::fs::read_to_string(task_dir.join("artifacts").join(format!("{run_id}-output.md")))
+            .await
+            .unwrap();
+        assert_eq!(output_md, "Done running tests.");
+        let prompt_md = tokio::fs::read_to_string(task_dir.join("artifacts").join(format!("{run_id}-prompt.md")))
+            .await
+            .unwrap();
+        assert!(!prompt_md.is_empty());
+    }
+
+    /// Fake that only answers `initialize` (health-check ping shape).
+    fn acp_ping_only_fake_body() -> String {
+        ACP_FAKE_PREAMBLE.to_string()
+            + r#"  case "$line" in
+    *'"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"1.0","agentInfo":{"name":"recovered-acp","version":"1.0.0"},"capabilities":{"streaming":true,"tools":true}}}\n' "$id" ;;
+  esac
+done
+"#
+    }
+
+    #[tokio::test]
+    async fn acp_ping_recovers_protocol_and_args_from_global_settings() {
+        let root = TempDir::new().unwrap();
+        let fake = write_fake(root.path(), "fake-acp-ping.sh", &acp_ping_only_fake_body()).await;
+        let store = Arc::new(BuddyStore::new(root.path()));
+        // Global settings carries the full ACP launcher...
+        patch_global_settings(
+            &store,
+            json!({
+                "launchers": {
+                    "wecode_claude": {
+                        "protocol": "acp",
+                        "command": fake,
+                        "args": [],
+                        "env": {},
+                        "timeout_seconds": 10
+                    }
+                }
+            }),
+        )
+        .await;
+        // ...while the task override kept only the command (protocol/args dropped).
+        let created = create_demo_task(
+            &store,
+            &root,
+            settings_map(&[(
+                "launchers",
+                json!({
+                    "wecode_claude": {
+                        "command": fake,
+                        "env": {},
+                        "timeout_seconds": 10
+                    }
+                }),
+            )]),
+        )
+        .await;
+        let runner = live_runner(&store);
+
+        let outcome = runner
+            .execute_ping("demo", &created.workspace_key, "wecode_claude", None)
+            .await
+            .unwrap();
+        assert!(outcome.success, "ping failed: {:?}", outcome.error);
+    }
+
+    /// Fake advertising a model list; records `session/set_model` requests.
+    fn acp_model_fake_body() -> String {
+        ACP_FAKE_PREAMBLE.to_string()
+            + r#"  case "$line" in
+    *'"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"1.0","agentInfo":{"name":"model-agent"},"capabilities":{}}}\n' "$id" ;;
+    *'"session/new"'* | *'"session/load"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess_model","models":{"currentModelId":"sonnet-4.5","availableModels":[{"modelId":"opus-4.6","name":"Opus 4.6"},{"modelId":"sonnet-4.5","name":"Sonnet 4.5"}]}}}\n' "$id" ;;
+    *'"session/set_model"'* | *'"session/set_config_option"'*)
+      printf '%s\n' "$line" > "$ACP_MODEL_LOG"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+    *'"session/prompt"'*)
+      printf '{"jsonrpc":"2.0","method":"session/contentDelta","params":{"text":"ok"}}\n'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"status":"completed"}}\n' "$id" ;;
+  esac
+done
+"#
+    }
+
+    #[tokio::test]
+    async fn acp_applies_selected_model_via_set_model_before_prompting() {
+        let root = TempDir::new().unwrap();
+        let marker = root.path().join("set-model.json");
+        let fake = write_fake(root.path(), "fake-acp-model.sh", &acp_model_fake_body()).await;
+        let store = Arc::new(BuddyStore::new(root.path()));
+        patch_global_settings(&store, json!({ "max_rounds": 1 })).await;
+        let created = create_demo_task(
+            &store,
+            &root,
+            settings_map(&[(
+                "launchers",
+                json!({
+                    "opencode": {
+                        "protocol": "acp",
+                        "command": fake,
+                        "args": [],
+                        "env": { "ACP_MODEL_LOG": marker.to_string_lossy() },
+                        "timeout_seconds": 10,
+                        "model": "opus-4.6"
+                    }
+                }),
+            )]),
+        )
+        .await;
+        let runner = live_runner(&store);
+
+        runner
+            .start_task(
+                "demo",
+                StartTaskInput {
+                    workspace_key: Some(created.workspace_key.clone()),
+                    actor: Some("opencode".to_string()),
+                    message: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let recorded: Value =
+            serde_json::from_str(&tokio::fs::read_to_string(&marker).await.unwrap()).unwrap();
+        assert_eq!(
+            recorded["params"]["sessionId"],
+            json!("sess_model")
+        );
+        assert_eq!(recorded["params"]["modelId"], json!("opus-4.6"));
+    }
+
+    // --- ACP context window overflow -------------------------------------
+
+    struct AcpOverflowFixture {
+        store: Arc<BuddyStore>,
+        workspace_key: String,
+        method_log: std::path::PathBuf,
+        prompt_dir: std::path::PathBuf,
+        model_log: std::path::PathBuf,
+        ready_file: std::path::PathBuf,
+    }
+
+    /// Fake whose first `overflow_until` prompts fail with the configured
+    /// overflow mode ('rpc' | 'stopReason' | 'chinese' | 'other' | 'hang'),
+    /// then recover with a content delta.
+    fn acp_overflow_fake_body() -> String {
+        ACP_FAKE_PREAMBLE.to_string()
+            + r#"  n=0
+  [ -f "$ACP_STATE_FILE" ] && n=$(cat "$ACP_STATE_FILE")
+  case "$line" in
+    *'"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"1.0","agentInfo":{"name":"overflow-agent"},"capabilities":{}}}\n' "$id" ;;
+    *'"session/load"'* | *'"session/new"'*)
+      method="session/new"
+      sid="fresh_session"
+      case "$line" in
+        *'"session/load"'*)
+          method="session/load"
+          sid=$(printf '%s' "$line" | sed -n 's/.*"sessionId":"\([^"]*\)".*/\1/p')
+          [ -z "$sid" ] && sid="loaded_session" ;;
+      esac
+      [ -n "$ACP_METHOD_LOG" ] && printf '{"method":"%s","sessionId":"%s"}\n' "$method" "$sid" >> "$ACP_METHOD_LOG"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"%s","models":{"currentModelId":"sonnet-4.5","availableModels":[{"modelId":"opus-4.6","name":"Opus 4.6"},{"modelId":"sonnet-4.5","name":"Sonnet 4.5"}]}}}\n' "$id" "$sid" ;;
+    *'"session/set_model"'* | *'"session/set_config_option"'*)
+      [ -n "$ACP_MODEL_LOG" ] && printf '%s\n' "$line" > "$ACP_MODEL_LOG"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+    *'"session/prompt"'*)
+      [ -n "$ACP_READY_FILE" ] && printf 'ready' > "$ACP_READY_FILE"
+      if [ "$ACP_OVERFLOW_MODE" = "hang" ]; then continue; fi
+      [ -n "$ACP_METHOD_LOG" ] && printf '{"method":"session/prompt","promptIndex":%s}\n' "$n" >> "$ACP_METHOD_LOG"
+      [ -n "$ACP_PROMPT_DIR" ] && printf '%s\n' "$line" > "$ACP_PROMPT_DIR/prompt-$n.txt"
+      n=$((n + 1))
+      printf '%s' "$n" > "$ACP_STATE_FILE"
+      if [ "$((n - 1))" -lt "${ACP_OVERFLOW_UNTIL:-1}" ]; then
+        case "$ACP_OVERFLOW_MODE" in
+          stopReason)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"status":"error","stopReason":"max_tokens"}}\n' "$id" ;;
+          chinese)
+            printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"对话内容太长，已超出当前模型的处理能力"}}\n' "$id" ;;
+          other)
+            printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"Permission denied"}}\n' "$id" ;;
+          *)
+            printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"超出上下文"}}\n' "$id" ;;
+        esac
+      else
+        printf '{"jsonrpc":"2.0","method":"session/contentDelta","params":{"text":"Recovered after compact"}}\n'
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"status":"completed"}}\n' "$id"
+      fi ;;
+  esac
+done
+"#
+    }
+
+    async fn setup_overflow_fixture(
+        root: &TempDir,
+        overflow_mode: &str,
+        overflow_until: u32,
+        max_compact_retries: Option<u32>,
+        model: Option<&str>,
+    ) -> AcpOverflowFixture {
+        let method_log = root.path().join("methods.jsonl");
+        let prompt_dir = root.path().join("prompts");
+        let state_file = root.path().join("prompt-count.txt");
+        let model_log = root.path().join("set-model.json");
+        let ready_file = root.path().join("ready.txt");
+        tokio::fs::create_dir_all(&prompt_dir).await.unwrap();
+        let fake = write_fake(root.path(), "fake-acp-overflow.sh", &acp_overflow_fake_body()).await;
+
+        let store = Arc::new(BuddyStore::new(root.path()));
+        let mut patch = json!({ "max_rounds": 1 });
+        if let Some(max_compact_retries) = max_compact_retries {
+            patch["max_compact_retries"] = json!(max_compact_retries);
+        }
+        patch_global_settings(&store, patch).await;
+
+        let mut launcher = json!({
+            "protocol": "acp",
+            "command": fake,
+            "args": [],
+            "env": {
+                "ACP_METHOD_LOG": method_log.to_string_lossy(),
+                "ACP_PROMPT_DIR": prompt_dir.to_string_lossy(),
+                "ACP_STATE_FILE": state_file.to_string_lossy(),
+                "ACP_OVERFLOW_UNTIL": overflow_until.to_string(),
+                "ACP_OVERFLOW_MODE": overflow_mode,
+                "ACP_MODEL_LOG": model_log.to_string_lossy(),
+                "ACP_READY_FILE": ready_file.to_string_lossy()
+            },
+            "timeout_seconds": 10
+        });
+        if let Some(model) = model {
+            launcher["model"] = json!(model);
+        }
+        let long_context = format!("UNIQUE_CONTEXT_BLOB {}", "x".repeat(2500));
+        let created = store
+            .create_task(crate::buddy::types::CreateTaskInput {
+                task_id: "demo".to_string(),
+                repo_root: Some(root.path().to_string_lossy().to_string()),
+                task_text: Some("Implement overflow recovery".to_string()),
+                context_text: Some(long_context),
+                settings: settings_map(&[
+                    ("implementer_actor", json!("opencode")),
+                    ("reviewer_actor", json!("kimi")),
+                    ("launchers", json!({ "opencode": launcher })),
+                ]),
+                execution_mode: None,
+            })
+            .await
+            .unwrap();
+        store
+            .update_task_state("demo", &created.workspace_key, |mut state| {
+                state.opencode_session_id = Some("bloated_opencode".to_string());
+                state.kimi_session_id = Some("keep_kimi".to_string());
+                state.actor_sessions = Some(HashMap::from([
+                    ("opencode".to_string(), "bloated_opencode".to_string()),
+                    ("kimi".to_string(), "keep_kimi".to_string()),
+                ]));
+                state
+            })
+            .await
+            .unwrap();
+
+        AcpOverflowFixture {
+            store,
+            workspace_key: created.workspace_key,
+            method_log,
+            prompt_dir,
+            model_log,
+            ready_file,
+        }
+    }
+
+    fn parse_method_log(text: &str) -> Vec<Value> {
+        text.split('\n')
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    async fn run_acp_overflow_modes(mode: &str) {
+        let root = TempDir::new().unwrap();
+        let fixture = setup_overflow_fixture(&root, mode, 1, None, Some("opus-4.6")).await;
+        let runner = live_runner(&fixture.store);
+
+        runner
+            .start_task(
+                "demo",
+                StartTaskInput {
+                    workspace_key: Some(fixture.workspace_key.clone()),
+                    actor: Some("opencode".to_string()),
+                    message: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let detail = fixture
+            .store
+            .get_task_detail("demo", &fixture.workspace_key)
+            .await
+            .unwrap();
+        assert!(event_types(&detail).contains(&"actor.session_reset"));
+        assert!(event_types(&detail).contains(&"actor.context_limit_detected"));
+        assert_ne!(detail.state.status, TaskStatus::Failed);
+        assert_eq!(detail.state.kimi_session_id.as_deref(), Some("keep_kimi"));
+        assert_eq!(
+            detail
+                .state
+                .actor_sessions
+                .as_ref()
+                .and_then(|s| s.get("kimi"))
+                .map(String::as_str),
+            Some("keep_kimi")
+        );
+        assert_ne!(
+            detail.state.opencode_session_id.as_deref(),
+            Some("bloated_opencode")
+        );
+        assert_eq!(
+            detail
+                .state
+                .actor_sessions
+                .as_ref()
+                .and_then(|s| s.get("opencode"))
+                .map(String::as_str),
+            Some("fresh_session")
+        );
+
+        let methods = parse_method_log(
+            &tokio::fs::read_to_string(&fixture.method_log).await.unwrap(),
+        );
+        let load_index = methods
+            .iter()
+            .position(|m| m["method"] == json!("session/load"));
+        let new_index = methods
+            .iter()
+            .position(|m| m["method"] == json!("session/new"));
+        assert!(methods.iter().any(|m| m["method"] == json!("session/load")
+            && m["sessionId"] == json!("bloated_opencode")));
+        assert!(new_index.is_some());
+        assert!(new_index.unwrap() > load_index.expect("session/load logged"));
+
+        let first_prompt = tokio::fs::read_to_string(fixture.prompt_dir.join("prompt-0.txt"))
+            .await
+            .unwrap();
+        let second_prompt = tokio::fs::read_to_string(fixture.prompt_dir.join("prompt-1.txt"))
+            .await
+            .unwrap();
+        assert!(first_prompt.contains("UNIQUE_CONTEXT_BLOB"));
+        assert!(!first_prompt.contains("上下文窗口限制已重置"));
+        assert!(second_prompt.contains("上下文窗口限制已重置"));
+        assert!(second_prompt.contains("请基于以上摘要继续工作"));
+
+        let recorded: Value =
+            serde_json::from_str(&tokio::fs::read_to_string(&fixture.model_log).await.unwrap())
+                .unwrap();
+        assert_eq!(recorded["params"]["sessionId"], json!("fresh_session"));
+        assert_eq!(
+            recorded["params"]
+                .get("modelId")
+                .or_else(|| recorded["params"].get("value")),
+            Some(&json!("opus-4.6"))
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_overflow_rpc_error_resets_session_and_retries() {
+        run_acp_overflow_modes("rpc").await;
+    }
+
+    #[tokio::test]
+    async fn acp_overflow_stop_reason_resets_session_and_retries() {
+        run_acp_overflow_modes("stopReason").await;
+    }
+
+    #[tokio::test]
+    async fn acp_overflow_chinese_error_resets_session_and_retries() {
+        run_acp_overflow_modes("chinese").await;
+    }
+
+    #[tokio::test]
+    async fn acp_no_reset_on_non_overflow_errors() {
+        let root = TempDir::new().unwrap();
+        let fixture = setup_overflow_fixture(&root, "other", 1, None, None).await;
+        let runner = live_runner(&fixture.store);
+
+        let error = runner
+            .start_task(
+                "demo",
+                StartTaskInput {
+                    workspace_key: Some(fixture.workspace_key.clone()),
+                    actor: Some("opencode".to_string()),
+                    message: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Permission denied"));
+
+        let detail = fixture
+            .store
+            .get_task_detail("demo", &fixture.workspace_key)
+            .await
+            .unwrap();
+        assert!(!event_types(&detail).contains(&"actor.session_reset"));
+        assert_eq!(detail.state.status, TaskStatus::Failed);
+        assert_eq!(
+            detail.state.opencode_session_id.as_deref(),
+            Some("bloated_opencode")
+        );
+        assert_eq!(detail.state.kimi_session_id.as_deref(), Some("keep_kimi"));
+
+        let methods = parse_method_log(
+            &tokio::fs::read_to_string(&fixture.method_log).await.unwrap(),
+        );
+        assert!(!methods.iter().any(|m| m["method"] == json!("session/new")));
+        assert!(methods.iter().any(|m| m["method"] == json!("session/load")));
+    }
+
+    #[tokio::test]
+    async fn acp_no_reset_when_user_interrupts() {
+        let root = TempDir::new().unwrap();
+        let fixture = setup_overflow_fixture(&root, "hang", 1, None, None).await;
+        let runner = Arc::new(live_runner(&fixture.store));
+        let workspace_key = fixture.workspace_key.clone();
+
+        let start_runner = runner.clone();
+        let start_workspace_key = workspace_key.clone();
+        let start_handle = tokio::spawn(async move {
+            start_runner
+                .start_task(
+                    "demo",
+                    StartTaskInput {
+                        workspace_key: Some(start_workspace_key),
+                        actor: Some("opencode".to_string()),
+                        message: None,
+                    },
+                )
+                .await
+        });
+
+        assert!(
+            wait_for_path(&fixture.ready_file, 10_000).await,
+            "ACP prompt did not start"
+        );
+        runner.interrupt("demo", &workspace_key).await.unwrap();
+        start_handle.await.unwrap().unwrap();
+
+        let detail = fixture
+            .store
+            .get_task_detail("demo", &workspace_key)
+            .await
+            .unwrap();
+        assert_eq!(detail.state.status, TaskStatus::Paused);
+        assert!(!event_types(&detail).contains(&"actor.session_reset"));
+        assert!(event_types(&detail).contains(&"actor.interrupted"));
+        assert_eq!(
+            detail.state.opencode_session_id.as_deref(),
+            Some("bloated_opencode")
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_no_auto_reset_when_max_compact_retries_is_zero() {
+        let root = TempDir::new().unwrap();
+        let fixture = setup_overflow_fixture(&root, "rpc", 1, Some(0), None).await;
+        let runner = live_runner(&fixture.store);
+
+        let error = runner
+            .start_task(
+                "demo",
+                StartTaskInput {
+                    workspace_key: Some(fixture.workspace_key.clone()),
+                    actor: Some("opencode".to_string()),
+                    message: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("超出上下文"));
+
+        let detail = fixture
+            .store
+            .get_task_detail("demo", &fixture.workspace_key)
+            .await
+            .unwrap();
+        assert!(!event_types(&detail).contains(&"actor.session_reset"));
+        assert!(!event_types(&detail).contains(&"actor.context_limit_detected"));
+        assert_eq!(detail.state.status, TaskStatus::Failed);
+        assert_eq!(
+            detail.state.opencode_session_id.as_deref(),
+            Some("bloated_opencode")
+        );
+
+        let methods = parse_method_log(
+            &tokio::fs::read_to_string(&fixture.method_log).await.unwrap(),
+        );
+        assert!(!methods.iter().any(|m| m["method"] == json!("session/new")));
     }
 }

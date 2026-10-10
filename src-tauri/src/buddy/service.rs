@@ -10,7 +10,12 @@ use std::sync::Arc;
 use serde::Serialize;
 
 use super::commit_message::{self, GenerateCommitMessageInput};
-use super::defaults::{normalize_global_settings, DEFAULT_LAUNCHER_ORDER};
+use super::acp::{
+    check_global_acp_adapters, default_acp_args, prepare_acp_environment, probe_acp_models,
+    resolve_acp_binary, AcpClient, AcpClientOptions, AcpStdioTransport, AcpTransport,
+    ProbeAcpModelsOptions, StdioTransportOptions,
+};
+use super::defaults::{default_launcher_for, normalize_global_settings, DEFAULT_LAUNCHER_ORDER};
 use super::events::BuddyEventBus;
 use super::git;
 use super::launchers::{
@@ -20,7 +25,7 @@ use super::launchers::{
 };
 use super::model_detect::detect_model_from_config;
 use super::parsers::{parse_actor_events, parse_buddy_message, BuddyMessage};
-use super::prompts::build_ping_prompt;
+use super::prompts::{actor_display_name, build_ping_prompt};
 use super::queue_coordinator::{CoordinatorError, QueueCoordinator};
 use super::redact::redact_sensitive_text;
 use super::runner::{
@@ -30,11 +35,11 @@ use super::runner::{
 use super::shell_path::merge_child_env;
 use super::store::{BuddyStore, StoreError};
 use super::types::{
-    AttachmentMeta, BootstrapResponse, CountdownInput, CreateTaskInput, CreateTaskResult, Event,
-    ExecutionMode, GitCommitPushResult, GitPushAvailability, GitPushResult, GitStatusResult,
-    GlobalSettings, InstructionQueueItem,
-    RoundEventSummary, SendMessageInput, StartTaskInput, Task, TaskDetail, TaskStats,
-    TestLauncherResult, TaskStatus,
+    AcpModelList, AttachmentMeta, BootstrapResponse, CountdownInput, CreateTaskInput,
+    CreateTaskResult, Event, ExecutionMode, GitCommitPushResult, GitPushAvailability,
+    GitPushResult, GitStatusResult, GlobalAcpAdaptersStatus, GlobalSettings,
+    InstructionQueueItem, RoundEventSummary, SendMessageInput, StartTaskInput, Task, TaskDetail,
+    TaskSettings, TaskStats, TestLauncherResult, TaskStatus,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -99,6 +104,13 @@ pub struct BuddyCoreService {
     runner: Arc<BuddyRunner>,
     coordinator: QueueCoordinator,
     locale: Option<String>,
+    /// Brief cache of `listAcpModels` results so the create-task modal can
+    /// reopen without re-spawning the agent (TS: 5-minute TTL).
+    acp_model_cache: parking_lot::Mutex<HashMap<String, (AcpModelList, std::time::Instant)>>,
+    /// In-flight `listAcpModels` probes, deduplicating concurrent callers onto
+    /// one spawn (TS: the `acpModelInflight` promise map).
+    acp_model_inflight:
+        parking_lot::Mutex<HashMap<String, Arc<tokio::sync::OnceCell<AcpModelList>>>>,
 }
 
 impl BuddyCoreService {
@@ -137,6 +149,8 @@ impl BuddyCoreService {
             runner,
             coordinator,
             locale: options.locale.or_else(detect_system_locale),
+            acp_model_cache: parking_lot::Mutex::new(HashMap::new()),
+            acp_model_inflight: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -157,6 +171,21 @@ impl BuddyCoreService {
         Ok(self
             .store
             .update_task_text(task_id, workspace_key, task_text)
+            .await?)
+    }
+
+    /// TS `updateTaskLauncherModel`: set (or clear) the per-task ACP model of
+    /// one actor's launcher.
+    pub async fn update_task_launcher_model(
+        &self,
+        task_id: &str,
+        workspace_key: &str,
+        actor: &str,
+        model: &str,
+    ) -> Result<TaskSettings, ServiceError> {
+        Ok(self
+            .store
+            .update_task_launcher_model(task_id, workspace_key, actor, model)
             .await?)
     }
 
@@ -491,6 +520,7 @@ impl BuddyCoreService {
                 lang: input.lang,
                 paths: input.paths,
                 launcher,
+                data_root: Some(self.store.data_root.clone()),
             },
         )
         .await?;
@@ -520,11 +550,12 @@ impl BuddyCoreService {
         Ok(())
     }
 
-    /// Detect the currently configured model for every actor, reading each
+    /// Detect the currently configured model for every CLI actor, reading each
     /// actor's launcher command from global settings so the result matches
-    /// what the runner will actually invoke. Actors whose model cannot be
-    /// determined before a run (e.g. claude, whose model is only emitted in
-    /// stream-json output) resolve to `None`.
+    /// what the runner will actually invoke. ACP actors are omitted (`None`):
+    /// their model is chosen from the live agent list rather than from a
+    /// local CLI config file. Actors whose model cannot be determined before a
+    /// run resolve to `None`.
     pub async fn detect_actor_models(
         &self,
     ) -> Result<HashMap<String, Option<String>>, ServiceError> {
@@ -533,7 +564,12 @@ impl BuddyCoreService {
         let launchers = normalized.launchers.unwrap_or_default();
         let mut result: HashMap<String, Option<String>> = HashMap::new();
         for actor in DEFAULT_LAUNCHER_ORDER {
-            let command = launchers.get(actor).map(|l| l.command.as_str());
+            let launcher = launchers.get(actor);
+            if launcher.and_then(|l| l.protocol.as_deref()) == Some("acp") {
+                result.insert(actor.to_string(), None);
+                continue;
+            }
+            let command = launcher.map(|l| l.command.as_str());
             result.insert(
                 actor.to_string(),
                 detect_model_from_config(actor, command).await,
@@ -542,23 +578,120 @@ impl BuddyCoreService {
         Ok(result)
     }
 
+    /// Probe an ACP actor for the models it currently advertises. CLI actors
+    /// resolve to an empty list. Results are cached briefly (5 minutes) and
+    /// concurrent probes are deduplicated (TS `listAcpModels`).
+    pub async fn list_acp_models(
+        &self,
+        actor: &str,
+        cwd: Option<String>,
+    ) -> Result<AcpModelList, ServiceError> {
+        let empty = AcpModelList {
+            models: Vec::new(),
+            current_model_id: None,
+        };
+        let settings = self.store.read_global_settings().await?;
+        let normalized = normalize_global_settings(Some(&settings));
+        let launchers = normalized.launchers.unwrap_or_default();
+        let Some(launcher) = launchers.get(actor) else {
+            return Ok(empty);
+        };
+        if launcher.protocol.as_deref() != Some("acp") {
+            return Ok(empty);
+        }
+
+        let cache_key = format!(
+            "{actor}|{}|{}",
+            launcher.command,
+            launcher.args.clone().unwrap_or_default().join(" ")
+        );
+        if let Some((list, expires_at)) = self.acp_model_cache.lock().get(&cache_key) {
+            if *expires_at > std::time::Instant::now() {
+                return Ok(list.clone());
+            }
+        }
+
+        let cell = {
+            let mut inflight = self.acp_model_inflight.lock();
+            inflight
+                .entry(cache_key.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
+                .clone()
+        };
+        let launcher = launcher.clone();
+        let data_root = self.store.data_root.clone();
+        let actor = actor.to_string();
+        let list = cell
+            .get_or_init(|| async move {
+                let probe = async {
+                    let base_args = launcher
+                        .args
+                        .clone()
+                        .filter(|args| !args.is_empty())
+                        .unwrap_or_else(|| default_acp_args(&launcher.command, Some(&actor)));
+                    let resolved = resolve_acp_binary(&launcher.command, &base_args);
+                    let acp_env =
+                        prepare_acp_environment(&actor, launcher.env.clone(), Some(&data_root), None)
+                            .await?;
+                    probe_acp_models(ProbeAcpModelsOptions {
+                        command: resolved.command,
+                        args: resolved.args,
+                        cwd,
+                        env: Some(acp_env),
+                        timeout_ms: None,
+                    })
+                    .await
+                }
+                .await;
+                probe.unwrap_or(AcpModelList {
+                    models: Vec::new(),
+                    current_model_id: None,
+                })
+            })
+            .await
+            .clone();
+        self.acp_model_inflight.lock().remove(&cache_key);
+        self.acp_model_cache.lock().insert(
+            cache_key,
+            (list.clone(), std::time::Instant::now() + std::time::Duration::from_secs(300)),
+        );
+        Ok(list)
+    }
+
+    /// TS `checkAcpGlobalAdapters`: whether the claude/codex ACP adapter
+    /// binaries are globally installed.
+    pub fn check_acp_global_adapters(&self) -> GlobalAcpAdaptersStatus {
+        check_global_acp_adapters()
+    }
+
     /// Two-phase launcher check, port of `testLauncher`. Phase 1 (`tool_check`)
     /// verifies the command can be spawned; phase 2 (`ping`) invokes the actor
     /// with a hello prompt in a temp directory and validates the buddy-message
-    /// response. Filesystem setup failures propagate (TS: they reject the
-    /// handler); launcher failures are reported in the result.
+    /// response — or, for `protocol == "acp"` launchers, performs just the ACP
+    /// initialize handshake. Filesystem setup failures propagate (TS: they
+    /// reject the handler); launcher failures are reported in the result.
     pub async fn test_launcher(
         &self,
         actor: &str,
         command: &str,
         env: Option<HashMap<String, String>>,
+        protocol: Option<&str>,
+        args: Option<Vec<String>>,
     ) -> Result<TestLauncherResult, ServiceError> {
         let start_time = std::time::Instant::now();
         let ping_timeout_ms = ping_timeout_ms();
         let env = env.unwrap_or_default();
+        // A bare `npx`/empty command only makes sense for ACP; CLI tests fall
+        // back to the actor's default command.
+        let effective_command =
+            if protocol != Some("acp") && (command.trim() == "npx" || command.trim().is_empty()) {
+                default_launcher_for(actor).command
+            } else {
+                command.to_string()
+            };
 
         // Phase 1: Tool check — verify the command exists and can be spawned.
-        let base_executable = split_command(command.trim())
+        let base_executable = split_command(effective_command.trim())
             .into_iter()
             .next()
             .unwrap_or_default();
@@ -597,19 +730,139 @@ impl BuddyCoreService {
             }
         }
 
-        // Phase 2: Ping test — actually invoke the actor with a hello prompt.
+        // Phase 2: Ping test — actually invoke the actor with a hello prompt
+        // (or perform the ACP initialize handshake).
         let millis = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or_default();
         let test_dir = std::env::temp_dir().join(format!("buddy-test-{actor}-{millis}"));
-        let result = run_ping(actor, command, &env, &test_dir, millis, ping_timeout_ms, start_time).await;
+        let result = if protocol == Some("acp") {
+            self.run_acp_ping(
+                actor,
+                &effective_command,
+                &env,
+                args,
+                &test_dir,
+                ping_timeout_ms,
+                start_time,
+            )
+            .await
+        } else {
+            run_ping(
+                actor,
+                &effective_command,
+                &env,
+                &test_dir,
+                millis,
+                ping_timeout_ms,
+                start_time,
+            )
+            .await
+        };
         // Clean up temp directory (ignore cleanup errors, like the TS finally).
         let _ = tokio::fs::remove_dir_all(&test_dir).await;
         if let Ok(result) = &result {
             self.record_launcher_test_quiet(actor, result).await;
         }
         result
+    }
+
+    /// Phase 2 for ACP launchers (TS `testLauncher` `protocol === 'acp'`
+    /// branch): spawn the agent in the temp dir and treat a successful
+    /// initialize handshake as a pass. Failures are reported, never thrown.
+    async fn run_acp_ping(
+        &self,
+        actor: &str,
+        command: &str,
+        env: &HashMap<String, String>,
+        args: Option<Vec<String>>,
+        test_dir: &std::path::Path,
+        ping_timeout_ms: u64,
+        start_time: std::time::Instant,
+    ) -> Result<TestLauncherResult, ServiceError> {
+        tokio::fs::create_dir_all(test_dir).await?;
+        let base_args = args
+            .filter(|args| !args.is_empty())
+            .unwrap_or_else(|| default_acp_args(command, Some(actor)));
+        let resolved = resolve_acp_binary(command, &base_args);
+        let outcome = async {
+            let acp_env =
+                prepare_acp_environment(actor, env.clone(), Some(&self.store.data_root), None)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            let transport = Arc::new(AcpStdioTransport::new(StdioTransportOptions {
+                command: resolved.command,
+                args: resolved.args,
+                cwd: Some(test_dir.to_string_lossy().to_string()),
+                env: Some(acp_env),
+                on_stderr: None,
+            }));
+            // Subscribe (via the client) before starting the transport.
+            let client = AcpClient::new(
+                transport.clone() as Arc<dyn AcpTransport>,
+                AcpClientOptions {
+                    timeout_ms: Some(ping_timeout_ms),
+                    client_info: None,
+                },
+            );
+            transport.start().await;
+            let result = client.initialize(None).await.map_err(|e| e.to_string());
+            client.close().await;
+            result
+        }
+        .await;
+        let duration_ms = Some(start_time.elapsed().as_millis() as u64);
+        let result = match outcome {
+            Ok(init) => {
+                let info = init.agent_info.or(init.server_info);
+                let server_name = info
+                    .as_ref()
+                    .map(|info| info.name.clone())
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| {
+                        if actor == "cursor" {
+                            "Cursor Agent".to_string()
+                        } else {
+                            format!("{} (ACP)", actor_display_name(actor))
+                        }
+                    });
+                let server_version = info
+                    .map(|info| info.version)
+                    .filter(|version| !version.is_empty())
+                    .map(|version| format!(" v{version}"))
+                    .unwrap_or_default();
+                TestLauncherResult {
+                    actor: actor.to_string(),
+                    success: true,
+                    phase: "ping".to_string(),
+                    error: None,
+                    session_id: None,
+                    thread_id: None,
+                    response_preview: Some(format!("Connected: {server_name}{server_version}")),
+                    run_id: None,
+                    duration_ms,
+                    timed_out: Some(false),
+                    exit_code: Some(0),
+                    signal: None,
+                }
+            }
+            Err(message) => TestLauncherResult {
+                actor: actor.to_string(),
+                success: false,
+                phase: "ping".to_string(),
+                error: Some(truncate(&redact_sensitive_text(&message), 300)),
+                session_id: None,
+                thread_id: None,
+                response_preview: None,
+                run_id: None,
+                duration_ms,
+                timed_out: Some(false),
+                exit_code: None,
+                signal: None,
+            },
+        };
+        Ok(result)
     }
 
     /// `store.recordLauncherTest(...).catch(() => {})` — diagnostics must
@@ -1121,7 +1374,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let service = service_in(dir.path());
         let result = service
-            .test_launcher("claude", "buddy-definitely-not-a-real-command-xyz", None)
+            .test_launcher("claude", "buddy-definitely-not-a-real-command-xyz", None, None, None)
             .await
             .unwrap();
         assert!(!result.success);
@@ -1166,7 +1419,7 @@ mod tests {
             ),
         )
         .await;
-        let result = service.test_launcher("agy", &fake, None).await.unwrap();
+        let result = service.test_launcher("agy", &fake, None, None, None).await.unwrap();
         assert!(result.success, "error: {:?}", result.error);
         assert_eq!(
             result.response_preview.as_deref(),
@@ -1196,7 +1449,7 @@ mod tests {
             "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exit 0; fi\nkill -TERM $$\n",
         )
         .await;
-        let result = service.test_launcher("agy", &fake, None).await.unwrap();
+        let result = service.test_launcher("agy", &fake, None, None, None).await.unwrap();
         assert!(!result.success);
         let error = result.error.unwrap();
         assert!(error.contains("SIGTERM"), "{error}");
@@ -1215,7 +1468,7 @@ mod tests {
             "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exit 0; fi\necho \"Authentication error: credentials expired\" >&2\nexit 1\n",
         )
         .await;
-        let result = service.test_launcher("agy", &fake, None).await.unwrap();
+        let result = service.test_launcher("agy", &fake, None, None, None).await.unwrap();
         assert!(!result.success);
         let error = result.error.unwrap();
         assert!(
@@ -1238,7 +1491,7 @@ mod tests {
         )
         .await;
         set_ping_timeout_override_for_test(1000);
-        let result = service.test_launcher("agy", &fake, None).await;
+        let result = service.test_launcher("agy", &fake, None, None, None).await;
         set_ping_timeout_override_for_test(120_000);
         let result = result.unwrap();
         assert!(!result.success);
@@ -1271,9 +1524,12 @@ mod tests {
         launchers.insert(
             "codex".to_string(),
             Launcher {
+                protocol: None,
                 command: "codex -m gpt-5.6-luna".to_string(),
+                args: None,
                 env: HashMap::new(),
                 timeout_seconds: 7200,
+                model: None,
             },
         );
         service

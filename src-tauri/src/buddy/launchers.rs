@@ -167,16 +167,14 @@ pub fn command_kind_for(actor: &str, command: &str) -> LauncherCommandKind {
 /// This allows e.g. actor=`kimi` with command=`opencode -m provider/kimi-k2.6`
 /// to be correctly identified as `native_opencode`.
 ///
-/// WeCode wraps both claude and codex: `wecode` (or `wecode ...` without a
-/// leading `codex` token) runs claude; `wecode codex ...` runs codex.
+/// WeCode wraps claude, codex, and opencode: `wecode codex ...` runs codex;
+/// `wecode opencode ...` runs opencode; otherwise `wecode` runs claude.
 pub fn command_kind_for_tokens(actor: &str, base_cmd: &[String]) -> LauncherCommandKind {
     let executable = basename(base_cmd.first().map(String::as_str).unwrap_or(""));
     if executable == "claude" || is_wecode_claude_command_tokens(base_cmd) {
         return LauncherCommandKind::NativeClaude;
     }
-    if executable == "codex"
-        || (executable == "wecode" && base_cmd.get(1).map(String::as_str) == Some("codex"))
-    {
+    if executable == "codex" || is_wecode_codex_command_tokens(base_cmd) {
         return LauncherCommandKind::NativeCodex;
     }
     if executable == "cursor-agent" || executable == "agent" {
@@ -185,7 +183,7 @@ pub fn command_kind_for_tokens(actor: &str, base_cmd: &[String]) -> LauncherComm
     if executable == "agy" || executable == "antigravity" {
         return LauncherCommandKind::NativeAgy;
     }
-    if executable == "opencode" {
+    if executable == "opencode" || is_wecode_opencode_command_tokens(base_cmd) {
         return LauncherCommandKind::NativeOpencode;
     }
     if executable == "kimi" {
@@ -198,11 +196,11 @@ pub fn command_kind_for_tokens(actor: &str, base_cmd: &[String]) -> LauncherComm
     // exactly what produces "flags provided but not defined: -actor".
     if executable.is_empty() || executable == "wecode" || actor == "agy" {
         match actor {
-            "claude" => return LauncherCommandKind::NativeClaude,
-            "codex" => return LauncherCommandKind::NativeCodex,
+            "claude" | "wecode_claude" => return LauncherCommandKind::NativeClaude,
+            "codex" | "wecode_codex" => return LauncherCommandKind::NativeCodex,
             "cursor" => return LauncherCommandKind::NativeCursor,
             "agy" => return LauncherCommandKind::NativeAgy,
-            "opencode" => return LauncherCommandKind::NativeOpencode,
+            "opencode" | "wecode_opencode" => return LauncherCommandKind::NativeOpencode,
             "kimi" => return LauncherCommandKind::NativeKimi,
             _ => {}
         }
@@ -223,7 +221,8 @@ pub fn is_wecode_command_tokens(base_cmd: &[String]) -> bool {
 }
 
 /// Whether a command invokes WeCode Claude (i.e. `wecode` whose second token
-/// is NOT `codex`). Mirrors the WeCode-Claude branch of `commandKindFor`.
+/// is NOT `codex` and NOT `opencode`). Mirrors the WeCode-Claude branch of
+/// `commandKindFor`.
 pub fn is_wecode_claude_command(command: &str) -> bool {
     is_wecode_claude_command_tokens(&split_command(command))
 }
@@ -232,7 +231,8 @@ pub fn is_wecode_claude_command_tokens(base_cmd: &[String]) -> bool {
     if !is_wecode_command_tokens(base_cmd) {
         return false;
     }
-    base_cmd.get(1).map(String::as_str) != Some("codex")
+    let second = base_cmd.get(1).map(String::as_str);
+    second != Some("codex") && second != Some("opencode")
 }
 
 /// Whether a command invokes WeCode Codex (i.e. `wecode codex ...`).
@@ -243,6 +243,15 @@ pub fn is_wecode_codex_command(command: &str) -> bool {
 
 pub fn is_wecode_codex_command_tokens(base_cmd: &[String]) -> bool {
     is_wecode_command_tokens(base_cmd) && base_cmd.get(1).map(String::as_str) == Some("codex")
+}
+
+/// Whether a command invokes WeCode OpenCode (i.e. `wecode opencode ...`).
+pub fn is_wecode_opencode_command(command: &str) -> bool {
+    is_wecode_opencode_command_tokens(&split_command(command))
+}
+
+pub fn is_wecode_opencode_command_tokens(base_cmd: &[String]) -> bool {
+    is_wecode_command_tokens(base_cmd) && base_cmd.get(1).map(String::as_str) == Some("opencode")
 }
 
 /// Strips legacy bare flags (`--full-auto`) from a codex base command.
@@ -268,7 +277,12 @@ pub fn build_launcher_command(input: &LauncherCommandInput) -> LauncherCommand {
     if base_cmd.first().map(String::is_empty).unwrap_or(true)
         && kind != LauncherCommandKind::Contract
     {
-        base_cmd = vec![input.actor.clone()];
+        base_cmd = match input.actor.as_str() {
+            "wecode_claude" => vec!["wecode".to_string()],
+            "wecode_codex" => vec!["wecode".to_string(), "codex".to_string()],
+            "wecode_opencode" => vec!["wecode".to_string(), "opencode".to_string()],
+            _ => vec![input.actor.clone()],
+        };
     }
     let base_cmd = if kind == LauncherCommandKind::NativeCodex {
         clean_codex_base_command(&base_cmd)
@@ -281,6 +295,9 @@ pub fn build_launcher_command(input: &LauncherCommandInput) -> LauncherCommand {
     match kind {
         LauncherCommandKind::NativeClaude => {
             let mut args = prefix_args;
+            if !args.iter().any(|arg| arg == "--dangerously-skip-permissions") {
+                args.push("--dangerously-skip-permissions".to_string());
+            }
             args.extend([
                 "-p".to_string(),
                 "--output-format".to_string(),
@@ -1568,8 +1585,14 @@ mod tests {
         assert!(is_wecode_claude_command("wecode"));
         assert!(is_wecode_claude_command("wecode --dangerously-skip-permissions"));
         assert!(!is_wecode_claude_command("wecode codex"));
+        assert!(!is_wecode_claude_command("wecode opencode"));
         assert!(is_wecode_codex_command("wecode codex --profile native"));
         assert!(!is_wecode_codex_command("wecode"));
+        assert!(is_wecode_opencode_command("wecode opencode"));
+        assert_eq!(
+            command_kind_for("opencode", "wecode opencode"),
+            LauncherCommandKind::NativeOpencode
+        );
         assert_eq!(
             command_kind_for("claude", "wecode"),
             LauncherCommandKind::NativeClaude
@@ -1587,6 +1610,46 @@ mod tests {
             command_kind_for("custom", "/tmp/run-actor"),
             LauncherCommandKind::Contract
         );
+        assert_eq!(
+            command_kind_for("wecode_claude", ""),
+            LauncherCommandKind::NativeClaude
+        );
+        assert_eq!(
+            command_kind_for("wecode_codex", ""),
+            LauncherCommandKind::NativeCodex
+        );
+        assert_eq!(
+            command_kind_for("wecode_opencode", ""),
+            LauncherCommandKind::NativeOpencode
+        );
+    }
+
+    #[test]
+    fn claude_and_wecode_defaults_include_skip_permissions_once() {
+        let bare = input("claude", "claude", "/tmp/prompt.md");
+        let built = build_launcher_command(&bare);
+        assert_eq!(built.args[0], "--dangerously-skip-permissions");
+        assert_eq!(
+            built.args.iter().filter(|arg| *arg == "--dangerously-skip-permissions").count(),
+            1
+        );
+
+        let wecode = input("wecode_claude", "", "/tmp/prompt.md");
+        let built = build_launcher_command(&wecode);
+        assert_eq!(built.command, "wecode");
+        assert!(built.args.iter().any(|arg| arg == "--dangerously-skip-permissions"));
+
+        let codex = input("wecode_codex", "", "/tmp/prompt.md");
+        let built = build_launcher_command(&codex);
+        assert_eq!(built.command, "wecode");
+        assert_eq!(built.args.first().map(String::as_str), Some("codex"));
+        assert_eq!(built.kind, LauncherCommandKind::NativeCodex);
+
+        let opencode = input("wecode_opencode", "", "/tmp/prompt.md");
+        let built = build_launcher_command(&opencode);
+        assert_eq!(built.command, "wecode");
+        assert_eq!(built.kind, LauncherCommandKind::NativeOpencode);
+        assert_eq!(built.args.first().map(String::as_str), Some("opencode"));
     }
 
     #[tokio::test]
