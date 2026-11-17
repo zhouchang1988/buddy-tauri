@@ -14,16 +14,20 @@ use crate::buddy::launchers::{
     LauncherCommandKind,
 };
 use crate::buddy::parsers::parse_jsonl_buffer;
-use crate::buddy::paths::{canonical_repo_root, create_buddy_paths, task_dir, workspace_key_for_repo};
+use crate::buddy::paths::{
+    canonical_repo_root, create_buddy_paths, task_dir, workspace_key_for_repo,
+};
 use crate::buddy::redact::redact_json_value;
 use crate::buddy::schemas::{
     parse_event_line, parse_global_settings, parse_task_settings, parse_task_state, SchemaError,
 };
 use crate::buddy::task_id::validate_task_id;
+use crate::buddy::token_usage::normalize_token_usage;
 use crate::buddy::types::{
     AttachmentMeta, CreateTaskInput, CreateTaskResult, Event, ExecutionMode, GlobalSettings,
     InstructionQueueItem, Launcher, RoundEventEntry, RoundEventSummary, Task, TaskActorStats,
-    TaskDetail, TaskQueueInfo, TaskSettings, TaskState, TaskStats, TaskStatus, TranscriptEntry,
+    TaskDetail, TaskQueueInfo, TaskSettings, TaskState, TaskStats, TaskStatus, TokenAvailability,
+    TranscriptEntry,
 };
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value};
@@ -33,19 +37,20 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
-const ACTORS: [&str; 9] = [
+const ACTORS: [&str; 10] = [
     "claude",
     "codex",
     "cursor",
     "agy",
     "opencode",
     "kimi",
+    "dsh",
     "wecode_claude",
     "wecode_codex",
     "wecode_opencode",
 ];
 
-const TRANSCRIPT_ROLES: [&str; 11] = [
+const TRANSCRIPT_ROLES: [&str; 12] = [
     "human",
     "claude",
     "codex",
@@ -53,6 +58,7 @@ const TRANSCRIPT_ROLES: [&str; 11] = [
     "agy",
     "opencode",
     "kimi",
+    "dsh",
     "wecode_claude",
     "wecode_codex",
     "wecode_opencode",
@@ -193,7 +199,10 @@ impl BuddyStore {
             .collect()
     }
 
-    pub async fn create_task(&self, input: CreateTaskInput) -> Result<CreateTaskResult, StoreError> {
+    pub async fn create_task(
+        &self,
+        input: CreateTaskInput,
+    ) -> Result<CreateTaskResult, StoreError> {
         let validation = validate_task_id(&input.task_id);
         if let Some(reason) = validation.reason {
             return Err(StoreError::Invalid(format!("Invalid task ID: {reason}")));
@@ -206,7 +215,9 @@ impl BuddyStore {
         } else {
             &repo_root
         });
-        let task_id = self.deduplicate_task_id(&requested_task_id, &workspace_key).await?;
+        let task_id = self
+            .deduplicate_task_id(&requested_task_id, &workspace_key)
+            .await?;
         let dir = self.task_directory(&task_id, &workspace_key);
         let now = utc_now();
         let task_text = task_markdown_content(input.task_text.as_deref().unwrap_or(""));
@@ -260,11 +271,7 @@ impl BuddyStore {
             run_id: None,
             payload,
         };
-        append_event_line(
-            &dir.join("events.jsonl"),
-            &serde_json::to_value(&created)?,
-        )
-        .await?;
+        append_event_line(&dir.join("events.jsonl"), &serde_json::to_value(&created)?).await?;
         if execution_mode == ExecutionMode::Queued {
             let mut queued_payload = Map::new();
             queued_payload.insert(
@@ -282,11 +289,7 @@ impl BuddyStore {
                 run_id: None,
                 payload: queued_payload,
             };
-            append_event_line(
-                &dir.join("events.jsonl"),
-                &serde_json::to_value(&queued)?,
-            )
-            .await?;
+            append_event_line(&dir.join("events.jsonl"), &serde_json::to_value(&queued)?).await?;
         }
 
         Ok(CreateTaskResult {
@@ -396,9 +399,9 @@ impl BuddyStore {
         let events = self.read_events(task_id, workspace_key).await;
         let state = self.read_task_state(task_id, workspace_key).await?;
         let max_logged_seq = events.iter().map(|event| event.seq).max().unwrap_or(0);
-        let seq = input.seq.unwrap_or_else(|| {
-            std::cmp::max(state.event_seq.unwrap_or(0), max_logged_seq) + 1
-        });
+        let seq = input
+            .seq
+            .unwrap_or_else(|| std::cmp::max(state.event_seq.unwrap_or(0), max_logged_seq) + 1);
         let next = Event {
             seq,
             task_id: Some(task_id.to_string()),
@@ -412,7 +415,8 @@ impl BuddyStore {
         append_event_line(&self.events_path(task_id, workspace_key), &redacted).await?;
         let mut new_state = state;
         new_state.event_seq = Some(seq);
-        self.write_task_state(task_id, workspace_key, new_state).await?;
+        self.write_task_state(task_id, workspace_key, new_state)
+            .await?;
         Ok(serde_json::from_value(redacted)?)
     }
 
@@ -440,7 +444,8 @@ impl BuddyStore {
         .await?;
         let mut new_state = state;
         new_state.transcript_seq = Some(seq);
-        self.write_task_state(task_id, workspace_key, new_state).await?;
+        self.write_task_state(task_id, workspace_key, new_state)
+            .await?;
         Ok(TranscriptEntry {
             role: role.to_string(),
             content: content.to_string(),
@@ -522,20 +527,18 @@ impl BuddyStore {
         }
         let mut new_state = state;
         new_state.instruction_queue = Some(Vec::new());
-        self.write_task_state(task_id, workspace_key, new_state).await?;
+        self.write_task_state(task_id, workspace_key, new_state)
+            .await?;
         Ok(items)
     }
 
     pub fn task_directory(&self, task_id: &str, workspace_key: &str) -> PathBuf {
-        task_dir(
-            &create_buddy_paths(&self.data_root),
-            workspace_key,
-            task_id,
-        )
+        task_dir(&create_buddy_paths(&self.data_root), workspace_key, task_id)
     }
 
     pub fn state_path(&self, task_id: &str, workspace_key: &str) -> PathBuf {
-        self.task_directory(task_id, workspace_key).join("state.json")
+        self.task_directory(task_id, workspace_key)
+            .join("state.json")
     }
 
     pub fn settings_path(&self, task_id: &str, workspace_key: &str) -> PathBuf {
@@ -656,7 +659,10 @@ impl BuddyStore {
         now: &str,
     ) -> Result<(), StoreError> {
         let mut value = Map::new();
-        value.insert("protocol_version".to_string(), Value::String("1".to_string()));
+        value.insert(
+            "protocol_version".to_string(),
+            Value::String("1".to_string()),
+        );
         value.insert(
             "workspace_key".to_string(),
             Value::String(workspace_key.to_string()),
@@ -681,7 +687,9 @@ impl BuddyStore {
             return markdown;
         }
 
-        let path = self.task_directory(task_id, workspace_key).join("task.json");
+        let path = self
+            .task_directory(task_id, workspace_key)
+            .join("task.json");
         match read_json(&path).await {
             Ok(value) => TaskMeta {
                 task_text: value
@@ -700,7 +708,11 @@ impl BuddyStore {
         }
     }
 
-    async fn read_markdown_task_meta(&self, task_id: &str, workspace_key: &str) -> Option<TaskMeta> {
+    async fn read_markdown_task_meta(
+        &self,
+        task_id: &str,
+        workspace_key: &str,
+    ) -> Option<TaskMeta> {
         let dir = self.task_directory(task_id, workspace_key);
         let task_text = read_optional_text(&dir.join("task.md")).await;
         let context_text = read_optional_text(&dir.join("context.md")).await;
@@ -769,6 +781,7 @@ impl BuddyStore {
         }
         let value = match actor {
             "kimi" => state.kimi_session_id,
+            "dsh" => state.dsh_session_id,
             "opencode" => state.opencode_session_id,
             "claude" => state.claude_session_id,
             "codex" => state.codex_thread_id,
@@ -815,10 +828,50 @@ impl BuddyStore {
         let mut duration_ms: Option<f64> = None;
         let mut cost_usd: Option<f64> = None;
         let mut model: Option<String> = None;
+        let mut token_availability = TokenAvailability {
+            input: false,
+            output: false,
+            cache: false,
+        };
         let mut first_ts: Option<f64> = None;
         let mut last_ts: Option<f64> = None;
 
         for event in parse_jsonl_buffer(&raw) {
+            let event_type = event.get("type").and_then(Value::as_str);
+            let usage_sources = [
+                event.get("usage"),
+                event.get("response").and_then(|value| value.get("usage")),
+                event.get("result").and_then(|value| value.get("usage")),
+                event
+                    .get("step_update")
+                    .and_then(|value| value.get("usage")),
+                if event_type == Some("step_finish") {
+                    event.get("part").and_then(|value| value.get("tokens"))
+                } else {
+                    None
+                },
+            ];
+            for source in usage_sources.into_iter().flatten() {
+                let usage = normalize_token_usage(Some(source));
+                token_availability.input |= usage.input.is_some();
+                token_availability.output |= usage.output.is_some();
+                token_availability.cache |= usage.cache.is_some();
+            }
+            if matches!(
+                event_type,
+                Some("acp.result" | "acp.usage" | "turn.completed")
+            ) {
+                let usage = normalize_token_usage(event.get("usage"));
+                if let Some(value) = usage.input {
+                    input_tokens = value;
+                }
+                if let Some(value) = usage.output {
+                    output_tokens = value;
+                }
+                if let Some(value) = usage.cache {
+                    cache_read_tokens = value;
+                }
+            }
             // Track timestamps for duration calculation
             let ts = event
                 .get("timestamp")
@@ -837,8 +890,6 @@ impl BuddyStore {
                     last_ts = Some(ms);
                 }
             }
-
-            let event_type = event.get("type").and_then(Value::as_str);
 
             // Claude stream-json format
             if event_type == Some("system")
@@ -868,16 +919,12 @@ impl BuddyStore {
                             }
                             Some("text") => {
                                 events.push(text_entry(
-                                    part.get("text")
-                                        .and_then(Value::as_str)
-                                        .map(str::to_string),
+                                    part.get("text").and_then(Value::as_str).map(str::to_string),
                                 ));
                             }
                             Some("tool_use") => {
                                 events.push(tool_use_entry(
-                                    part.get("name")
-                                        .and_then(Value::as_str)
-                                        .map(str::to_string),
+                                    part.get("name").and_then(Value::as_str).map(str::to_string),
                                     part.get("input").and_then(Value::as_object).cloned(),
                                 ));
                             }
@@ -897,9 +944,10 @@ impl BuddyStore {
                         if part.get("type").and_then(Value::as_str) == Some("tool_result") {
                             let preview = match part.get("content") {
                                 Some(Value::String(text)) => take_chars(text, 200),
-                                Some(other) => {
-                                    take_chars(&serde_json::to_string(other).unwrap_or_default(), 200)
-                                }
+                                Some(other) => take_chars(
+                                    &serde_json::to_string(other).unwrap_or_default(),
+                                    200,
+                                ),
                                 None => String::new(),
                             };
                             events.push(tool_result_entry(
@@ -1099,7 +1147,9 @@ impl BuddyStore {
                     .unwrap_or("tool")
                     .to_string();
                 // OpenCode stores tool input in part.state.input, not part.input
-                let state = part.and_then(|part| part.get("state")).and_then(Value::as_object);
+                let state = part
+                    .and_then(|part| part.get("state"))
+                    .and_then(Value::as_object);
                 let tool_input = state
                     .and_then(|state| state.get("input"))
                     .and_then(Value::as_object)
@@ -1115,7 +1165,9 @@ impl BuddyStore {
                     if js_truthy(output) {
                         let preview = match output {
                             Value::String(text) => take_chars(text, 200),
-                            other => take_chars(&serde_json::to_string(other).unwrap_or_default(), 200),
+                            other => {
+                                take_chars(&serde_json::to_string(other).unwrap_or_default(), 200)
+                            }
                         };
                         let exit = state
                             .and_then(|state| state.get("metadata"))
@@ -1135,6 +1187,7 @@ impl BuddyStore {
                 if let Some(text) = part
                     .and_then(|part| part.get("text"))
                     .and_then(Value::as_str)
+                    .or_else(|| event.get("text").and_then(Value::as_str))
                     .filter(|text| !text.is_empty())
                 {
                     events.push(text_entry(Some(text.to_string())));
@@ -1153,15 +1206,17 @@ impl BuddyStore {
                         .and_then(|cache| cache.get("read"))
                         .and_then(Value::as_u64)
                         .unwrap_or(0);
-                    input_tokens = json_u64(tokens.get("input")).unwrap_or(0);
-                    cache_read_tokens = cache_read;
-                    output_tokens = json_u64(tokens.get("output")).unwrap_or(output_tokens);
+                    input_tokens += json_u64(tokens.get("input")).unwrap_or(0);
+                    cache_read_tokens += cache_read;
+                    output_tokens += json_u64(tokens.get("output")).unwrap_or(0);
                 }
                 if let Some(cost) = part
                     .and_then(|part| part.get("cost"))
                     .filter(|value| !value.is_null())
                 {
-                    cost_usd = cost.as_f64().or(cost_usd);
+                    if let Some(cost) = cost.as_f64() {
+                        cost_usd = Some(cost_usd.unwrap_or(0.0) + cost);
+                    }
                 }
                 let responded = part
                     .and_then(|part| part.get("respondedModelID"))
@@ -1176,6 +1231,37 @@ impl BuddyStore {
                 } else if let Some(requested) = requested {
                     model = Some(requested.to_string());
                 }
+            }
+
+            if event_type == Some("thinking") {
+                if let Some(thinking) = event.get("text").and_then(Value::as_str) {
+                    events.push(thinking_entry(thinking.chars().count() as u64));
+                }
+            }
+            if event_type == Some("tool_call") {
+                let tool_name = event.get("tool").and_then(Value::as_str).unwrap_or("tool");
+                events.push(tool_use_entry(
+                    Some(tool_name.to_string()),
+                    event.get("input").and_then(Value::as_object).cloned(),
+                ));
+            }
+            if event_type == Some("tool_result") {
+                events.push(tool_result_entry(
+                    event
+                        .get("result")
+                        .and_then(Value::as_str)
+                        .map(|result| take_chars(result, 200))
+                        .unwrap_or_default(),
+                    Some(event.get("status").and_then(Value::as_str) == Some("error")),
+                ));
+            }
+            if event_type == Some("status")
+                && event.get("phase").and_then(Value::as_str) == Some("step_end")
+            {
+                let usage = normalize_token_usage(event.get("usage"));
+                input_tokens += usage.input.unwrap_or(0);
+                output_tokens += usage.output.unwrap_or(0);
+                cache_read_tokens += usage.cache.unwrap_or(0);
             }
 
             // Generic: item.text
@@ -1279,6 +1365,7 @@ impl BuddyStore {
         }
 
         Some(RoundEventSummary {
+            token_availability: Some(token_availability),
             run_id: run_id.to_string(),
             events,
             input_tokens,
@@ -1318,7 +1405,10 @@ impl BuddyStore {
                 elapsed_ms,
                 end_ts,
             };
-            if let Some((_, runs)) = actor_runs.iter_mut().find(|(actor, _)| actor == &entry.role) {
+            if let Some((_, runs)) = actor_runs
+                .iter_mut()
+                .find(|(actor, _)| actor == &entry.role)
+            {
                 runs.push(run);
             } else {
                 actor_runs.push((entry.role.clone(), vec![run]));
@@ -1338,6 +1428,11 @@ impl BuddyStore {
             let mut duration_ms: f64 = 0.0;
             let mut cost_usd: Option<f64> = None;
             let mut model: Option<String> = None;
+            let mut token_availability = TokenAvailability {
+                input: true,
+                output: true,
+                cache: true,
+            };
 
             for run in runs {
                 duration_ms += run.elapsed_ms;
@@ -1345,6 +1440,17 @@ impl BuddyStore {
                     .get_round_events(task_id, &run.run_id, workspace_key, Some(actor), None)
                     .await
                 {
+                    if let Some(availability) = &summary.token_availability {
+                        token_availability.input &= availability.input;
+                        token_availability.output &= availability.output;
+                        token_availability.cache &= availability.cache;
+                    } else {
+                        token_availability = TokenAvailability {
+                            input: false,
+                            output: false,
+                            cache: false,
+                        };
+                    }
                     input_tokens += summary.input_tokens;
                     output_tokens += summary.output_tokens;
                     cache_read_tokens += summary.cache_read_tokens;
@@ -1382,6 +1488,7 @@ impl BuddyStore {
                 };
                 if let Some(insight) = insight {
                     const WINDOW_SLACK_MS: f64 = 5_000.0;
+                    let mut matched_run_ids = std::collections::HashSet::new();
                     for record in &insight.records {
                         let matched = runs.iter().any(|run| {
                             run.end_ts.is_some_and(|end_ts| {
@@ -1392,10 +1499,24 @@ impl BuddyStore {
                         if !matched {
                             continue;
                         }
+                        for run in runs {
+                            if run.end_ts.is_some_and(|end_ts| {
+                                record.time_ms >= end_ts - run.elapsed_ms - WINDOW_SLACK_MS
+                                    && record.time_ms <= end_ts + WINDOW_SLACK_MS
+                            }) {
+                                matched_run_ids.insert(run.run_id.clone());
+                            }
+                        }
                         input_tokens += record.input_tokens;
                         output_tokens += record.output_tokens;
                         cache_read_tokens += record.cache_read_tokens;
                     }
+                    let complete = matched_run_ids.len() == runs.len();
+                    token_availability = TokenAvailability {
+                        input: complete,
+                        output: complete,
+                        cache: complete,
+                    };
                     if model.is_none() && insight.model.is_some() {
                         model = insight.model;
                     }
@@ -1403,6 +1524,7 @@ impl BuddyStore {
             }
 
             actors.push(TaskActorStats {
+                token_availability: Some(token_availability),
                 actor: actor.clone(),
                 model,
                 input_tokens,
@@ -1427,6 +1549,26 @@ impl BuddyStore {
         };
 
         Some(TaskStats {
+            token_availability: Some(TokenAvailability {
+                input: actors.iter().all(|actor| {
+                    actor
+                        .token_availability
+                        .as_ref()
+                        .is_some_and(|value| value.input)
+                }),
+                output: actors.iter().all(|actor| {
+                    actor
+                        .token_availability
+                        .as_ref()
+                        .is_some_and(|value| value.output)
+                }),
+                cache: actors.iter().all(|actor| {
+                    actor
+                        .token_availability
+                        .as_ref()
+                        .is_some_and(|value| value.cache)
+                }),
+            }),
             actors,
             total_input_tokens,
             total_output_tokens,
@@ -1642,7 +1784,11 @@ async fn read_opencode_model_from_db(home: &Path, session_id: &str) -> Option<St
     if !is_safe_session_id(session_id) {
         return None;
     }
-    let db_path = home.join(".local").join("share").join("opencode").join("opencode.db");
+    let db_path = home
+        .join(".local")
+        .join("share")
+        .join("opencode")
+        .join("opencode.db");
     let query = format!(
         "SELECT json_extract(data,'$.providerID') || '/' || json_extract(data,'$.modelID') FROM message WHERE session_id='{session_id}' AND json_extract(data,'$.role')='assistant' AND json_extract(data,'$.modelID') IS NOT NULL ORDER BY time_created DESC LIMIT 1;"
     );
@@ -1742,7 +1888,11 @@ async fn read_opencode_session_model(home: &Path, session_id: &str) -> Option<St
 
 /// Detect the current model for an actor by reading its configuration file;
 /// fallback when the model cannot be determined from streaming output events.
-async fn detect_model_from_config(home: &Path, actor: &str, command: Option<&str>) -> Option<String> {
+async fn detect_model_from_config(
+    home: &Path,
+    actor: &str,
+    command: Option<&str>,
+) -> Option<String> {
     // 1. An explicit -m / --model on the command line always wins, for any CLI.
     if let Some(from_command) = model_from_command_args(command) {
         return Some(from_command);
@@ -1753,8 +1903,11 @@ async fn detect_model_from_config(home: &Path, actor: &str, command: Option<&str
     let kind = command_kind_for(actor, command);
     match kind {
         LauncherCommandKind::NativeOpencode => {
-            read_json_model(&home.join(".config").join("opencode").join("opencode.json"), "model")
-                .await
+            read_json_model(
+                &home.join(".config").join("opencode").join("opencode.json"),
+                "model",
+            )
+            .await
         }
         LauncherCommandKind::NativeCodex => {
             if is_wecode_codex_command(command) || actor == "wecode_codex" {
@@ -1765,8 +1918,11 @@ async fn detect_model_from_config(home: &Path, actor: &str, command: Option<&str
         }
         LauncherCommandKind::NativeKimi => {
             // Kimi Code CLI reads ~/.kimi-code/config.toml; ~/.kimi is the legacy path
-            if let Some(primary) =
-                read_toml_model(&home.join(".kimi-code").join("config.toml"), "default_model").await
+            if let Some(primary) = read_toml_model(
+                &home.join(".kimi-code").join("config.toml"),
+                "default_model",
+            )
+            .await
             {
                 return Some(primary);
             }
@@ -1976,6 +2132,7 @@ fn state_to_json_value(state: &TaskState) -> Value {
     insert_nullable(&mut map, "agy_session_id", &state.agy_session_id);
     insert_nullable(&mut map, "opencode_session_id", &state.opencode_session_id);
     insert_nullable(&mut map, "kimi_session_id", &state.kimi_session_id);
+    insert_nullable(&mut map, "dsh_session_id", &state.dsh_session_id);
     insert_nullable(
         &mut map,
         "wecode_claude_session_id",
@@ -1999,7 +2156,11 @@ fn state_to_json_value(state: &TaskState) -> Value {
     );
     insert_opt(&mut map, "event_seq", &state.event_seq);
     insert_opt(&mut map, "transcript_seq", &state.transcript_seq);
-    insert_opt(&mut map, "consecutive_failures", &state.consecutive_failures);
+    insert_opt(
+        &mut map,
+        "consecutive_failures",
+        &state.consecutive_failures,
+    );
     insert_nullable(&mut map, "last_error", &state.last_error);
     insert_opt(&mut map, "created_at", &state.created_at);
     insert_opt(&mut map, "updated_at", &state.updated_at);
@@ -2021,7 +2182,11 @@ fn insert_opt<T: serde::Serialize>(map: &mut Map<String, Value>, key: &str, valu
     }
 }
 
-fn insert_nullable<T: serde::Serialize>(map: &mut Map<String, Value>, key: &str, value: &Option<T>) {
+fn insert_nullable<T: serde::Serialize>(
+    map: &mut Map<String, Value>,
+    key: &str,
+    value: &Option<T>,
+) {
     let value = match value {
         Some(value) => serde_json::to_value(value).unwrap_or(Value::Null),
         None => Value::Null,
@@ -2101,10 +2266,8 @@ fn coerce_launcher_overrides(
             .get("command")
             .and_then(Value::as_str)
             .map(str::to_string);
-        let candidate_args: Option<Vec<String>> = candidate
-            .get("args")
-            .and_then(Value::as_array)
-            .map(|args| {
+        let candidate_args: Option<Vec<String>> =
+            candidate.get("args").and_then(Value::as_array).map(|args| {
                 args.iter()
                     .filter_map(|arg| arg.as_str().map(str::to_string))
                     .collect()
@@ -2126,8 +2289,8 @@ fn coerce_launcher_overrides(
                 // task override kept the same command (or is itself an ACP
                 // invocation); a bare npx/acp-looking override also implies it.
                 let global_is_acp = global.and_then(|g| g.protocol.as_deref()) == Some("acp");
-                let same_command =
-                    command.as_deref().is_some() && command.as_deref() == global.map(|g| g.command.as_str());
+                let same_command = command.as_deref().is_some()
+                    && command.as_deref() == global.map(|g| g.command.as_str());
                 if (global_is_acp && (same_command || npx_or_acp)) || npx_or_acp {
                     Some("acp".to_string())
                 } else {
@@ -2239,11 +2402,21 @@ fn default_task_settings(
     map.insert("launchers".to_string(), Value::Object(launchers));
     map.insert(
         "seed_claude_session_id".to_string(),
-        Value::String(normalized_global.seed_claude_session_id.clone().unwrap_or_default()),
+        Value::String(
+            normalized_global
+                .seed_claude_session_id
+                .clone()
+                .unwrap_or_default(),
+        ),
     );
     map.insert(
         "seed_codex_thread_id".to_string(),
-        Value::String(normalized_global.seed_codex_thread_id.clone().unwrap_or_default()),
+        Value::String(
+            normalized_global
+                .seed_codex_thread_id
+                .clone()
+                .unwrap_or_default(),
+        ),
     );
     map.insert(
         "seed_cursor_session_id".to_string(),
@@ -2277,6 +2450,15 @@ fn default_task_settings(
         Value::String(
             normalized_global
                 .seed_kimi_session_id
+                .clone()
+                .unwrap_or_default(),
+        ),
+    );
+    map.insert(
+        "seed_dsh_session_id".to_string(),
+        Value::String(
+            normalized_global
+                .seed_dsh_session_id
                 .clone()
                 .unwrap_or_default(),
         ),
@@ -2357,6 +2539,7 @@ fn default_task_state(
         agy_session_id: None,
         opencode_session_id: None,
         kimi_session_id: None,
+        dsh_session_id: None,
         wecode_claude_session_id: None,
         wecode_codex_thread_id: None,
         wecode_opencode_session_id: None,
@@ -2540,7 +2723,7 @@ async fn directory_exists(path: &Path) -> bool {
     fs::metadata(path).await.is_ok()
 }
 
-async fn atomic_write_json(path: &Path, value: &Value) -> Result<(), StoreError> {
+pub(crate) async fn atomic_write_json(path: &Path, value: &Value) -> Result<(), StoreError> {
     atomic_write_text(path, &stringify_json(value)).await
 }
 
@@ -2826,7 +3009,10 @@ mod tests {
         assert_eq!(first_meta.get("elapsed_ms"), Some(&json!(1000)));
         let second = &detail.transcript[1];
         assert_eq!(second.role, "system");
-        assert_eq!(second.content, "Claude Code 请求结束任务，等待 Codex 确认。");
+        assert_eq!(
+            second.content,
+            "Claude Code 请求结束任务，等待 Codex 确认。"
+        );
         let second_meta = second.meta.as_ref().unwrap();
         assert_eq!(second_meta.get("kind"), Some(&json!("round_notice")));
         assert_eq!(second_meta.get("round"), Some(&json!(2)));
@@ -2948,7 +3134,10 @@ mod tests {
     #[tokio::test]
     async fn loads_legacy_markdown_tasks_with_nullable_state_fields() {
         let root = TempDir::new().unwrap();
-        let workspace_dir = root.path().join("workspaces").join("buddy-macos-31bd2c697ab4");
+        let workspace_dir = root
+            .path()
+            .join("workspaces")
+            .join("buddy-macos-31bd2c697ab4");
         let task_dir = workspace_dir.join("tasks").join("设置页基本功能");
         fs::create_dir_all(&task_dir).await.unwrap();
         write_file(
@@ -3042,10 +3231,14 @@ mod tests {
         assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()));
         assert_eq!(result.path, task_dir.to_string_lossy().to_string());
 
-        let workspace_json =
-            fs::read_to_string(root.path().join("workspaces").join(&result.workspace_key).join("workspace.json"))
-                .await
-                .unwrap();
+        let workspace_json = fs::read_to_string(
+            root.path()
+                .join("workspaces")
+                .join(&result.workspace_key)
+                .join("workspace.json"),
+        )
+        .await
+        .unwrap();
         assert!(
             workspace_json.contains(&format!("\"default_repo_root\": \"{expected_repo_root}\"")),
             "workspace.json: {workspace_json}"
@@ -3055,7 +3248,9 @@ mod tests {
             "Build it\n"
         );
         assert_eq!(
-            fs::read_to_string(task_dir.join("context.md")).await.unwrap(),
+            fs::read_to_string(task_dir.join("context.md"))
+                .await
+                .unwrap(),
             "Use tests\n"
         );
         assert_eq!(
@@ -3070,7 +3265,9 @@ mod tests {
         assert!(!task_dir.join("transcript.jsonl").exists());
 
         let settings: Value = serde_json::from_str(
-            &fs::read_to_string(task_dir.join("settings.json")).await.unwrap(),
+            &fs::read_to_string(task_dir.join("settings.json"))
+                .await
+                .unwrap(),
         )
         .unwrap();
         assert_eq!(settings["protocol_version"], json!("1"));
@@ -3088,9 +3285,12 @@ mod tests {
             json!({ "command": "codex", "env": {}, "timeout_seconds": 7200 })
         );
 
-        let state: Value =
-            serde_json::from_str(&fs::read_to_string(task_dir.join("state.json")).await.unwrap())
-                .unwrap();
+        let state: Value = serde_json::from_str(
+            &fs::read_to_string(task_dir.join("state.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(state["protocol_version"], json!("1"));
         assert_eq!(state["task_id"], json!("demo"));
         assert_eq!(state["repo_root"], json!(expected_repo_root));
@@ -3114,7 +3314,9 @@ mod tests {
         assert!(state["created_at"].as_str().unwrap().ends_with('Z'));
         assert!(state["updated_at"].as_str().unwrap().ends_with('Z'));
 
-        let events_text = fs::read_to_string(task_dir.join("events.jsonl")).await.unwrap();
+        let events_text = fs::read_to_string(task_dir.join("events.jsonl"))
+            .await
+            .unwrap();
         let event: Value = serde_json::from_str(events_text.trim()).unwrap();
         assert_eq!(event["payload"]["task_id"], json!("demo"));
         assert_eq!(event["seq"], json!(1));
@@ -3170,7 +3372,9 @@ mod tests {
             .join("tasks")
             .join("demo");
         let settings: Value = serde_json::from_str(
-            &fs::read_to_string(task_dir.join("settings.json")).await.unwrap(),
+            &fs::read_to_string(task_dir.join("settings.json"))
+                .await
+                .unwrap(),
         )
         .unwrap();
         assert_eq!(
@@ -3272,7 +3476,9 @@ mod tests {
             .await
             .unwrap();
 
-        let text = fs::read_to_string(task_dir.join("transcript.jsonl")).await.unwrap();
+        let text = fs::read_to_string(task_dir.join("transcript.jsonl"))
+            .await
+            .unwrap();
         let lines: Vec<&str> = text.trim_end().split('\n').collect();
         assert_eq!(lines.len(), 3);
         let pattern1 = regex::Regex::new(
@@ -3286,9 +3492,12 @@ mod tests {
         .unwrap();
         assert!(pattern2.is_match(lines[2]), "line 2: {}", lines[2]);
 
-        let state: Value =
-            serde_json::from_str(&fs::read_to_string(task_dir.join("state.json")).await.unwrap())
-                .unwrap();
+        let state: Value = serde_json::from_str(
+            &fs::read_to_string(task_dir.join("state.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(state["transcript_seq"], json!(2));
     }
 
@@ -3304,7 +3513,9 @@ mod tests {
             .join(WORKSPACE_KEY)
             .join("tasks")
             .join("demo");
-        fs::create_dir_all(task_dir.join("artifacts")).await.unwrap();
+        fs::create_dir_all(task_dir.join("artifacts"))
+            .await
+            .unwrap();
         write_file(
             &task_dir.join("settings.json"),
             &json!({
@@ -3372,7 +3583,9 @@ mod tests {
     }
 
     fn ts_ms(text: &str) -> i64 {
-        DateTime::parse_from_rfc3339(text).unwrap().timestamp_millis()
+        DateTime::parse_from_rfc3339(text)
+            .unwrap()
+            .timestamp_millis()
     }
 
     #[tokio::test]
@@ -3589,7 +3802,13 @@ mod tests {
 
         let store = store(&root);
         let summary = store
-            .get_round_events("demo", "run_cursor_1", CURSOR_WORKSPACE_KEY, Some("cursor"), None)
+            .get_round_events(
+                "demo",
+                "run_cursor_1",
+                CURSOR_WORKSPACE_KEY,
+                Some("cursor"),
+                None,
+            )
             .await
             .expect("round summary");
 
@@ -3692,12 +3911,7 @@ mod tests {
         task_dir
     }
 
-    async fn write_agy_run(
-        task_dir: &Path,
-        run_id: &str,
-        duration_seconds: f64,
-        usage: Value,
-    ) {
+    async fn write_agy_run(task_dir: &Path, run_id: &str, duration_seconds: f64, usage: Value) {
         let events = [
             json!({
                 "event": "init",
@@ -3741,7 +3955,13 @@ mod tests {
 
         let store = BuddyStore::new(root.path());
         let summary = store
-            .get_round_events("demo", "run_agy_1", AGY_DURATION_WORKSPACE_KEY, Some("agy"), None)
+            .get_round_events(
+                "demo",
+                "run_agy_1",
+                AGY_DURATION_WORKSPACE_KEY,
+                Some("agy"),
+                None,
+            )
             .await
             .expect("round events");
 

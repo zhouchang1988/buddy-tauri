@@ -120,6 +120,7 @@ struct TaskSettingsWire {
     seed_agy_session_id: Option<String>,
     seed_opencode_session_id: Option<String>,
     seed_kimi_session_id: Option<String>,
+    seed_dsh_session_id: Option<String>,
     seed_wecode_claude_session_id: Option<String>,
     seed_wecode_codex_thread_id: Option<String>,
     seed_wecode_opencode_session_id: Option<String>,
@@ -146,6 +147,7 @@ pub fn parse_task_settings(input: &serde_json::Value) -> Result<TaskSettings, Sc
         seed_agy_session_id: wire.seed_agy_session_id,
         seed_opencode_session_id: wire.seed_opencode_session_id,
         seed_kimi_session_id: wire.seed_kimi_session_id,
+        seed_dsh_session_id: wire.seed_dsh_session_id,
         seed_wecode_claude_session_id: wire.seed_wecode_claude_session_id,
         seed_wecode_codex_thread_id: wire.seed_wecode_codex_thread_id,
         seed_wecode_opencode_session_id: wire.seed_wecode_opencode_session_id,
@@ -156,6 +158,8 @@ pub fn parse_task_settings(input: &serde_json::Value) -> Result<TaskSettings, Sc
 /// before converting into the shared `GlobalSettings` type.
 #[derive(Debug, Deserialize)]
 struct GlobalSettingsWire {
+    #[serde(default)]
+    agent_management: HashMap<String, crate::buddy::agents::AgentConfiguration>,
     #[serde(default = "default_protocol_version")]
     protocol_version: String,
     #[serde(default = "default_countdown_seconds")]
@@ -172,6 +176,7 @@ struct GlobalSettingsWire {
     seed_agy_session_id: Option<String>,
     seed_opencode_session_id: Option<String>,
     seed_kimi_session_id: Option<String>,
+    seed_dsh_session_id: Option<String>,
     seed_wecode_claude_session_id: Option<String>,
     seed_wecode_codex_thread_id: Option<String>,
     seed_wecode_opencode_session_id: Option<String>,
@@ -214,6 +219,7 @@ pub fn parse_global_settings(input: &serde_json::Value) -> Result<GlobalSettings
             .filter(|p| !p.is_empty())
     }
     Ok(GlobalSettings {
+        agent_management: Some(wire.agent_management),
         protocol_version: Some(wire.protocol_version),
         countdown_seconds: Some(wire.countdown_seconds),
         max_rounds: Some(wire.max_rounds),
@@ -230,6 +236,7 @@ pub fn parse_global_settings(input: &serde_json::Value) -> Result<GlobalSettings
         seed_agy_session_id: wire.seed_agy_session_id,
         seed_opencode_session_id: wire.seed_opencode_session_id,
         seed_kimi_session_id: wire.seed_kimi_session_id,
+        seed_dsh_session_id: wire.seed_dsh_session_id,
         seed_wecode_claude_session_id: wire.seed_wecode_claude_session_id,
         seed_wecode_codex_thread_id: wire.seed_wecode_codex_thread_id,
         seed_wecode_opencode_session_id: wire.seed_wecode_opencode_session_id,

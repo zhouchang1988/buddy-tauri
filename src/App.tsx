@@ -1,3 +1,7 @@
+import { useAgentInventory, useAgentUpdatesController } from './hooks/useAgentUpdates'
+import { AgentUpdateIndicator, AgentUpdateNotice } from './components/settings/AgentUpdateStatus'
+import { modelMemoryKey, readModelMemory } from './lib/agent-memory'
+import { useQuery, useQueries } from '@tanstack/react-query'
 import { useState, useCallback, useEffect, useMemo, useRef } from 'react'
 import { ChevronDown, FolderOpen, GitBranch, X, Image as ImageIcon, File as FileIcon } from 'lucide-react'
 import { useHealthCheck, useBootstrap, useTasks, useTaskDetail, useCreateTask, useSendMessage, useStartTask, useInterrupt, useDeleteTask, useEnqueueInstruction, useDequeueInstruction, useClearInstructionQueue, useInterruptAndInsert, useGitStatus } from './hooks/useBuddy'
@@ -19,13 +23,14 @@ import { SettingsContent, SettingsTab } from './components/SettingsContent'
 import { Switch } from './components/Switch'
 import { UpdateNotification } from './components/UpdateNotification'
 import { useUpdater } from './hooks/useUpdater'
-import { ACTOR_LABEL_KEY, Actor } from './lib/format'
+import { ACTOR_LABEL_KEY, Actor, modelOptionLabel } from './lib/format'
 import { isTaskReadyToStart, isTaskQueued, queuedPosition } from './lib/taskState'
 import type { Task } from './shared/types'
 import { readStringArraySetting, visibleTasksForShortcuts, markTaskAsRead, readLastSelectedTask, saveLastSelectedTask, clearLastSelectedTask, readTaskNames, writeTaskNames } from './lib/taskList'
-import type { GlobalSettings, InstructionQueueItem, Attachment, AttachmentMeta, Launcher, AcpModelInfo } from './shared/types'
+import type { GlobalSettings, InstructionQueueItem, Attachment, AttachmentMeta, Launcher } from './shared/types'
 import { IMAGE_EXTS, MIME_MAP, EXT_ICON_MAP, isImageAttachment, generateAttachmentId, ensureMimeType } from './lib/attachments'
-import { DEFAULT_LAUNCHER_ORDER, defaultLauncherFor, normalizeGlobalSettings, normalizeLauncher } from './shared/defaults'
+import { DEFAULT_LAUNCHER_ORDER, normalizeGlobalSettings, normalizeLauncher } from './shared/defaults'
+import { selectableAgentIds, resolveEffectiveAgentLaunch } from './shared/agents'
 import { TASK_ID_MAX_CODE_POINTS, validateTaskId } from './shared/task-id'
 
 export default function App() {
@@ -55,6 +60,17 @@ export default function App() {
 
   useTheme()
   const updater = useUpdater()
+  const [agentUpdateScroll,setAgentUpdateScroll]=useState(0)
+  const openAgentUpdates=()=>{setView('settings');setSettingsTab('agents');setAgentUpdateScroll(n=>n+1)}
+  const agentUpdates=useAgentUpdatesController(openAgentUpdates)
+  const indicatedAgentBatch=agentUpdates.data?.activeBatch || (agentUpdates.data?.lastCompletedBatch?.items.some(item=>['failed','interrupted'].includes(item.status))?agentUpdates.data.lastCompletedBatch:undefined)
+
+  useEffect(()=>{
+    if(agentUpdateScroll && view==='settings' && settingsTab==='agents') {
+      const frame=requestAnimationFrame(()=>document.querySelector('#agent-active-updates, #agent-last-update')?.scrollIntoView({block:'nearest'}))
+      return ()=>cancelAnimationFrame(frame)
+    }
+  },[agentUpdateScroll,view,settingsTab])
 
   useEffect(() => {
     window.api.isFullScreen().then(setIsFullScreen).catch(() => {})
@@ -673,6 +689,7 @@ export default function App() {
       <div className="flex-1 flex flex-col min-w-0 border-l border-border rounded-tl-xl rounded-bl-xl bg-bg-elevated overflow-hidden">
         {/* 标题栏 */}
         <TitleBar
+          agentStatus={indicatedAgentBatch ? <AgentUpdateIndicator batch={indicatedAgentBatch} onOpen={openAgentUpdates}/> : undefined}
           taskName={taskDetail?.task_id ?? ''}
           taskStatus={taskDetail?.state?.status ?? null}
           isSidebarOpen={isSidebarOpen}
@@ -687,6 +704,9 @@ export default function App() {
           onRetry={() => handleStartTask()}
           onResume={() => handleStartTask()}
         />
+
+        {view==='chat'&&startTask.isPending&&agentUpdates.data?.activeBatch&&!taskStatus?.startsWith('RUNNING')&&taskStatus!=='PINGING'&&<div role="status" className="agent-update-notice">{t('agents.waitingForUpdates')}</div>}
+        {agentUpdates.notice&&<AgentUpdateNotice batch={agentUpdates.notice} onOpen={()=>{openAgentUpdates();agentUpdates.dismiss()}} onDismiss={agentUpdates.dismiss}/>}
 
         {/* 主内容区 */}
         <div className="flex-1 flex overflow-hidden">
@@ -822,12 +842,12 @@ export function CreateTaskModal({
   const [implementerSession, setImplementerSession] = useState('')
   const [reviewerSession, setReviewerSession] = useState('')
   const [implementerModel, setImplementerModel] = useState(() => {
-    try { return localStorage.getItem('buddy.lastImplementerModel') || '' } catch { return '' }
+    try { return readModelMemory('implementer', implementer, globalSettings || {}) } catch { return '' }
   })
   const [reviewerModel, setReviewerModel] = useState(() => {
-    try { return localStorage.getItem('buddy.lastReviewerModel') || '' } catch { return '' }
+    try { return readModelMemory('reviewer', reviewer, globalSettings || {}) } catch { return '' }
   })
-  const [acpModelState, setAcpModelState] = useState<Record<string, { loading: boolean; models: AcpModelInfo[] }>>({})
+  const [showAdvancedOptions, setShowAdvancedOptions] = useState(false)
   const [executionMode, setExecutionMode] = useState<'immediate' | 'queued'>('immediate')
   const [showBranchModal, setShowBranchModal] = useState(false)
 
@@ -913,61 +933,42 @@ export function CreateTaskModal({
   })
   const fileAttachments = attachments.filter(a => !imageAttachments.includes(a))
 
+  const {data:agentInventory} = useAgentInventory()
+  const localAgents=agentInventory?.agents
   const normalizedGlobalSettings = normalizeGlobalSettings(globalSettings)
+  const availableActors = localAgents ? selectableAgentIds(localAgents) : typeof window.buddy?.listLocalAgents === 'function' ? [] : [...DEFAULT_LAUNCHER_ORDER]
+  const actorName = (id:string) => ACTOR_LABEL_KEY[id] ? t(ACTOR_LABEL_KEY[id]) : localAgents?.find(a=>a.id===id)?.name || id
 
-  // Detect each actor's currently configured model so the dropdowns can show
-  // it beside the agent name (e.g. "Codex (gpt-5.6-luna)"). Refetch when the
-  // launcher commands change, since the model may be derived from the command.
-  const launcherCommandsKey = DEFAULT_LAUNCHER_ORDER
-    .map(a => normalizedGlobalSettings.launchers?.[a]?.command ?? '')
-    .join('|')
-  const [actorModels, setActorModels] = useState<Record<string, string | undefined>>({})
-  useEffect(() => {
-    let cancelled = false
-    window.buddy?.detectActorModels()
-      .then(models => { if (!cancelled) setActorModels(models ?? {}) })
-      .catch(() => { /* model is best-effort annotation; ignore failures */ })
-    return () => { cancelled = true }
-  }, [launcherCommandsKey])
-
-  const actorLabel = (a: Actor): string => {
-    const name = t(ACTOR_LABEL_KEY[a])
-    if (normalizeLauncher(a, normalizedGlobalSettings.launchers?.[a]).protocol === 'acp') return name
-    const model = actorModels[a]
-    return model ? `${name} (${model})` : name
-  }
-
-  const isAcpActor = (a: Actor): boolean =>
-    normalizeLauncher(a, normalizedGlobalSettings.launchers?.[a]).protocol === 'acp'
-
-  const acpActorsKey = [implementer, reviewer].filter(isAcpActor).join('|')
-  useEffect(() => {
-    const actors = [implementer, reviewer].filter((actor, index, all) => isAcpActor(actor) && all.indexOf(actor) === index)
-    if (actors.length === 0) return
-    let cancelled = false
-    for (const actor of actors) {
-      setAcpModelState(prev => ({ ...prev, [actor]: { loading: true, models: prev[actor]?.models ?? [] } }))
-      window.buddy?.listAcpModels(actor)
-        .then(list => {
-          if (cancelled) return
-          const models = list?.models ?? []
-          setAcpModelState(prev => ({ ...prev, [actor]: { loading: false, models } }))
-          const pick = (current: string): string => {
-            if (current && models.some(model => model.id === current)) return current
-            if (list?.currentModelId && models.some(model => model.id === list.currentModelId)) return list.currentModelId
-            return models[0]?.id ?? ''
-          }
-          if (actor === implementer) setImplementerModel(pick)
-          if (actor === reviewer) setReviewerModel(pick)
-        })
-        .catch(() => {
-          if (!cancelled) {
-            setAcpModelState(prev => ({ ...prev, [actor]: { loading: false, models: [] } }))
-          }
-        })
+  const effectiveLaunchFor = (a: Actor) => resolveEffectiveAgentLaunch(
+    localAgents?.find(agent => agent.id === a),
+    {
+      agentConfig: globalSettings?.agent_management?.[a],
+      savedLauncher: globalSettings?.launchers?.[a]
     }
-    return () => { cancelled = true }
-  }, [acpActorsKey])
+  )
+  const isAcpActor = (a: Actor): boolean => effectiveLaunchFor(a).protocol === 'acp'
+
+  // Both protocols use the same picker. Key requests by launcher context so
+  // switching agents or protocols cannot display another launcher's models.
+  const selectedActors = [...new Set([implementer, reviewer])]
+  const actorModelLists = useQueries({
+    queries: selectedActors.map(actor => {
+      const agent = localAgents?.find(a => a.id === actor)
+      const { protocol, launcher } = effectiveLaunchFor(actor)
+      const listModels = protocol === 'acp' ? window.buddy?.listAcpModels : window.buddy?.listCliModels
+      return {
+        queryKey: ['taskActorModels', actor, protocol, launcher?.command, launcher?.args, launcher?.env, agent?.installationId, agent?.version],
+        queryFn: () => listModels!(actor),
+        enabled: !!listModels && availableActors.includes(actor),
+        retry: false,
+        staleTime: 300000,
+        // Keep expired catalogs around so remounts can show the last list
+        // while a background refetch replaces it.
+        gcTime: 30 * 60 * 1000
+      }
+    })
+  })
+  const modelsFor = (actor: Actor) => actorModelLists[selectedActors.indexOf(actor)]
 
   // Debounced git branch query — avoids firing on every keystroke in the path input
   const [debouncedRepoRoot, setDebouncedRepoRoot] = useState(repoRoot.trim())
@@ -997,7 +998,11 @@ export function CreateTaskModal({
     ? t('modal.create.taskNameError')
     : null
   const sameActorError = implementer === reviewer
-  const canSubmit = taskIdValidation.reason === null && !sameActorError
+  const modelValid = (actor: Actor, value: string) => {
+    const models = modelsFor(actor).data?.models ?? []
+    return !isAcpActor(actor) || !value || value === '__native__' || models.length === 0 || models.some(m => m.id === value)
+  }
+  const canSubmit = taskIdValidation.reason === null && !sameActorError && availableActors.includes(implementer) && availableActors.includes(reviewer) && modelValid(implementer,implementerModel) && modelValid(reviewer,reviewerModel)
 
   const seedFor = (actor: Actor, session: string): Record<string, string> => {
     const value = session.trim()
@@ -1010,19 +1015,21 @@ export function CreateTaskModal({
   const handleSubmit = () => {
     if (!canSubmit) return
     try {
+      localStorage.setItem(modelMemoryKey('implementer',implementer,globalSettings || {}),implementerModel || '__native__')
+      localStorage.setItem(modelMemoryKey('reviewer',reviewer,globalSettings || {}),reviewerModel || '__native__')
       localStorage.setItem('buddy.lastImplementer', implementer)
       localStorage.setItem('buddy.lastReviewer', reviewer)
       localStorage.setItem('buddy.lastImplementerModel', implementerModel)
       localStorage.setItem('buddy.lastReviewerModel', reviewerModel)
     } catch {}
-    const launchers = normalizedGlobalSettings.launchers ?? {}
     const launcherFor = (actor: Actor): Launcher => {
-      const launcher = normalizeLauncher(actor, launchers[actor])
+      const { protocol, launcher: resolved } = effectiveLaunchFor(actor)
+      const launcher = normalizeLauncher(actor, resolved ? { ...resolved, protocol } : { protocol })
       const selected = actor === implementer ? implementerModel : actor === reviewer ? reviewerModel : ''
-      if (launcher.protocol === 'acp' && selected) {
+      if (selected && selected !== '__native__') {
         return { ...launcher, model: selected }
       }
-      return launcher
+      return selected === '__native__' ? {...launcher,model:undefined} : launcher
     }
     const settings: Record<string, unknown> = {
       protocol_version: normalizedGlobalSettings.protocol_version ?? '1',
@@ -1030,8 +1037,9 @@ export function CreateTaskModal({
       role_mode: implementer === 'codex' || implementer === 'wecode_codex' ? 'codex_implements' : 'claude_implements',
       implementer_actor: implementer,
       reviewer_actor: reviewer,
+      seed_actor_sessions: Object.fromEntries([[implementer,implementerSession.trim()],[reviewer,reviewerSession.trim()]].filter(([,value])=>!!value)),
       max_consecutive_failures: normalizedGlobalSettings.max_consecutive_failures ?? 10,
-      launchers: Object.fromEntries(DEFAULT_LAUNCHER_ORDER.map(a => [a, launcherFor(a as Actor)])),
+      launchers: Object.fromEntries(availableActors.map(a => [a, launcherFor(a as Actor)])),
       ...seedFor(implementer, implementerSession),
       ...seedFor(reviewer, reviewerSession)
     }
@@ -1047,25 +1055,32 @@ export function CreateTaskModal({
     }
   }
 
-  const actorOptions: Actor[] = [...DEFAULT_LAUNCHER_ORDER] as Actor[]
+  const actorOptions: Actor[] = [...new Set([...availableActors,implementer,reviewer])]
   const standardActors: Actor[] = actorOptions.filter(a => !a.startsWith('wecode_'))
   const internalActors: Actor[] = actorOptions.filter(a => a.startsWith('wecode_'))
 
-  const actorSelect = (value: Actor, onChange: (actor: Actor) => void) => (
+  const actorSelect = (value: Actor, onChange: (actor: Actor) => void, role: 'implementer' | 'reviewer') => (
     <div className="relative min-w-0 flex-1">
       <select
+        aria-label={`${t(`modal.create.${role}`)} ${t('modal.create.agent')}`}
         value={value}
-        onChange={(e) => onChange(e.target.value as Actor)}
+        onChange={(e) => {
+          const actor = e.target.value
+          const remembered = readModelMemory(role, actor, globalSettings || {})
+          if (role === 'implementer') setImplementerModel(remembered)
+          else setReviewerModel(remembered)
+          onChange(actor)
+        }}
         className="w-full appearance-none pl-3 pr-7 py-1.5 border border-border rounded-lg focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent bg-bg text-xs"
       >
         <optgroup label={t('modal.create.standardAgents')}>
           {standardActors.map(a => (
-            <option key={a} value={a}>{actorLabel(a)}</option>
+            <option key={a} value={a} disabled={!availableActors.includes(a)}>{actorName(a)}</option>
           ))}
         </optgroup>
         <optgroup label={t('modal.create.internalAgents')}>
           {internalActors.map(a => (
-            <option key={a} value={a}>{actorLabel(a)}</option>
+            <option key={a} value={a} disabled={!availableActors.includes(a)}>{actorName(a)}</option>
           ))}
         </optgroup>
       </select>
@@ -1077,26 +1092,40 @@ export function CreateTaskModal({
   )
 
   const modelSelect = (actor: Actor, value: string, onChange: (model: string) => void, roleLabel: string) => {
-    if (!isAcpActor(actor)) return null
-    const state = acpModelState[actor]
-    const loading = state?.loading ?? true
-    const models = state?.models ?? []
+    const state = modelsFor(actor)
+    const models = state.data?.models ?? []
+    // Only flash loading when we have nothing to show yet; background
+    // revalidation keeps the previous catalog visible.
+    const loading = state.isLoading && models.length === 0
+    const unavailable = !modelValid(actor, value)
     return (
       <div className="relative min-w-0 flex-1">
         <select
           aria-label={`${roleLabel} ${t('modal.create.model')}`}
-          value={loading ? '' : value}
-          disabled={loading || models.length === 0}
+          value={value || '__native__'}
+          disabled={!availableActors.includes(actor)}
+          aria-busy={state.isFetching}
+          aria-invalid={unavailable || undefined}
           onChange={(e) => onChange(e.target.value)}
           className="w-full appearance-none pl-3 pr-7 py-1.5 border border-border rounded-lg focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent bg-bg text-xs disabled:opacity-60"
         >
-          {loading && <option value="">{t('common.loading')}</option>}
-          {!loading && models.length === 0 && (
-            <option value="">{t('modal.create.modelUnavailable')}</option>
+          <option value="__native__">{t('agents.native')}</option>
+          {value && value !== '__native__' && !models.some(m => m.id === value) && (
+            <option value={value} disabled={unavailable}>
+              {unavailable
+                ? `${modelOptionLabel(value, models, { nativeLabel: t('agents.native') })} (${t('modal.create.modelUnavailable')})`
+                : modelOptionLabel(value, models, { nativeLabel: t('agents.native') })}
+            </option>
           )}
           {models.map(model => (
             <option key={model.id} value={model.id}>{model.name}</option>
           ))}
+          {loading && <option disabled>{t('common.loading')}</option>}
+          {!loading && models.length === 0 && (state.error || state.data?.error) ? (
+            <option disabled>{t('modal.create.modelLoadFailed')}</option>
+          ) : !loading && models.length === 0 ? (
+            <option disabled>{t('modal.create.modelUnavailable')}</option>
+          ) : null}
         </select>
         <ChevronDown
           size={14}
@@ -1279,46 +1308,60 @@ export function CreateTaskModal({
             <div>
               <label className="block text-xs font-medium text-fg-secondary mb-1">{t('modal.create.implementer')}</label>
               <div className="flex gap-2">
-                {actorSelect(implementer, setImplementer)}
+                {actorSelect(implementer, setImplementer, 'implementer')}
                 {modelSelect(implementer, implementerModel, setImplementerModel, t('modal.create.implementer'))}
               </div>
             </div>
             <div>
               <label className="block text-xs font-medium text-fg-secondary mb-1">{t('modal.create.reviewer')}</label>
               <div className="flex gap-2">
-                {actorSelect(reviewer, setReviewer)}
+                {actorSelect(reviewer, setReviewer, 'reviewer')}
                 {modelSelect(reviewer, reviewerModel, setReviewerModel, t('modal.create.reviewer'))}
               </div>
-            </div>
-          </div>
-
-          {/* 会话 ID */}
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="block text-xs font-medium text-fg-secondary mb-1">{t('modal.create.implementerSession')}</label>
-              <input
-                type="text"
-                value={implementerSession}
-                onChange={(e) => setImplementerSession(e.target.value)}
-                placeholder={t('modal.create.sessionPlaceholder')}
-                className="w-full px-3 py-1.5 border border-border rounded-lg focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent bg-bg font-mono text-xs"
-              />
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-fg-secondary mb-1">{t('modal.create.reviewerSession')}</label>
-              <input
-                type="text"
-                value={reviewerSession}
-                onChange={(e) => setReviewerSession(e.target.value)}
-                placeholder={t('modal.create.sessionPlaceholder')}
-                className="w-full px-3 py-1.5 border border-border rounded-lg focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent bg-bg font-mono text-xs"
-              />
             </div>
           </div>
 
           {sameActorError && (
             <div className="text-xs text-danger">{t('modal.create.sameActorError')}</div>
           )}
+
+          {/* 高级选项：会话 ID */}
+          <div>
+            <button
+              type="button"
+              aria-expanded={showAdvancedOptions}
+              aria-controls="create-task-advanced-options"
+              onClick={() => setShowAdvancedOptions(open => !open)}
+              className="flex items-center gap-1.5 text-xs text-fg-secondary hover:text-fg rounded focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent"
+            >
+              <ChevronDown size={14} className={`transition-transform ${showAdvancedOptions ? '' : '-rotate-90'}`} />
+              {t('modal.create.advancedOptions')}
+            </button>
+            <div id="create-task-advanced-options" hidden={!showAdvancedOptions} className={showAdvancedOptions ? 'grid grid-cols-2 gap-4 mt-3' : 'hidden'}>
+              <div>
+                <label htmlFor="create-task-implementer-session" className="block text-xs font-medium text-fg-secondary mb-1">{t('modal.create.implementerSession')}</label>
+                <input
+                  id="create-task-implementer-session"
+                  type="text"
+                  value={implementerSession}
+                  onChange={(e) => setImplementerSession(e.target.value)}
+                  placeholder={t('modal.create.sessionPlaceholder')}
+                  className="w-full px-3 py-1.5 border border-border rounded-lg focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent bg-bg font-mono text-xs"
+                />
+              </div>
+              <div>
+                <label htmlFor="create-task-reviewer-session" className="block text-xs font-medium text-fg-secondary mb-1">{t('modal.create.reviewerSession')}</label>
+                <input
+                  id="create-task-reviewer-session"
+                  type="text"
+                  value={reviewerSession}
+                  onChange={(e) => setReviewerSession(e.target.value)}
+                  placeholder={t('modal.create.sessionPlaceholder')}
+                  className="w-full px-3 py-1.5 border border-border rounded-lg focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent bg-bg font-mono text-xs"
+                />
+              </div>
+            </div>
+          </div>
         </div>
 
         {/* 底部 */}

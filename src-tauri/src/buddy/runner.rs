@@ -27,7 +27,7 @@ use crate::buddy::events::BuddyEventBus;
 use crate::buddy::launchers::{
     build_launcher_command, command_kind_for, kind_needs_pty, launcher_timeout_message,
     parser_actor_for_kind, run_launcher, run_launcher_with_pty, LauncherCommand,
-    LauncherCommandKind, LauncherCommandInput, LauncherError, LauncherRunResult, PtyRunInput,
+    LauncherCommandInput, LauncherCommandKind, LauncherError, LauncherRunResult, PtyRunInput,
     RunLauncherInput,
 };
 use crate::buddy::locks::{create_run_lock, remove_run_lock};
@@ -43,6 +43,7 @@ use crate::buddy::prompts::{
 use crate::buddy::queue_coordinator::QueueTaskRunner;
 use crate::buddy::store::{BuddyStore, EventInput, StoreError};
 use crate::buddy::task_services::TaskServiceManager;
+use crate::buddy::token_usage::normalize_token_usage;
 use crate::buddy::types::{
     ActiveRun, AttachmentMeta, BreakMarker, Countdown, CountdownInput, Event, Failure,
     GlobalSettings, HealthCheckResult, InstructionQueueItem, Launcher, SendMessageInput,
@@ -117,7 +118,6 @@ fn prepend_path(env: &mut HashMap<String, String>, dir: &Path) {
         format!("{}:{}", dir.to_string_lossy(), current),
     );
 }
-
 
 /// Canonical phrase used in both throw sites and the context-limit patterns.
 const CONTEXT_EXHAUSTED_PHRASE: &str = "context window exhausted";
@@ -656,6 +656,7 @@ impl BuddyRunner {
             "agy" => TaskStatus::RunningAgy,
             "opencode" => TaskStatus::RunningOpencode,
             "kimi" => TaskStatus::RunningKimi,
+            "dsh" => TaskStatus::RunningDsh,
             "wecode_claude" => TaskStatus::RunningWecodeClaude,
             "wecode_codex" => TaskStatus::RunningWecodeCodex,
             "wecode_opencode" => TaskStatus::RunningWecodeOpencode,
@@ -727,8 +728,7 @@ impl BuddyRunner {
 
         let run_id = new_run_id("run");
         let started_at = utc_now();
-        let session_id_before =
-            session_id_for_actor(&actor, &detail.state, Some(&detail.settings));
+        let session_id_before = session_id_for_actor(&actor, &detail.state, Some(&detail.settings));
 
         self.store
             .update_task_state(task_id, &workspace_key, |mut state| {
@@ -814,7 +814,10 @@ impl BuddyRunner {
         meta.insert("source".to_string(), Value::from("run_once"));
         if let Some(attachments) = &input.attachment_meta {
             if !attachments.is_empty() {
-                meta.insert("attachments".to_string(), serde_json::to_value(attachments)?);
+                meta.insert(
+                    "attachments".to_string(),
+                    serde_json::to_value(attachments)?,
+                );
             }
         }
         self.store
@@ -926,9 +929,7 @@ impl BuddyRunner {
             .ok_or_else(|| RunnerError::msg("workspace_key is required"))?;
         let detail = self.store.get_task_detail(task_id, &workspace_key).await?;
         if detail.state.status != TaskStatus::Countdown {
-            return Err(RunnerError::msg(format!(
-                "当前任务不在倒计时中：{task_id}"
-            )));
+            return Err(RunnerError::msg(format!("当前任务不在倒计时中：{task_id}")));
         }
         let actor = input
             .next_actor
@@ -1072,9 +1073,7 @@ impl BuddyRunner {
     pub async fn cancel_task(&self, task_id: &str, workspace_key: &str) -> Result<(), RunnerError> {
         let key = Self::run_controller_key(workspace_key, task_id);
         if self.cancelling.lock().contains(&key) {
-            return Err(RunnerError::msg(
-                "Task cancellation is already in progress",
-            ));
+            return Err(RunnerError::msg("Task cancellation is already in progress"));
         }
         self.cancelling.lock().insert(key.clone());
         let result: Result<(), RunnerError> = async {
@@ -1528,8 +1527,7 @@ impl BuddyRunner {
                 .unwrap_or(false);
 
         let protocol = base.protocol.clone().or_else(|| {
-            let global_is_acp =
-                global_launcher.and_then(|g| g.protocol.as_deref()) == Some("acp");
+            let global_is_acp = global_launcher.and_then(|g| g.protocol.as_deref()) == Some("acp");
             let same_command = global_launcher
                 .map(|g| g.command == base.command)
                 .unwrap_or(false);
@@ -1647,6 +1645,8 @@ impl BuddyRunner {
         let command = build_launcher_command(&LauncherCommandInput {
             actor: actor.to_string(),
             command: launcher.command.clone(),
+            args: launcher.args.clone(),
+            model: launcher.model.clone(),
             mode: Some("start".to_string()),
             prompt_file: prompt_file.to_string_lossy().to_string(),
             prompt_text: Some(prompt),
@@ -1683,14 +1683,11 @@ impl BuddyRunner {
 
         match result {
             Ok(result) => {
-                let raw_events =
-                    collect_raw_events(&event_file, &stdout_text, command.kind).await;
+                let raw_events = collect_raw_events(&event_file, &stdout_text, command.kind).await;
                 let output_text =
                     collect_output_text(actor, command.kind, &output_file, &stdout_text).await;
-                let parsed_lines = parse_actor_events(
-                    &parser_actor_for_kind(actor, command.kind),
-                    &raw_events,
-                );
+                let parsed_lines =
+                    parse_actor_events(&parser_actor_for_kind(actor, command.kind), &raw_events);
 
                 if result.timed_out {
                     return Ok(PingOutcome {
@@ -1749,8 +1746,7 @@ impl BuddyRunner {
             }
             Err(error) => {
                 let message = error.to_string();
-                let is_only_warning =
-                    !stderr_text.is_empty() && is_cli_warning_only(&stderr_text);
+                let is_only_warning = !stderr_text.is_empty() && is_cli_warning_only(&stderr_text);
                 let fallback = if !is_only_warning {
                     stderr_text.clone()
                 } else {
@@ -1759,7 +1755,11 @@ impl BuddyRunner {
                 Ok(PingOutcome {
                     success: false,
                     error: Some(truncate_chars(
-                        if message.is_empty() { &fallback } else { &message },
+                        if message.is_empty() {
+                            &fallback
+                        } else {
+                            &message
+                        },
                         300,
                     )),
                     stderr: stderr_text,
@@ -1815,7 +1815,13 @@ impl BuddyRunner {
         meta.insert("kind".to_string(), Value::from("health_check"));
         meta.insert("actors".to_string(), serde_json::to_value(&actors)?);
         self.store
-            .append_transcript(task_id, workspace_key, "system", "health_check.started", meta)
+            .append_transcript(
+                task_id,
+                workspace_key,
+                "system",
+                "health_check.started",
+                meta,
+            )
             .await?;
 
         let mut running_results = pending_results.clone();
@@ -1897,6 +1903,11 @@ impl BuddyRunner {
                     "kimi" => {
                         if let Some(sid) = &sid {
                             session_updates.push(("kimi_session_id", sid.clone()));
+                        }
+                    }
+                    "dsh" => {
+                        if let Some(sid) = &sid {
+                            session_updates.push(("dsh_session_id", sid.clone()));
                         }
                     }
                     "wecode_claude" => {
@@ -2014,7 +2025,13 @@ impl BuddyRunner {
             meta.insert("actors".to_string(), serde_json::to_value(&actors)?);
             meta.insert("session_ids".to_string(), Value::Array(session_ids));
             self.store
-                .append_transcript(task_id, workspace_key, "system", "health_check.passed", meta)
+                .append_transcript(
+                    task_id,
+                    workspace_key,
+                    "system",
+                    "health_check.passed",
+                    meta,
+                )
                 .await?;
 
             if self.execute_launchers {
@@ -2028,10 +2045,7 @@ impl BuddyRunner {
                     }),
                 ));
             }
-            return Ok((
-                format!("ping_ok_{}", Utc::now().timestamp_millis()),
-                None,
-            ));
+            return Ok((format!("ping_ok_{}", Utc::now().timestamp_millis()), None));
         }
 
         let failed_at = utc_now();
@@ -2109,7 +2123,13 @@ impl BuddyRunner {
             Value::from(failed_reason.clone().unwrap_or_default()),
         );
         self.store
-            .append_transcript(task_id, workspace_key, "system", "health_check.failed", meta)
+            .append_transcript(
+                task_id,
+                workspace_key,
+                "system",
+                "health_check.failed",
+                meta,
+            )
             .await?;
         if let Some(notifier) = &self.notifier {
             notifier
@@ -2206,9 +2226,7 @@ impl BuddyRunner {
                 task_text: detail.task_text.clone(),
                 context_text: detail.context_text.clone(),
                 transcript: detail.transcript.iter().map(TranscriptRow::from).collect(),
-                settings: Some(
-                    serde_json::to_value(&detail.settings).map_err(RunnerError::from)?,
-                ),
+                settings: Some(serde_json::to_value(&detail.settings).map_err(RunnerError::from)?),
                 state: Some(serde_json::to_value(&detail.state).map_err(RunnerError::from)?),
                 global_settings: Some(global_settings.clone()),
                 user_message: Some(user_message.to_string()),
@@ -2306,8 +2324,14 @@ impl BuddyRunner {
                         continue;
                     }
 
-                    self.mark_failed(task_id, workspace_key, actor, &failure_message, Some(run_id))
-                        .await?;
+                    self.mark_failed(
+                        task_id,
+                        workspace_key,
+                        actor,
+                        &failure_message,
+                        Some(run_id),
+                    )
+                    .await?;
                     return Err(error);
                 }
             }
@@ -2443,9 +2467,10 @@ impl BuddyRunner {
                 .and_then(|modes| modes.get("availableModes"))
                 .and_then(Value::as_array)
                 .and_then(|modes| {
-                    modes.iter().filter_map(|mode| mode.get("id").and_then(Value::as_str)).find(
-                        |id| *id == "bypassPermissions" || *id == "acceptEdits",
-                    )
+                    modes
+                        .iter()
+                        .filter_map(|mode| mode.get("id").and_then(Value::as_str))
+                        .find(|id| *id == "bypassPermissions" || *id == "acceptEdits")
                 })
                 .map(str::to_string);
             if let Some(mode) = auto_mode {
@@ -2495,6 +2520,25 @@ impl BuddyRunner {
                 )
                 .await
                 .map_err(acp_runner_error)?;
+            let final_usage = normalize_token_usage(
+                prompt_result
+                    .usage
+                    .as_ref()
+                    .map(|usage| Value::Object(usage.clone()))
+                    .as_ref(),
+            );
+            append_acp_event_line(
+                &event_file,
+                &serde_json::json!({
+                    "type": "acp.result",
+                    "usage": {
+                        "inputTokens": final_usage.input,
+                        "outputTokens": final_usage.output,
+                        "cachedReadTokens": final_usage.cache
+                    }
+                })
+                .to_string(),
+            );
             if is_acp_prompt_context_overflow(&prompt_result) {
                 return Err(RunnerError::msg(describe_acp_prompt_overflow(
                     &prompt_result,
@@ -2598,7 +2642,8 @@ impl BuddyRunner {
             Arc::new(move |thinking: String| {
                 append_acp_event_line(
                     &event_file,
-                    &serde_json::json!({ "type": "acp.thinking", "thinking": thinking }).to_string(),
+                    &serde_json::json!({ "type": "acp.thinking", "thinking": thinking })
+                        .to_string(),
                 );
                 publish(
                     &actor,
@@ -2614,17 +2659,38 @@ impl BuddyRunner {
             let actor = actor.to_string();
             let run_id = run_id.to_string();
             let event_file = event_file.clone();
-            Arc::new(move |_id: String, name: String, input: Map<String, Value>| {
-                append_acp_event_line(
+            Arc::new(
+                move |_id: String, name: String, input: Map<String, Value>| {
+                    append_acp_event_line(
                     &event_file,
                     &serde_json::json!({ "type": "acp.tool_use", "toolName": name, "toolInput": input })
                         .to_string(),
                 );
-                publish(
-                    &actor,
-                    &run_id,
-                    "actor.stdout",
-                    serde_json::json!({ "text": format!("🔧 {name}\n"), "stream": "line" }),
+                    publish(
+                        &actor,
+                        &run_id,
+                        "actor.stdout",
+                        serde_json::json!({ "text": format!("🔧 {name}\n"), "stream": "line" }),
+                    );
+                },
+            )
+        };
+
+        let on_usage = {
+            let event_file = event_file.clone();
+            Arc::new(move |usage: Map<String, Value>| {
+                let normalized = normalize_token_usage(Some(&Value::Object(usage)));
+                append_acp_event_line(
+                    &event_file,
+                    &serde_json::json!({
+                        "type": "acp.usage",
+                        "usage": {
+                            "inputTokens": normalized.input,
+                            "outputTokens": normalized.output,
+                            "cachedReadTokens": normalized.cache
+                        }
+                    })
+                    .to_string(),
                 );
             })
         };
@@ -2652,6 +2718,7 @@ impl BuddyRunner {
             on_content_delta: Some(on_content_delta),
             on_thinking_delta: Some(on_thinking_delta),
             on_tool_call: Some(on_tool_call),
+            on_usage: Some(on_usage),
             on_break: Some(on_break),
             ..Default::default()
         }
@@ -2705,8 +2772,12 @@ impl BuddyRunner {
             if !skip_auto_retry
                 && is_context_window_limit_error(&failure.message)
                 && compact_retries < max_compact_retries
-                && session_id_for_actor(actor, &failure.detail.state, Some(&failure.detail.settings))
-                    .is_some()
+                && session_id_for_actor(
+                    actor,
+                    &failure.detail.state,
+                    Some(&failure.detail.settings),
+                )
+                .is_some()
             {
                 self.store
                     .append_task_event(
@@ -2808,8 +2879,14 @@ impl BuddyRunner {
                 continue;
             }
 
-            self.mark_failed(task_id, workspace_key, actor, &failure.message, Some(run_id))
-                .await?;
+            self.mark_failed(
+                task_id,
+                workspace_key,
+                actor,
+                &failure.message,
+                Some(run_id),
+            )
+            .await?;
             return Err(RunnerError::msg(failure.message));
         }
     }
@@ -2863,7 +2940,8 @@ impl BuddyRunner {
             context_text: detail.context_text.clone(),
             transcript: detail.transcript.iter().map(TranscriptRow::from).collect(),
             settings: Some(
-                serde_json::to_value(&detail.settings).map_err(|e| AttemptError::Fatal(e.into()))?,
+                serde_json::to_value(&detail.settings)
+                    .map_err(|e| AttemptError::Fatal(e.into()))?,
             ),
             state: Some(
                 serde_json::to_value(&detail.state).map_err(|e| AttemptError::Fatal(e.into()))?,
@@ -2891,6 +2969,8 @@ impl BuddyRunner {
         let command = build_launcher_command(&LauncherCommandInput {
             actor: actor.to_string(),
             command: launcher.command.clone(),
+            args: launcher.args.clone(),
+            model: launcher.model.clone(),
             mode: Some(
                 if existing_session_id.is_some() {
                     "resume"
@@ -3241,8 +3321,7 @@ impl BuddyRunner {
                 // Prefer the actual error message over stderr; only use stderr
                 // as fallback and filter out known CLI warnings.
                 let message = error.to_string();
-                let is_only_warning =
-                    !stderr_text.is_empty() && is_cli_warning_only(&stderr_text);
+                let is_only_warning = !stderr_text.is_empty() && is_cli_warning_only(&stderr_text);
                 let failure_message = if !message.is_empty() {
                     message
                 } else if !is_only_warning {
@@ -3299,8 +3378,7 @@ impl BuddyRunner {
         // Cursor result counts as content even though it is not streamed as
         // text (TS: `l.rawType === 'result' && !l.noise`).
         let has_non_noise_content = parsed_lines.iter().any(|l| {
-            (l.text.is_some() && !l.noise)
-                || (l.raw_type.as_deref() == Some("result") && !l.noise)
+            (l.text.is_some() && !l.noise) || (l.raw_type.as_deref() == Some("result") && !l.noise)
         });
         let has_buddy_json_in_output = match &message {
             BuddyMessage::Message { text: message_text } => message_text != text,
@@ -3338,8 +3416,11 @@ impl BuddyRunner {
                 .map(|a| a != actor)
                 .unwrap_or(false);
         let break_pending = is_break && !break_confirmed;
-        let break_rejected =
-            !is_break && pending_break.as_ref().and_then(|p| p.actor.as_deref()).is_some();
+        let break_rejected = !is_break
+            && pending_break
+                .as_ref()
+                .and_then(|p| p.actor.as_deref())
+                .is_some();
         let has_queued_instructions = current_state
             .instruction_queue
             .as_deref()
@@ -3439,6 +3520,11 @@ impl BuddyRunner {
                     "kimi" => {
                         if let Some(sid) = &session_id {
                             state.kimi_session_id = Some(sid.clone());
+                        }
+                    }
+                    "dsh" => {
+                        if let Some(sid) = &session_id {
+                            state.dsh_session_id = Some(sid.clone());
                         }
                     }
                     "wecode_claude" => {
@@ -3716,7 +3802,10 @@ impl BuddyRunner {
                     task_id,
                     workspace_key,
                     "system",
-                    &format!("{} 已达到轮次上限，暂停等待确认。", actor_display_name(actor)),
+                    &format!(
+                        "{} 已达到轮次上限，暂停等待确认。",
+                        actor_display_name(actor)
+                    ),
                     meta,
                 )
                 .await?;
@@ -3798,9 +3887,10 @@ impl BuddyRunner {
             event_file: None,
         };
         let state_before = self.store.read_task_state(task_id, workspace_key).await?;
-        let other_actor_break = state_before.pending_break.clone().filter(|p| {
-            p.actor.as_deref().map(|a| a != actor).unwrap_or(false)
-        });
+        let other_actor_break = state_before
+            .pending_break
+            .clone()
+            .filter(|p| p.actor.as_deref().map(|a| a != actor).unwrap_or(false));
 
         if let Some(other_break) = other_actor_break {
             // The failed actor's round ends the task; stop its Buddy-owned
@@ -4033,6 +4123,7 @@ impl BuddyRunner {
                     "agy_session_id" => state.agy_session_id = None,
                     "opencode_session_id" => state.opencode_session_id = None,
                     "kimi_session_id" => state.kimi_session_id = None,
+                    "dsh_session_id" => state.dsh_session_id = None,
                     "wecode_claude_session_id" => state.wecode_claude_session_id = None,
                     "wecode_codex_thread_id" => state.wecode_codex_thread_id = None,
                     "wecode_opencode_session_id" => state.wecode_opencode_session_id = None,
@@ -4090,11 +4181,8 @@ impl BuddyRunner {
         cwd: &str,
         launcher: &Launcher,
     ) -> Result<Option<String>, RunnerError> {
-        let summarize_prompt = build_summarize_prompt(
-            &detail.task_text,
-            &detail.context_text,
-            &detail.transcript,
-        );
+        let summarize_prompt =
+            build_summarize_prompt(&detail.task_text, &detail.context_text, &detail.transcript);
 
         // Pre-check: skip LLM summarization when the prompt is still very
         // large after size limiting. Rough estimate: 1 token ≈ 4 chars for
@@ -4132,6 +4220,8 @@ impl BuddyRunner {
         let summarize_command = build_launcher_command(&LauncherCommandInput {
             actor: actor.to_string(),
             command: launcher.command.clone(),
+            args: launcher.args.clone(),
+            model: launcher.model.clone(),
             mode: Some("start".to_string()), // fresh session, no resume
             prompt_text: Some(summarize_prompt),
             prompt_file: summarize_prompt_file.to_string_lossy().to_string(),
@@ -4149,51 +4239,52 @@ impl BuddyRunner {
             merged_env.extend(command_env.clone());
         }
 
-        let result: Result<LauncherRunResult, RunnerError> = if kind_needs_pty(summarize_command.kind) {
-            if let Some(shim_dir) = ensure_osascript_shim_dir(&self.store.data_root).await {
-                prepend_path(&mut merged_env, &shim_dir);
-            }
-            let output_lines = output_lines.clone();
-            run_launcher_with_pty(
-                &PtyRunInput {
-                    command: summarize_command.command.clone(),
-                    args: summarize_command.args.clone(),
-                    cwd: cwd.to_string(),
-                    env: Some(merged_env),
-                    timeout_ms: 120_000,
-                    abort: None,
-                },
-                move |data| {
-                    for line in data
-                        .split('\n')
-                        .map(|l| l.strip_suffix('\r').unwrap_or(l))
-                        .filter(|l| !l.is_empty())
-                    {
-                        output_lines.lock().push(line.to_string());
-                    }
-                },
-            )
-            .await
-            .map_err(RunnerError::from)
-        } else {
-            let output_lines = output_lines.clone();
-            let stderr_lines = stderr_lines.clone();
-            run_launcher(
-                &RunLauncherInput {
-                    command: summarize_command.command.clone(),
-                    args: summarize_command.args.clone(),
-                    cwd: cwd.to_string(),
-                    env: Some(merged_env),
-                    stdin_text: summarize_command.stdin_text.clone(),
-                    timeout_ms: 120_000, // 2 minutes for summarization
-                    abort: None,
-                },
-                move |line| output_lines.lock().push(line),
-                move |line| stderr_lines.lock().push(line),
-            )
-            .await
-            .map_err(RunnerError::from)
-        };
+        let result: Result<LauncherRunResult, RunnerError> =
+            if kind_needs_pty(summarize_command.kind) {
+                if let Some(shim_dir) = ensure_osascript_shim_dir(&self.store.data_root).await {
+                    prepend_path(&mut merged_env, &shim_dir);
+                }
+                let output_lines = output_lines.clone();
+                run_launcher_with_pty(
+                    &PtyRunInput {
+                        command: summarize_command.command.clone(),
+                        args: summarize_command.args.clone(),
+                        cwd: cwd.to_string(),
+                        env: Some(merged_env),
+                        timeout_ms: 120_000,
+                        abort: None,
+                    },
+                    move |data| {
+                        for line in data
+                            .split('\n')
+                            .map(|l| l.strip_suffix('\r').unwrap_or(l))
+                            .filter(|l| !l.is_empty())
+                        {
+                            output_lines.lock().push(line.to_string());
+                        }
+                    },
+                )
+                .await
+                .map_err(RunnerError::from)
+            } else {
+                let output_lines = output_lines.clone();
+                let stderr_lines = stderr_lines.clone();
+                run_launcher(
+                    &RunLauncherInput {
+                        command: summarize_command.command.clone(),
+                        args: summarize_command.args.clone(),
+                        cwd: cwd.to_string(),
+                        env: Some(merged_env),
+                        stdin_text: summarize_command.stdin_text.clone(),
+                        timeout_ms: 120_000, // 2 minutes for summarization
+                        abort: None,
+                    },
+                    move |line| output_lines.lock().push(line),
+                    move |line| stderr_lines.lock().push(line),
+                )
+                .await
+                .map_err(RunnerError::from)
+            };
 
         match result {
             Ok(result) if result.exit_code == Some(0) => {
@@ -4298,7 +4389,10 @@ impl BuddyRunner {
             meta.insert("queue_item_id".to_string(), Value::from(item.id.clone()));
             if let Some(attachments) = &item.attachments {
                 if !attachments.is_empty() {
-                    meta.insert("attachments".to_string(), serde_json::to_value(attachments)?);
+                    meta.insert(
+                        "attachments".to_string(),
+                        serde_json::to_value(attachments)?,
+                    );
                 }
             }
             self.store
@@ -4447,6 +4541,7 @@ pub fn session_id_for_actor(
         "agy" => settings.and_then(|s| s.seed_agy_session_id.clone()),
         "opencode" => settings.and_then(|s| s.seed_opencode_session_id.clone()),
         "kimi" => settings.and_then(|s| s.seed_kimi_session_id.clone()),
+        "dsh" => settings.and_then(|s| s.seed_dsh_session_id.clone()),
         "wecode_claude" => settings.and_then(|s| s.seed_wecode_claude_session_id.clone()),
         "wecode_codex" => settings.and_then(|s| s.seed_wecode_codex_thread_id.clone()),
         "wecode_opencode" => settings.and_then(|s| s.seed_wecode_opencode_session_id.clone()),
@@ -4460,6 +4555,7 @@ pub fn session_id_for_actor(
         "agy" => state.agy_session_id.clone(),
         "opencode" => state.opencode_session_id.clone(),
         "kimi" => state.kimi_session_id.clone(),
+        "dsh" => state.dsh_session_id.clone(),
         "wecode_claude" => state.wecode_claude_session_id.clone(),
         "wecode_codex" => state.wecode_codex_thread_id.clone(),
         "wecode_opencode" => state.wecode_opencode_session_id.clone(),
@@ -4477,6 +4573,7 @@ fn session_field_for_actor(actor: &str) -> Option<&'static str> {
         "agy" => Some("agy_session_id"),
         "opencode" => Some("opencode_session_id"),
         "kimi" => Some("kimi_session_id"),
+        "dsh" => Some("dsh_session_id"),
         "wecode_claude" => Some("wecode_claude_session_id"),
         "wecode_codex" => Some("wecode_codex_thread_id"),
         "wecode_opencode" => Some("wecode_opencode_session_id"),
@@ -4492,6 +4589,7 @@ fn set_session_field(state: &mut TaskState, key: &str, value: String) {
         "agy_session_id" => state.agy_session_id = Some(value),
         "opencode_session_id" => state.opencode_session_id = Some(value),
         "kimi_session_id" => state.kimi_session_id = Some(value),
+        "dsh_session_id" => state.dsh_session_id = Some(value),
         "wecode_claude_session_id" => state.wecode_claude_session_id = Some(value),
         "wecode_codex_thread_id" => state.wecode_codex_thread_id = Some(value),
         "wecode_opencode_session_id" => state.wecode_opencode_session_id = Some(value),
@@ -4507,6 +4605,7 @@ fn normalize_actor_role(actor: &str) -> &'static str {
         "agy" => "agy",
         "opencode" => "opencode",
         "kimi" => "kimi",
+        "dsh" => "dsh",
         "wecode_claude" => "wecode_claude",
         "wecode_codex" => "wecode_codex",
         "wecode_opencode" => "wecode_opencode",
@@ -4584,10 +4683,12 @@ pub async fn collect_output_text(
     if matches!(
         kind,
         LauncherCommandKind::NativeClaude
+            | LauncherCommandKind::NativeCodebuddy
             | LauncherCommandKind::NativeCursor
             | LauncherCommandKind::NativeAgy
             | LauncherCommandKind::NativeOpencode
             | LauncherCommandKind::NativeKimi
+            | LauncherCommandKind::NativeDsh
     ) {
         let parser_actor = parser_actor_for_kind(actor, kind);
         let mut output = extract_actor_output(&parser_actor, stdout_text);
@@ -4606,9 +4707,7 @@ pub async fn collect_output_text(
                 if event.get("type").and_then(Value::as_str) == Some("tool_use") {
                     if let Some(part) = event.get("part").filter(|p| p.is_object()) {
                         if let Some(state) = part.get("state").filter(|s| s.is_object()) {
-                            if let Some(tool_output) =
-                                state.get("output").and_then(Value::as_str)
-                            {
+                            if let Some(tool_output) = state.get("output").and_then(Value::as_str) {
                                 let tool_message = parse_buddy_message(tool_output.trim());
                                 if matches!(tool_message, BuddyMessage::Break { .. }) {
                                     message = tool_message;
@@ -4616,6 +4715,22 @@ pub async fn collect_output_text(
                                 }
                             }
                         }
+                    }
+                }
+            }
+        }
+
+        if !matches!(message, BuddyMessage::Break { .. }) && kind == LauncherCommandKind::NativeDsh
+        {
+            for event in parse_jsonl_buffer(stdout_text) {
+                if event.get("type").and_then(Value::as_str) != Some("tool_result") {
+                    continue;
+                }
+                if let Some(tool_output) = event.get("result").and_then(Value::as_str) {
+                    let tool_message = parse_buddy_message(tool_output.trim());
+                    if matches!(tool_message, BuddyMessage::Break { .. }) {
+                        message = tool_message;
+                        break;
                     }
                 }
             }
@@ -4706,7 +4821,9 @@ fn build_summarize_prompt(
     // Include only the most recent transcript entries, with size limits.
     if !transcript.is_empty() {
         parts.push("## 对话记录".to_string());
-        let start = transcript.len().saturating_sub(SUMMARIZE_MAX_TRANSCRIPT_ENTRIES);
+        let start = transcript
+            .len()
+            .saturating_sub(SUMMARIZE_MAX_TRANSCRIPT_ENTRIES);
         for entry in &transcript[start..] {
             let role_label = match entry.role.as_str() {
                 "human" => "用户".to_string(),
@@ -4728,7 +4845,10 @@ fn build_summarize_prompt(
     }
 
     parts.push("## 输出要求".to_string());
-    parts.push("请输出一份精简的上下文摘要，包含：当前进展、关键发现、待解决问题。不要输出任何其他内容。".to_string());
+    parts.push(
+        "请输出一份精简的上下文摘要，包含：当前进展、关键发现、待解决问题。不要输出任何其他内容。"
+            .to_string(),
+    );
 
     let mut result = parts.join("\n");
 
@@ -4822,7 +4942,8 @@ fn get_json<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
     value.as_object().and_then(|obj| obj.get(key))
 }
 
-fn payload(value: Value) -> Map<String, Value> {    match value {
+fn payload(value: Value) -> Map<String, Value> {
+    match value {
         Value::Object(map) => map,
         _ => Map::new(),
     }
@@ -4832,7 +4953,6 @@ fn payload(value: Value) -> Map<String, Value> {    match value {
 fn truncate_chars(text: &str, max_chars: usize) -> String {
     text.chars().take(max_chars).collect()
 }
-
 
 // ---------------------------------------------------------------------------
 // Tests — port of the runner-related suites in `tests/unit/main/` of the
@@ -4902,8 +5022,7 @@ mod tests {
     }
 
     async fn patch_global_settings(store: &BuddyStore, patch: Value) {
-        let current =
-            serde_json::to_value(store.read_global_settings().await.unwrap()).unwrap();
+        let current = serde_json::to_value(store.read_global_settings().await.unwrap()).unwrap();
         let mut obj = current.as_object().unwrap().clone();
         for (key, value) in patch.as_object().unwrap() {
             obj.insert(key.clone(), value.clone());
@@ -5114,7 +5233,10 @@ printf '{"type":"break","content":"%s confirms done"}' "$BUDDY_ACTOR" > "$BUDDY_
             .iter()
             .find(|e| e.event_type == "round_window.reset")
             .expect("round_window.reset event");
-        assert_eq!(event.payload.get("previous_rounds_in_window"), Some(&json!(1)));
+        assert_eq!(
+            event.payload.get("previous_rounds_in_window"),
+            Some(&json!(1))
+        );
         assert_eq!(event.payload.get("max_rounds"), Some(&json!(1)));
     }
 
@@ -6041,8 +6163,14 @@ printf '%s\n' '{"type":"result","subtype":"success","session_id":"cursor-chat-12
             exit_error_message(None, None),
             "Actor exited unexpectedly (no exit code)"
         );
-        assert_eq!(exit_error_message(Some(1), None), "Actor exited with code 1");
-        assert_eq!(exit_error_message(Some(0), None), "Actor exited with code 0");
+        assert_eq!(
+            exit_error_message(Some(1), None),
+            "Actor exited with code 1"
+        );
+        assert_eq!(
+            exit_error_message(Some(0), None),
+            "Actor exited with code 0"
+        );
         assert_eq!(
             exit_error_message(None, Some("SIGKILL")),
             "Actor was killed by signal SIGKILL (possible timeout)"
@@ -6116,7 +6244,6 @@ printf '%s\n' '{"type":"result","subtype":"success","session_id":"cursor-chat-12
             env.get("PATH")
         );
     }
-
 
     // -----------------------------------------------------------------------
     // buddy-failure.test.ts
@@ -6490,7 +6617,8 @@ printf '%s\n' '{"type":"result","subtype":"success","session_id":"cursor-chat-12
 
     const UPGRADE_STDERR_ACTOR: &str = "#!/bin/sh\nprintf '%s\\n' 'A new version is available. Upgrade complete, restart required.' >&2\nexit 1\n";
     const UPGRADE_STDOUT_ACTOR: &str = "#!/bin/sh\nprintf '%s\\n' 'A new version is available. Upgrade complete, restart required.'\nexit 1\n";
-    const NORMAL_ERROR_ACTOR: &str = "#!/bin/sh\nprintf '%s\\n' 'Some random runtime error' >&2\nexit 1\n";
+    const NORMAL_ERROR_ACTOR: &str =
+        "#!/bin/sh\nprintf '%s\\n' 'Some random runtime error' >&2\nexit 1\n";
 
     async fn make_upgrade_task(
         root: &TempDir,
@@ -6555,7 +6683,10 @@ printf '%s\n' '{"type":"result","subtype":"success","session_id":"cursor-chat-12
             .filter(|e| e.event_type == "actor.upgrade_detected")
             .collect();
         assert!(!upgrade_events.is_empty());
-        assert_eq!(upgrade_events[0].payload.get("retry_attempt"), Some(&json!(1)));
+        assert_eq!(
+            upgrade_events[0].payload.get("retry_attempt"),
+            Some(&json!(1))
+        );
 
         let retry_transcript = detail
             .transcript
@@ -6742,7 +6873,10 @@ exit 0
             .filter(|e| e.event_type == "health_check.actor_upgrade_retry")
             .collect();
         assert!(!retry_events.is_empty());
-        assert_eq!(retry_events[0].payload.get("retry_attempt"), Some(&json!(1)));
+        assert_eq!(
+            retry_events[0].payload.get("retry_attempt"),
+            Some(&json!(1))
+        );
 
         let retry_transcript = detail
             .transcript
@@ -6871,14 +7005,18 @@ exit 0
         assert!(is_context_window_limit_error(
             "API Error: The model has reached its context window limit."
         ));
-        assert!(is_context_window_limit_error("Error: context length exceeded"));
+        assert!(is_context_window_limit_error(
+            "Error: context length exceeded"
+        ));
         assert!(is_context_window_limit_error(
             "This model maximum context length is 128000 tokens"
         ));
         assert!(is_context_window_limit_error("Token limit exceeded"));
         assert!(is_context_window_limit_error("too many tokens in request"));
         assert!(is_context_window_limit_error("Input exceeds token limit"));
-        assert!(is_context_window_limit_error("Request exceeded token limit"));
+        assert!(is_context_window_limit_error(
+            "Request exceeded token limit"
+        ));
         assert!(is_context_window_limit_error("Input too long for model"));
         assert!(is_context_window_limit_error("Request too large"));
         assert!(is_context_window_limit_error(
@@ -6914,7 +7052,9 @@ exit 0
     /// stopReason values.
     #[test]
     fn context_window_limit_error_detection_acp_variants() {
-        assert!(is_context_window_limit_error("ACP Error -32603: 超出上下文"));
+        assert!(is_context_window_limit_error(
+            "ACP Error -32603: 超出上下文"
+        ));
         assert!(is_context_window_limit_error(
             "ACP Error -32000: 对话内容太长，已超出当前模型的处理能力"
         ));
@@ -6924,15 +7064,21 @@ exit 0
         assert!(is_context_window_limit_error(
             "ACP Error -32603: {\"error\":{\"message\":\"超出上下文\"}}"
         ));
-        assert!(is_context_window_limit_error("ACP prompt stopReason max_tokens"));
+        assert!(is_context_window_limit_error(
+            "ACP prompt stopReason max_tokens"
+        ));
         assert!(is_context_window_limit_error(
             "ACP prompt stopReason context_length_exceeded"
         ));
         assert!(is_context_window_limit_error("max_tokens"));
         assert!(is_context_window_limit_error("context_overflow"));
-        assert!(!is_context_window_limit_error("ACP Error -32600: Invalid Request"));
+        assert!(!is_context_window_limit_error(
+            "ACP Error -32600: Invalid Request"
+        ));
         assert!(!is_context_window_limit_error("ACP Client closed"));
-        assert!(!is_context_window_limit_error("ACP prompt stopReason cancelled"));
+        assert!(!is_context_window_limit_error(
+            "ACP prompt stopReason cancelled"
+        ));
     }
 
     async fn make_context_limit_task(
@@ -6985,8 +7131,7 @@ exit 0
     #[tokio::test]
     async fn context_limit_detected_and_session_reset() {
         let root = TempDir::new().unwrap();
-        let (store, created) =
-            make_context_limit_task(&root, Some("test-session-123"), None).await;
+        let (store, created) = make_context_limit_task(&root, Some("test-session-123"), None).await;
         run_failing_claude(&store, &created.workspace_key).await;
 
         let detail = store
@@ -7124,16 +7269,13 @@ exit 0
             reset_event.payload.get("reason"),
             Some(&json!("context_window_limit"))
         );
-        assert!(detail
-            .transcript
-            .iter()
-            .any(|t| t
-                .meta
-                .as_ref()
-                .and_then(|m| m.get("kind"))
-                .map(|k| k == &json!("session_reset"))
-                .unwrap_or(false)
-                && t.content.contains("重置会话")));
+        assert!(detail.transcript.iter().any(|t| t
+            .meta
+            .as_ref()
+            .and_then(|m| m.get("kind"))
+            .map(|k| k == &json!("session_reset"))
+            .unwrap_or(false)
+            && t.content.contains("重置会话")));
         assert!(detail.state.claude_session_id.is_none());
     }
 
@@ -7260,7 +7402,10 @@ exit 0
     fn health_state(overrides: Value) -> TaskState {
         let mut value = json!({ "status": "READY", "round": 0, "next_actor": "claude" });
         for (key, val) in overrides.as_object().unwrap() {
-            value.as_object_mut().unwrap().insert(key.clone(), val.clone());
+            value
+                .as_object_mut()
+                .unwrap()
+                .insert(key.clone(), val.clone());
         }
         serde_json::from_value(value).unwrap()
     }
@@ -7273,7 +7418,10 @@ exit 0
             "launchers": {}
         });
         for (key, val) in overrides.as_object().unwrap() {
-            value.as_object_mut().unwrap().insert(key.clone(), val.clone());
+            value
+                .as_object_mut()
+                .unwrap()
+                .insert(key.clone(), val.clone());
         }
         serde_json::from_value(value).unwrap()
     }
@@ -7338,7 +7486,9 @@ exit 0
             "{\"type\":\"user\",\"message\":\"hello\"}\nUpgrade complete, restarting..."
         ));
         // Truncated NDJSON never proves an upgrade either.
-        assert!(!is_upgrade_exit_error("{\"type\":\"tool_call\",\"result\":\"new version"));
+        assert!(!is_upgrade_exit_error(
+            "{\"type\":\"tool_call\",\"result\":\"new version"
+        ));
         // Tightened Chinese pattern: bare 已更新 no longer matches, versioned
         // forms still do.
         assert!(!is_upgrade_exit_error("配置已更新，继续使用"));
@@ -7680,7 +7830,12 @@ exit 0
 
     /// Seed a Buddy-owned service for `demo` as if an earlier actor run had
     /// started it, then return the task to READY. Returns the service pid.
-    async fn seed_service(root: &TempDir, store: &Arc<BuddyStore>, runner: &BuddyRunner, workspace_key: &str) -> u32 {
+    async fn seed_service(
+        root: &TempDir,
+        store: &Arc<BuddyStore>,
+        runner: &BuddyRunner,
+        workspace_key: &str,
+    ) -> u32 {
         store
             .update_task_state("demo", workspace_key, |mut state| {
                 state.status = TaskStatus::RunningCursor;
@@ -7734,7 +7889,11 @@ exit 0
         pid
     }
 
-    async fn dual_break_outcome(root: &TempDir, reviewer_script: &str, reviewer_name: &str) -> (Arc<BuddyStore>, TaskDetail, u32) {
+    async fn dual_break_outcome(
+        root: &TempDir,
+        reviewer_script: &str,
+        reviewer_name: &str,
+    ) -> (Arc<BuddyStore>, TaskDetail, u32) {
         let store = Arc::new(BuddyStore::new(root.path()));
         let break_actor = write_fake(root.path(), "break.sh", BREAK_ACTOR).await;
         let reviewer = write_fake(root.path(), reviewer_name, reviewer_script).await;
@@ -7883,11 +8042,8 @@ done
             tokio::spawn(async move {
                 while let Ok(envelope) = rx.recv().await {
                     if envelope.event.event_type == "actor.stdout" {
-                        if let Some(text) = envelope
-                            .event
-                            .payload
-                            .get("text")
-                            .and_then(Value::as_str)
+                        if let Some(text) =
+                            envelope.event.payload.get("text").and_then(Value::as_str)
                         {
                             stdout_deltas.lock().push(text.to_string());
                         }
@@ -7944,7 +8100,10 @@ done
             .iter()
             .any(|text| text == "Hello from ACP agent!"));
         assert_eq!(
-            detail.transcript.first().map(|entry| entry.content.as_str()),
+            detail
+                .transcript
+                .first()
+                .map(|entry| entry.content.as_str()),
             Some("Hello from ACP agent!")
         );
     }
@@ -8072,7 +8231,12 @@ done
     #[tokio::test]
     async fn acp_persists_artifacts_and_extracts_round_events() {
         let root = TempDir::new().unwrap();
-        let fake = write_fake(root.path(), "fake-acp-artifacts.sh", &acp_artifacts_fake_body()).await;
+        let fake = write_fake(
+            root.path(),
+            "fake-acp-artifacts.sh",
+            &acp_artifacts_fake_body(),
+        )
+        .await;
         let store = Arc::new(BuddyStore::new(root.path()));
         patch_global_settings(&store, json!({ "max_rounds": 1 })).await;
         let created = create_demo_task(
@@ -8108,24 +8272,41 @@ done
             .to_string();
 
         let summary = store
-            .get_round_events("demo", &run_id, &created.workspace_key, Some("opencode"), None)
+            .get_round_events(
+                "demo",
+                &run_id,
+                &created.workspace_key,
+                Some("opencode"),
+                None,
+            )
             .await
             .expect("round events");
-        assert!(summary.events.iter().any(|entry| entry.entry_type == "thinking"
-            && entry.thinking_length.unwrap_or(0) > 0));
         assert!(summary
             .events
             .iter()
-            .any(|entry| entry.entry_type == "tool_use" && entry.tool_name.as_deref() == Some("bash")));
+            .any(|entry| entry.entry_type == "thinking" && entry.thinking_length.unwrap_or(0) > 0));
+        assert!(summary
+            .events
+            .iter()
+            .any(|entry| entry.entry_type == "tool_use"
+                && entry.tool_name.as_deref() == Some("bash")));
 
         let task_dir = store.task_directory("demo", &created.workspace_key);
-        let output_md = tokio::fs::read_to_string(task_dir.join("artifacts").join(format!("{run_id}-output.md")))
-            .await
-            .unwrap();
+        let output_md = tokio::fs::read_to_string(
+            task_dir
+                .join("artifacts")
+                .join(format!("{run_id}-output.md")),
+        )
+        .await
+        .unwrap();
         assert_eq!(output_md, "Done running tests.");
-        let prompt_md = tokio::fs::read_to_string(task_dir.join("artifacts").join(format!("{run_id}-prompt.md")))
-            .await
-            .unwrap();
+        let prompt_md = tokio::fs::read_to_string(
+            task_dir
+                .join("artifacts")
+                .join(format!("{run_id}-prompt.md")),
+        )
+        .await
+        .unwrap();
         assert!(!prompt_md.is_empty());
     }
 
@@ -8246,10 +8427,7 @@ done
 
         let recorded: Value =
             serde_json::from_str(&tokio::fs::read_to_string(&marker).await.unwrap()).unwrap();
-        assert_eq!(
-            recorded["params"]["sessionId"],
-            json!("sess_model")
-        );
+        assert_eq!(recorded["params"]["sessionId"], json!("sess_model"));
         assert_eq!(recorded["params"]["modelId"], json!("opus-4.6"));
     }
 
@@ -8328,7 +8506,12 @@ done
         let model_log = root.path().join("set-model.json");
         let ready_file = root.path().join("ready.txt");
         tokio::fs::create_dir_all(&prompt_dir).await.unwrap();
-        let fake = write_fake(root.path(), "fake-acp-overflow.sh", &acp_overflow_fake_body()).await;
+        let fake = write_fake(
+            root.path(),
+            "fake-acp-overflow.sh",
+            &acp_overflow_fake_body(),
+        )
+        .await;
 
         let store = Arc::new(BuddyStore::new(root.path()));
         let mut patch = json!({ "max_rounds": 1 });
@@ -8451,7 +8634,9 @@ done
         );
 
         let methods = parse_method_log(
-            &tokio::fs::read_to_string(&fixture.method_log).await.unwrap(),
+            &tokio::fs::read_to_string(&fixture.method_log)
+                .await
+                .unwrap(),
         );
         let load_index = methods
             .iter()
@@ -8459,8 +8644,10 @@ done
         let new_index = methods
             .iter()
             .position(|m| m["method"] == json!("session/new"));
-        assert!(methods.iter().any(|m| m["method"] == json!("session/load")
-            && m["sessionId"] == json!("bloated_opencode")));
+        assert!(methods
+            .iter()
+            .any(|m| m["method"] == json!("session/load")
+                && m["sessionId"] == json!("bloated_opencode")));
         assert!(new_index.is_some());
         assert!(new_index.unwrap() > load_index.expect("session/load logged"));
 
@@ -8535,7 +8722,9 @@ done
         assert_eq!(detail.state.kimi_session_id.as_deref(), Some("keep_kimi"));
 
         let methods = parse_method_log(
-            &tokio::fs::read_to_string(&fixture.method_log).await.unwrap(),
+            &tokio::fs::read_to_string(&fixture.method_log)
+                .await
+                .unwrap(),
         );
         assert!(!methods.iter().any(|m| m["method"] == json!("session/new")));
         assert!(methods.iter().any(|m| m["method"] == json!("session/load")));
@@ -8617,7 +8806,9 @@ done
         );
 
         let methods = parse_method_log(
-            &tokio::fs::read_to_string(&fixture.method_log).await.unwrap(),
+            &tokio::fs::read_to_string(&fixture.method_log)
+                .await
+                .unwrap(),
         );
         assert!(!methods.iter().any(|m| m["method"] == json!("session/new")));
     }

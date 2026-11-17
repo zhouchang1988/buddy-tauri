@@ -21,10 +21,10 @@ use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
 use super::acp::{
-    apply_acp_session_model, default_acp_args, extract_acp_session_models,
-    prepare_acp_environment, resolve_acp_binary, AcpClient, AcpClientOptions, AcpError,
-    AcpNewSessionParams, AcpPromptHandlers, AcpPromptInput, AcpPromptParams, AcpStdioTransport,
-    AcpTransport, StdioTransportOptions,
+    apply_acp_session_model, default_acp_args, extract_acp_session_models, prepare_acp_environment,
+    resolve_acp_binary, AcpClient, AcpClientOptions, AcpError, AcpNewSessionParams,
+    AcpPromptHandlers, AcpPromptInput, AcpPromptParams, AcpStdioTransport, AcpTransport,
+    StdioTransportOptions,
 };
 use super::defaults::{default_launcher_for, normalize_global_settings, normalize_launcher};
 use super::launchers::{
@@ -38,13 +38,14 @@ use super::types::{GlobalSettings, Launcher, TaskSettings};
 pub const COMMIT_MESSAGE_TIMEOUT_MS: u64 = 120_000;
 pub const MAX_DIFF_BYTES: usize = 200_000;
 
-pub const SUPPORTED_ACTORS: [&str; 9] = [
+pub const SUPPORTED_ACTORS: [&str; 10] = [
     "claude",
     "codex",
     "cursor",
     "agy",
     "opencode",
     "kimi",
+    "dsh",
     "wecode_claude",
     "wecode_codex",
     "wecode_opencode",
@@ -158,10 +159,8 @@ pub async fn git_diff_for_selected_files(cwd: &str, paths: &[String]) -> Selecte
                 // HEAD may not exist yet (no commits); staged + unstaged separately.
                 let staged_args = ["diff", "--cached", "--no-renames", "--", file_path];
                 let unstaged_args = ["diff", "--no-renames", "--", file_path];
-                let (staged, unstaged) = tokio::join!(
-                    exec_git(&staged_args, cwd),
-                    exec_git(&unstaged_args, cwd),
-                );
+                let (staged, unstaged) =
+                    tokio::join!(exec_git(&staged_args, cwd), exec_git(&unstaged_args, cwd),);
                 [staged.unwrap_or_default(), unstaged.unwrap_or_default()]
                     .into_iter()
                     .filter(|s| !s.is_empty())
@@ -173,7 +172,10 @@ pub async fn git_diff_for_selected_files(cwd: &str, paths: &[String]) -> Selecte
         if !diff.is_empty() {
             let remaining = MAX_DIFF_BYTES - total_bytes;
             if char_len(&diff) > remaining {
-                diffs.push(format!("{}\n... (diff truncated)", truncate_chars(&diff, remaining)));
+                diffs.push(format!(
+                    "{}\n... (diff truncated)",
+                    truncate_chars(&diff, remaining)
+                ));
                 truncated = true;
                 break;
             }
@@ -184,12 +186,12 @@ pub async fn git_diff_for_selected_files(cwd: &str, paths: &[String]) -> Selecte
 
         // Untracked or new file: synthesize an all-added diff from disk content.
         let abs = Path::new(cwd).join(file_path);
-        let is_file = std::fs::metadata(&abs).map(|m| m.is_file()).unwrap_or(false);
+        let is_file = std::fs::metadata(&abs)
+            .map(|m| m.is_file())
+            .unwrap_or(false);
         if !is_file {
             // Deleted (or otherwise missing) file: try the deletion diff.
-            if let Ok(del_diff) =
-                exec_git(&["diff", "--no-renames", "--", file_path], cwd).await
-            {
+            if let Ok(del_diff) = exec_git(&["diff", "--no-renames", "--", file_path], cwd).await {
                 if !del_diff.is_empty() {
                     let remaining = MAX_DIFF_BYTES - total_bytes;
                     if char_len(&del_diff) > remaining {
@@ -210,7 +212,9 @@ pub async fn git_diff_for_selected_files(cwd: &str, paths: &[String]) -> Selecte
             continue; // skip inaccessible files
         };
         if buf.contains(&0) {
-            diffs.push(format!("Binary file {file_path} changed (binary content not shown)"));
+            diffs.push(format!(
+                "Binary file {file_path} changed (binary content not shown)"
+            ));
             continue;
         }
         let content = String::from_utf8_lossy(&buf).to_string();
@@ -345,17 +349,17 @@ JSON 中换行通过 \n 表达。"#
 fn conventional_commit_re() -> &'static Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"^(feat|fix|chore|docs|style|refactor|perf|test|build|ci|revert)(\([^)]*\))?!?:\s.+")
-            .unwrap()
+        Regex::new(
+            r"^(feat|fix|chore|docs|style|refactor|perf|test|build|ci|revert)(\([^)]*\))?!?:\s.+",
+        )
+        .unwrap()
     })
 }
 
 /// TS: `/\{[\s\S]*"type"\s*:\s*"commit_message"[\s\S]*\}/` (greedy).
 fn commit_message_json_re() -> &'static Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r#"(?s)\{.*"type"\s*:\s*"commit_message".*\}"#).unwrap()
-    })
+    RE.get_or_init(|| Regex::new(r#"(?s)\{.*"type"\s*:\s*"commit_message".*\}"#).unwrap())
 }
 
 const INVALID_MARKERS: [&str; 10] = [
@@ -376,7 +380,10 @@ fn has_invalid_markers(text: &str) -> bool {
 }
 
 fn normalize_newlines(text: &str) -> String {
-    text.replace("\r\n", "\n").replace('\r', "\n").trim().to_string()
+    text.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .trim()
+        .to_string()
 }
 
 /// Parse already-extracted assistant text into a commit message. Used by both
@@ -391,10 +398,7 @@ pub fn parse_commit_message_text(final_text: &str) -> Option<String> {
     // Try JSON parse first.
     if let Some(json_match) = commit_message_json_re().find(text) {
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_match.as_str()) {
-            let message = parsed
-                .get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("");
+            let message = parsed.get("message").and_then(|m| m.as_str()).unwrap_or("");
             if parsed.get("type").and_then(|t| t.as_str()) == Some("commit_message") {
                 let message = message.trim();
                 let first_line = message.split('\n').next().unwrap_or("");
@@ -448,6 +452,8 @@ pub fn parse_commit_message_output(
 pub struct GenerateCommitMessageInput {
     pub repo_root: String,
     pub actor: String,
+    #[serde(default)]
+    pub model: Option<String>,
     #[serde(default)]
     pub lang: Option<String>,
     #[serde(default)]
@@ -618,8 +624,7 @@ pub async fn generate_commit_message_with_actor(
                 timed_out = outcome.timed_out;
                 cancelled = outcome.cancelled;
                 if !cancelled && !timed_out && exit_code == Some(0) {
-                    message =
-                        parse_commit_message_text(&outcome.output_text).unwrap_or_default();
+                    message = parse_commit_message_text(&outcome.output_text).unwrap_or_default();
                     valid = !message.is_empty();
                 }
             }
@@ -737,10 +742,8 @@ async fn generate_via_cli(
     abort: &Arc<AtomicBool>,
 ) -> Result<GenerateViaCliOutcome, CommitMessageError> {
     // mkdtemp(join(tmpdir(), 'buddy-commit-'))
-    let temp_dir = std::env::temp_dir().join(format!(
-        "buddy-commit-{}",
-        uuid::Uuid::new_v4().simple()
-    ));
+    let temp_dir =
+        std::env::temp_dir().join(format!("buddy-commit-{}", uuid::Uuid::new_v4().simple()));
     tokio::fs::create_dir_all(&temp_dir)
         .await
         .map_err(|error| CommitMessageError::Launcher(LauncherError::Io(error)))?;
@@ -1178,7 +1181,12 @@ mod tests {
                 .env("GIT_CONFIG_NOSYSTEM", "1")
                 .output()
                 .unwrap();
-            assert!(status.status.success(), "git {:?} failed: {:?}", args, status);
+            assert!(
+                status.status.success(),
+                "git {:?} failed: {:?}",
+                args,
+                status
+            );
         };
         run(&["init", "-b", "main"]);
         run(&["config", "user.name", "Test"]);
@@ -1213,7 +1221,12 @@ mod tests {
         }
     }
 
-    fn actor_input(repo_root: &str, actor: &str, command: &str, paths: &[&str]) -> GenerateCommitMessageActorInput {
+    fn actor_input(
+        repo_root: &str,
+        actor: &str,
+        command: &str,
+        paths: &[&str],
+    ) -> GenerateCommitMessageActorInput {
         GenerateCommitMessageActorInput {
             repo_root: repo_root.to_string(),
             actor: actor.to_string(),
@@ -1251,6 +1264,7 @@ mod tests {
             seed_agy_session_id: None,
             seed_opencode_session_id: None,
             seed_kimi_session_id: None,
+            seed_dsh_session_id: None,
             seed_wecode_claude_session_id: None,
             seed_wecode_codex_thread_id: None,
             seed_wecode_opencode_session_id: None,
@@ -1262,7 +1276,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn supported_actors_cover_the_nine_and_reject_others() {
+    fn supported_actors_cover_the_ten_and_reject_others() {
         for actor in [
             "claude",
             "codex",
@@ -1270,6 +1284,7 @@ mod tests {
             "agy",
             "opencode",
             "kimi",
+            "dsh",
             "wecode_claude",
             "wecode_codex",
             "wecode_opencode",
@@ -1283,9 +1298,18 @@ mod tests {
 
     #[test]
     fn resolve_actor_prefers_stored_then_implementer_then_claude() {
-        assert_eq!(resolve_commit_message_actor(Some("codex"), Some("claude")), "codex");
-        assert_eq!(resolve_commit_message_actor(Some("invalid"), Some("cursor")), "cursor");
-        assert_eq!(resolve_commit_message_actor(None, Some("invalid")), "claude");
+        assert_eq!(
+            resolve_commit_message_actor(Some("codex"), Some("claude")),
+            "codex"
+        );
+        assert_eq!(
+            resolve_commit_message_actor(Some("invalid"), Some("cursor")),
+            "cursor"
+        );
+        assert_eq!(
+            resolve_commit_message_actor(None, Some("invalid")),
+            "claude"
+        );
         assert_eq!(resolve_commit_message_actor(None, None), "claude");
     }
 
@@ -1473,7 +1497,10 @@ mod tests {
     fn parses_valid_json_commit_message_output() {
         let raw = codex_event("{\"type\":\"commit_message\",\"message\":\"feat: add new feature\\n\\n- Added X\\n- Updated Y\"}");
         let result = parse_commit_message_output("codex", KIND, &raw);
-        assert_eq!(result.as_deref(), Some("feat: add new feature\n\n- Added X\n- Updated Y"));
+        assert_eq!(
+            result.as_deref(),
+            Some("feat: add new feature\n\n- Added X\n- Updated Y")
+        );
     }
 
     #[test]
@@ -1513,13 +1540,17 @@ mod tests {
 
     #[test]
     fn returns_none_for_non_conventional_json_message() {
-        let raw = codex_event("{\"type\":\"commit_message\",\"message\":\"just some text without type\"}");
+        let raw = codex_event(
+            "{\"type\":\"commit_message\",\"message\":\"just some text without type\"}",
+        );
         assert_eq!(parse_commit_message_output("codex", KIND, &raw), None);
     }
 
     #[test]
     fn falls_back_to_plain_text_conventional_commit() {
-        let raw = codex_event("fix(api): handle null response\\n\\n- Added null check\\n- Returns empty array");
+        let raw = codex_event(
+            "fix(api): handle null response\\n\\n- Added null check\\n- Returns empty array",
+        );
         let result = parse_commit_message_output("codex", KIND, &raw).expect("parsed");
         assert!(result.contains("fix(api): handle null response"));
         assert!(result.contains("- Added null check"));
@@ -1563,7 +1594,8 @@ mod tests {
 
     #[test]
     fn parse_text_accepts_plain_conventional_commit() {
-        let result = parse_commit_message_text("fix(api): handle null response\n\n- Added null check");
+        let result =
+            parse_commit_message_text("fix(api): handle null response\n\n- Added null check");
         assert_eq!(
             result.as_deref(),
             Some("fix(api): handle null response\n\n- Added null check")
@@ -1575,7 +1607,10 @@ mod tests {
         assert_eq!(parse_commit_message_text(""), None);
         assert_eq!(parse_commit_message_text("   "), None);
         assert_eq!(parse_commit_message_text("just some text"), None);
-        assert_eq!(parse_commit_message_text("<think>hmm</think>\nfeat: x"), None);
+        assert_eq!(
+            parse_commit_message_text("<think>hmm</think>\nfeat: x"),
+            None
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1597,7 +1632,11 @@ mod tests {
         let cwd = path(&dir);
         std::fs::write(dir.path().join("a.txt"), "hello\nworld\n").unwrap();
         let result = git_diff_for_selected_files(&cwd, &["a.txt".to_string()]).await;
-        assert!(result.diff.contains("diff --git a/a.txt b/a.txt"), "{}", result.diff);
+        assert!(
+            result.diff.contains("diff --git a/a.txt b/a.txt"),
+            "{}",
+            result.diff
+        );
         assert!(result.diff.contains("+world"), "{}", result.diff);
         assert!(!result.truncated);
     }
@@ -1633,7 +1672,11 @@ mod tests {
 
         let result = git_diff_for_selected_files(&cwd, &["selected.txt".to_string()]).await;
         assert!(result.diff.contains("selected modified"), "{}", result.diff);
-        assert!(!result.diff.contains("unselected modified"), "{}", result.diff);
+        assert!(
+            !result.diff.contains("unselected modified"),
+            "{}",
+            result.diff
+        );
     }
 
     #[tokio::test]
@@ -1688,9 +1731,10 @@ mod tests {
             "codex",
             "#!/bin/sh\ncat >/dev/null\necho '{\"type\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"{\\\"type\\\":\\\"commit_message\\\",\\\"message\\\":\\\"feat: generated commit message\\\"}\"}]}'\n",
         );
-        let result = generate_commit_message_with_actor(&actor_input(&cwd, "codex", &script, &["a.txt"]))
-            .await
-            .unwrap();
+        let result =
+            generate_commit_message_with_actor(&actor_input(&cwd, "codex", &script, &["a.txt"]))
+                .await
+                .unwrap();
         assert_eq!(result.message, "feat: generated commit message");
         assert!(result.log.valid);
         assert_eq!(result.log.exit_code, Some(0));
@@ -1707,11 +1751,14 @@ mod tests {
             "codex",
             "#!/bin/sh\ncat >/dev/null\necho 'boom' >&2\nexit 1\n",
         );
-        let error = generate_commit_message_with_actor(&actor_input(&cwd, "codex", &script, &["a.txt"]))
-            .await
-            .unwrap_err();
+        let error =
+            generate_commit_message_with_actor(&actor_input(&cwd, "codex", &script, &["a.txt"]))
+                .await
+                .unwrap_err();
         match error {
-            CommitMessageError::Process { exit_code, stderr, .. } => {
+            CommitMessageError::Process {
+                exit_code, stderr, ..
+            } => {
                 assert_eq!(exit_code, 1);
                 assert!(stderr.contains("boom"), "{stderr}");
             }
@@ -1726,10 +1773,14 @@ mod tests {
         let cwd = path(&dir);
         std::fs::write(dir.path().join("a.txt"), "hello\nworld\n").unwrap();
         let script = write_script(dir.path(), "codex", "#!/bin/sh\ncat >/dev/null\nexit 0\n");
-        let error = generate_commit_message_with_actor(&actor_input(&cwd, "codex", &script, &["a.txt"]))
-            .await
-            .unwrap_err();
-        assert!(matches!(error, CommitMessageError::InvalidOutput { .. }), "{error:?}");
+        let error =
+            generate_commit_message_with_actor(&actor_input(&cwd, "codex", &script, &["a.txt"]))
+                .await
+                .unwrap_err();
+        assert!(
+            matches!(error, CommitMessageError::InvalidOutput { .. }),
+            "{error:?}"
+        );
     }
 
     #[tokio::test]
@@ -1746,7 +1797,10 @@ mod tests {
         ))
         .await
         .unwrap_err();
-        assert!(matches!(error, CommitMessageError::Launcher(_)), "{error:?}");
+        assert!(
+            matches!(error, CommitMessageError::Launcher(_)),
+            "{error:?}"
+        );
     }
 
     #[tokio::test]
@@ -1761,12 +1815,16 @@ mod tests {
         // grandchild holding the stdout pipe open and flake the elapsed assert.
         let script = write_script(dir.path(), "claude", "#!/bin/sh\nexec sleep 60\n");
         let started = std::time::Instant::now();
-        let error = generate_commit_message_with_actor(&actor_input(&cwd, "claude", &script, &["a.txt"]))
-            .await
-            .unwrap_err();
+        let error =
+            generate_commit_message_with_actor(&actor_input(&cwd, "claude", &script, &["a.txt"]))
+                .await
+                .unwrap_err();
         TEST_TIMEOUT_MS.store(0, Ordering::SeqCst);
         assert!(started.elapsed() < Duration::from_secs(10));
-        assert!(matches!(error, CommitMessageError::Timeout { .. }), "{error:?}");
+        assert!(
+            matches!(error, CommitMessageError::Timeout { .. }),
+            "{error:?}"
+        );
     }
 
     #[tokio::test]
@@ -1779,11 +1837,15 @@ mod tests {
         // Named `opencode` so the run goes through the PTY path, which
         // reports a timeout as exit_code None + signal "15".
         let script = write_script(dir.path(), "opencode", "#!/bin/sh\nsleep 60\n");
-        let error = generate_commit_message_with_actor(&actor_input(&cwd, "opencode", &script, &["a.txt"]))
-            .await
-            .unwrap_err();
+        let error =
+            generate_commit_message_with_actor(&actor_input(&cwd, "opencode", &script, &["a.txt"]))
+                .await
+                .unwrap_err();
         TEST_TIMEOUT_MS.store(0, Ordering::SeqCst);
-        assert!(matches!(error, CommitMessageError::Timeout { .. }), "{error:?}");
+        assert!(
+            matches!(error, CommitMessageError::Timeout { .. }),
+            "{error:?}"
+        );
     }
 
     #[tokio::test]
@@ -1796,7 +1858,13 @@ mod tests {
         let cwd_clone = cwd.clone();
         let script_clone = script.clone();
         let handle = tokio::spawn(async move {
-            generate_commit_message_with_actor(&actor_input(&cwd_clone, "claude", &script_clone, &["a.txt"])).await
+            generate_commit_message_with_actor(&actor_input(
+                &cwd_clone,
+                "claude",
+                &script_clone,
+                &["a.txt"],
+            ))
+            .await
         });
         // Wait until the generation has actually registered in the
         // process-wide slot before cancelling — a fixed sleep races the
@@ -1819,7 +1887,10 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert!(started.elapsed() < Duration::from_secs(10));
-        assert!(matches!(error, CommitMessageError::Cancelled { .. }), "{error:?}");
+        assert!(
+            matches!(error, CommitMessageError::Cancelled { .. }),
+            "{error:?}"
+        );
         // Cancelling with nothing in flight is a no-op.
         cancel_generate_commit_message();
     }
@@ -1961,8 +2032,14 @@ done
             .lines()
             .find(|line| line.contains("session/set_model"))
             .expect("session/set_model request");
-        assert!(set_model.contains("\"sessionId\":\"fresh_sess\""), "{set_model}");
-        assert!(set_model.contains("\"modelId\":\"opus-4.6\""), "{set_model}");
+        assert!(
+            set_model.contains("\"sessionId\":\"fresh_sess\""),
+            "{set_model}"
+        );
+        assert!(
+            set_model.contains("\"modelId\":\"opus-4.6\""),
+            "{set_model}"
+        );
     }
 
     #[tokio::test]
@@ -1978,10 +2055,9 @@ done
             "ACP_METHODS_LOG".to_string(),
             methods_log.to_string_lossy().to_string(),
         );
-        let result =
-            generate_commit_message_with_actor(&acp_input(&cwd, &script, None, env))
-                .await
-                .unwrap();
+        let result = generate_commit_message_with_actor(&acp_input(&cwd, &script, None, env))
+            .await
+            .unwrap();
         assert_eq!(result.message, "feat: modeled acp");
         let log = std::fs::read_to_string(&methods_log).unwrap();
         // launcher.model absent → session currentModelId already applies, so
@@ -1997,7 +2073,11 @@ done
         let dir = init_repo();
         let cwd = path(&dir);
         std::fs::write(dir.path().join("a.txt"), "hello\nworld\n").unwrap();
-        let script = write_script(dir.path(), "fake-agent-silent.sh", &acp_silent_prompt_fake_body());
+        let script = write_script(
+            dir.path(),
+            "fake-agent-silent.sh",
+            &acp_silent_prompt_fake_body(),
+        );
         let started = std::time::Instant::now();
         let error =
             generate_commit_message_with_actor(&acp_input(&cwd, &script, None, HashMap::new()))
@@ -2005,7 +2085,10 @@ done
                 .unwrap_err();
         TEST_TIMEOUT_MS.store(0, Ordering::SeqCst);
         assert!(started.elapsed() < Duration::from_secs(10));
-        assert!(matches!(error, CommitMessageError::Timeout { .. }), "{error:?}");
+        assert!(
+            matches!(error, CommitMessageError::Timeout { .. }),
+            "{error:?}"
+        );
     }
 
     #[tokio::test]
@@ -2014,7 +2097,11 @@ done
         let dir = init_repo();
         let cwd = path(&dir);
         std::fs::write(dir.path().join("a.txt"), "hello\nworld\n").unwrap();
-        let script = write_script(dir.path(), "fake-agent-silent.sh", &acp_silent_prompt_fake_body());
+        let script = write_script(
+            dir.path(),
+            "fake-agent-silent.sh",
+            &acp_silent_prompt_fake_body(),
+        );
         let cwd_clone = cwd.clone();
         let script_clone = script.clone();
         let handle = tokio::spawn(async move {
@@ -2044,7 +2131,10 @@ done
             .expect("generation did not finish after cancel")
             .unwrap()
             .unwrap_err();
-        assert!(matches!(error, CommitMessageError::Cancelled { .. }), "{error:?}");
+        assert!(
+            matches!(error, CommitMessageError::Cancelled { .. }),
+            "{error:?}"
+        );
     }
 
     // -----------------------------------------------------------------------

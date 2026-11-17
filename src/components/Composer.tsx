@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { ArrowUp, ChevronDown, Square, X, Image as ImageIcon } from 'lucide-react'
 import { AcpModelInfo, Attachment, TaskSettings, TaskState } from '../shared/types'
-import { taskActors, ACTOR_LABEL_KEY, Actor } from '../lib/format'
+import { taskActors, actorOptionLabel, modelOptionLabel, Actor } from '../lib/format'
 import { useT, useSendShortcut } from '../hooks/useI18n'
 import { IMAGE_EXTS, EXT_ICON_MAP, generateAttachmentId, isImageAttachment, fileExt, fileIconForName, mimeTypeForExt } from '../lib/attachments'
 
@@ -22,14 +22,13 @@ interface ComposerProps {
   onAttachmentsChange: (attachments: Attachment[]) => void
 }
 
-function pickAcpModelId(
-  models: AcpModelInfo[],
-  saved?: string,
-  currentModelId?: string
-): string {
-  if (saved && models.some(model => model.id === saved)) return saved
-  if (currentModelId && models.some(model => model.id === currentModelId)) return currentModelId
-  return models[0]?.id ?? ''
+/** Keep the task launcher model as-is. Never invent models[0]/currentModelId. */
+function pickModelId(saved?: string): string {
+  return saved?.trim() || ''
+}
+
+function modelCatalogKey(actor: string, protocol: string): string {
+  return `${actor}:${protocol}`
 }
 
 export function Composer({ onSend, onStart, onInterrupt, onEnqueueInstruction, isRunning, isReady, settings, taskState, taskId, workspaceKey, draft, onDraftChange, attachments, onAttachmentsChange }: ComposerProps) {
@@ -40,13 +39,18 @@ export function Composer({ onSend, onStart, onInterrupt, onEnqueueInstruction, i
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const prevStateNextRef = useRef<string | undefined>()
   const selectedModelByActorRef = useRef<Record<string, string>>({})
+  // Cross-actor stale-while-revalidate: switching handoff must not flash loading
+  // when this actor was already probed in the current composer session.
+  const modelCatalogByActorRef = useRef<Map<string, AcpModelInfo[]>>(new Map())
   const persistChainRef = useRef<Promise<unknown>>(Promise.resolve())
-  const nextIsAcp = settings?.launchers?.[nextActor]?.protocol === 'acp'
-  const [acpModelState, setAcpModelState] = useState<{
+  const nextProtocol = settings?.launchers?.[nextActor]?.protocol === 'acp' ? 'acp' : 'cli'
+  const [modelState, setModelState] = useState<{
     status: 'idle' | 'loading' | 'ready'
+    actor: string
+    protocol: 'cli' | 'acp' | ''
     models: AcpModelInfo[]
     selected: string
-  }>({ status: 'idle', models: [], selected: '' })
+  }>({ status: 'loading', actor: '', protocol: '', models: [], selected: '' })
 
   const computedNext = (() => {
     if (isRunning && taskState?.active_run?.actor) {
@@ -65,7 +69,8 @@ export function Composer({ onSend, onStart, onInterrupt, onEnqueueInstruction, i
   }, [computedNext, participants])
 
   const persistModel = useCallback((actor: string, model: string) => {
-    if (!taskId || !workspaceKey || !model || !window.buddy?.updateTaskLauncherModel) return
+    // Empty string clears launcher.model (agent default). Do not treat it as a no-op.
+    if (!taskId || !workspaceKey || !window.buddy?.updateTaskLauncherModel) return
     persistChainRef.current = persistChainRef.current
       .then(() => window.buddy.updateTaskLauncherModel(taskId, workspaceKey, actor, model))
       .then(() => undefined)
@@ -73,37 +78,111 @@ export function Composer({ onSend, onStart, onInterrupt, onEnqueueInstruction, i
   }, [taskId, workspaceKey])
 
   useEffect(() => {
-    if (!nextIsAcp) {
-      setAcpModelState({ status: 'idle', models: [], selected: '' })
-      return
-    }
     let cancelled = false
-    const saved = selectedModelByActorRef.current[nextActor]
-      || settings?.launchers?.[nextActor]?.model
-      || ''
-    setAcpModelState({ status: 'loading', models: [], selected: saved })
+    const remembered = Object.prototype.hasOwnProperty.call(selectedModelByActorRef.current, nextActor)
+    const saved = remembered
+      ? selectedModelByActorRef.current[nextActor]
+      : (settings?.launchers?.[nextActor]?.model || '')
+    const catalogKey = modelCatalogKey(nextActor, nextProtocol)
+    const cached = modelCatalogByActorRef.current.get(catalogKey)
+    const hasCache = cached !== undefined
+    // Stale-while-revalidate across actors: show the last good catalog immediately.
+    setModelState({
+      status: hasCache ? 'ready' : 'loading',
+      actor: nextActor,
+      protocol: nextProtocol,
+      models: cached ?? [],
+      selected: pickModelId(saved)
+    })
     const cwd = taskState?.repo_root?.trim() || undefined
-    const pending = window.buddy?.listAcpModels?.(nextActor, cwd)
+    const taskLauncher = settings?.launchers?.[nextActor]
+    const modelContext = {
+      launcher: taskLauncher,
+      ...(taskId && workspaceKey ? { taskId, workspaceKey } : {})
+    }
+    const pending = nextProtocol === 'acp'
+      ? window.buddy?.listAcpModels?.(nextActor, cwd, modelContext)
+      : window.buddy?.listCliModels?.(nextActor, modelContext)
     if (!pending) {
-      setAcpModelState({ status: 'ready', models: [], selected: saved })
+      if (!hasCache) {
+        setModelState({
+          status: 'ready',
+          actor: nextActor,
+          protocol: nextProtocol,
+          models: [],
+          selected: pickModelId(saved)
+        })
+      }
       return
     }
     pending
       .then(list => {
         if (cancelled) return
         const models = list?.models ?? []
-        const selected = pickAcpModelId(models, saved, list?.currentModelId)
-        if (selected) selectedModelByActorRef.current[nextActor] = selected
-        setAcpModelState({ status: 'ready', models, selected })
+        const stale = modelCatalogByActorRef.current.get(catalogKey)
+        // Failed probes keep the last good catalog; a successful empty list
+        // is a real state and must replace it.
+        if (list?.error && models.length === 0 && stale && stale.length > 0) {
+          setModelState({
+            status: 'ready',
+            actor: nextActor,
+            protocol: nextProtocol,
+            models: stale,
+            selected: pickModelId(saved)
+          })
+          return
+        }
+        modelCatalogByActorRef.current.set(catalogKey, models)
+        setModelState({
+          status: 'ready',
+          actor: nextActor,
+          protocol: nextProtocol,
+          models,
+          selected: pickModelId(saved)
+        })
       })
       .catch(() => {
-        if (!cancelled) setAcpModelState({ status: 'ready', models: [], selected: saved })
+        if (cancelled) return
+        const stale = modelCatalogByActorRef.current.get(catalogKey)
+        setModelState({
+          status: 'ready',
+          actor: nextActor,
+          protocol: nextProtocol,
+          models: stale ?? [],
+          selected: pickModelId(saved)
+        })
       })
-    return () => { cancelled = true }
-  }, [nextIsAcp, nextActor, taskState?.repo_root])
+    const unsub = window.buddy?.onModelCatalog?.(update => {
+      if (cancelled) return
+      if (update.actor !== nextActor || update.protocol !== nextProtocol) return
+      const models = update.list?.models ?? []
+      if (update.list?.error && models.length === 0) {
+        const stale = modelCatalogByActorRef.current.get(catalogKey)
+        if (stale && stale.length > 0) {
+          setModelState({
+            status: 'ready',
+            actor: nextActor,
+            protocol: nextProtocol,
+            models: stale,
+            selected: pickModelId(saved)
+          })
+          return
+        }
+      }
+      modelCatalogByActorRef.current.set(catalogKey, models)
+      setModelState({
+        status: 'ready',
+        actor: nextActor,
+        protocol: nextProtocol,
+        models,
+        selected: pickModelId(saved)
+      })
+    })
+    return () => { cancelled = true; unsub?.() }
+  }, [nextProtocol, nextActor, taskState?.repo_root, settings?.launchers, taskId, workspaceKey])
 
   const handleModelChange = (model: string) => {
-    setAcpModelState(prev => ({ ...prev, selected: model }))
+    setModelState(prev => ({ ...prev, selected: model }))
     selectedModelByActorRef.current[nextActor] = model
     persistModel(nextActor, model)
   }
@@ -369,7 +448,7 @@ export function Composer({ onSend, onStart, onInterrupt, onEnqueueInstruction, i
                 className="appearance-none bg-transparent text-sm font-medium pr-5 pl-1 py-1 outline-none cursor-pointer hover:text-accent"
               >
                 {participants.map(a => (
-                  <option key={a} value={a}>{t(ACTOR_LABEL_KEY[a])}</option>
+                  <option key={a} value={a}>{actorOptionLabel(a, t)}</option>
                 ))}
               </select>
               <ChevronDown
@@ -379,30 +458,44 @@ export function Composer({ onSend, onStart, onInterrupt, onEnqueueInstruction, i
               />
             </div>
 
-            {nextIsAcp && (
-              <div className="relative max-w-[160px]">
-                <select
-                  aria-label={t('modal.create.model')}
-                  value={acpModelState.status !== 'ready' || acpModelState.models.length === 0 ? '' : acpModelState.selected}
-                  disabled={acpModelState.status !== 'ready' || acpModelState.models.length === 0}
-                  onChange={(e) => handleModelChange(e.target.value)}
-                  className="appearance-none bg-transparent text-xs pr-5 pl-1 py-1 outline-none cursor-pointer hover:text-accent disabled:opacity-60 disabled:cursor-not-allowed max-w-[160px] truncate"
-                >
-                  {acpModelState.status !== 'ready' && <option value="">{t('common.loading')}</option>}
-                  {acpModelState.status === 'ready' && acpModelState.models.length === 0 && (
-                    <option value="">{t('modal.create.modelUnavailable')}</option>
-                  )}
-                  {acpModelState.models.map(model => (
-                    <option key={model.id} value={model.id}>{model.name}</option>
-                  ))}
-                </select>
-                <ChevronDown
-                  size={10}
-                  strokeWidth={2}
-                  className="absolute right-0 top-1/2 -translate-y-1/2 pointer-events-none text-fg-muted"
-                />
-              </div>
-            )}
+            <div className="relative max-w-[160px]">
+              <select
+                aria-label={t('modal.create.model')}
+                value={
+                  modelState.status !== 'ready' && modelState.models.length === 0
+                    ? ''
+                    : modelState.models.length === 0
+                      ? ''
+                      : modelState.selected
+                }
+                disabled={modelState.status !== 'ready' || modelState.models.length === 0}
+                aria-busy={modelState.status !== 'ready'}
+                onChange={(e) => handleModelChange(e.target.value)}
+                className="appearance-none bg-transparent text-xs pr-5 pl-1 py-1 outline-none cursor-pointer hover:text-accent disabled:opacity-60 disabled:cursor-not-allowed max-w-[160px] truncate"
+              >
+                {modelState.status !== 'ready' && modelState.models.length === 0 && (
+                  <option value="">{t('common.loading')}</option>
+                )}
+                {(modelState.status === 'ready' || modelState.models.length > 0) && (
+                  <option value="">{t('agents.native')}</option>
+                )}
+                {modelState.models.length > 0
+                  && modelState.selected
+                  && !modelState.models.some(model => model.id === modelState.selected) && (
+                  <option value={modelState.selected}>
+                    {modelOptionLabel(modelState.selected, modelState.models, { nativeLabel: t('agents.native') })}
+                  </option>
+                )}
+                {modelState.models.map(model => (
+                  <option key={model.id} value={model.id}>{model.name}</option>
+                ))}
+              </select>
+              <ChevronDown
+                size={10}
+                strokeWidth={2}
+                className="absolute right-0 top-1/2 -translate-y-1/2 pointer-events-none text-fg-muted"
+              />
+            </div>
 
             <button
               onClick={handlePrimary}

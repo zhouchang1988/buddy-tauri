@@ -43,6 +43,16 @@ describe('tauri-bridge', () => {
     openUrlMock.mockResolvedValue(undefined)
     openPathMock.mockReset()
     openPathMock.mockResolvedValue(undefined)
+    const store = new Map<string, string>()
+    Object.defineProperty(window, 'localStorage', {
+      configurable: true,
+      value: {
+        getItem: (key: string) => store.get(key) ?? null,
+        setItem: (key: string, value: string) => store.set(key, value),
+        removeItem: (key: string) => store.delete(key),
+        clear: () => store.clear()
+      }
+    })
     window.localStorage.clear()
     await import('../../../src/lib/tauri-bridge')
   })
@@ -79,6 +89,48 @@ describe('tauri-bridge', () => {
       content: 'do it',
       attachments: []
     })
+  })
+
+  it('maps agent and library APIs with camelCase arguments', async () => {
+    invokeMock.mockResolvedValue({ revision: 1, agents: [], refreshing: false })
+    await window.buddy.refreshLocalAgents('scan')
+    expect(invokeMock).toHaveBeenCalledWith('buddy_refresh_local_agents', { mode: 'scan' })
+
+    await window.buddy.startAgentUpdates(['claude'], 'request-1')
+    expect(invokeMock).toHaveBeenCalledWith('buddy_start_agent_updates', { ids: ['claude'], requestId: 'request-1' })
+
+    await window.buddy.listCliModels('claude', { taskId: 'task-1', workspaceKey: 'ws-1' })
+    expect(invokeMock).toHaveBeenCalledWith('buddy_list_cli_models', {
+      id: 'claude', context: { taskId: 'task-1', workspaceKey: 'ws-1' }
+    })
+
+    await window.buddy.configureAgent('claude', { protocol: 'acp' })
+    expect(invokeMock).toHaveBeenCalledWith('buddy_configure_agent', { id: 'claude', config: { protocol: 'acp' } })
+
+    await window.buddy.setLibrarySkillAssignment('skill-1', 'claude:native:user', true)
+    expect(invokeMock).toHaveBeenCalledWith('buddy_set_library_skill_assignment', {
+      skillId: 'skill-1', targetId: 'claude:native:user', enabled: true
+    })
+
+    await window.buddy.addLibraryServer('docs', { type: 'http', url: 'https://example.com/mcp' })
+    expect(invokeMock).toHaveBeenCalledWith('buddy_add_library_server', {
+      name: 'docs', raw: { type: 'http', url: 'https://example.com/mcp' }
+    })
+
+    await window.buddy.ensureLibraryAcpHome('codex')
+    expect(invokeMock).toHaveBeenCalledWith('buddy_ensure_library_acp_home', { agentId: 'codex' })
+  })
+
+  it('subscribes to agent inventory, update and model catalog events', () => {
+    listenMock.mockResolvedValue(vi.fn())
+    window.buddy.onAgentInventory(vi.fn())
+    window.buddy.onAgentUpdate(vi.fn())
+    window.buddy.onModelCatalog(vi.fn())
+    window.buddy.onOpenAgentUpdates(vi.fn())
+    expect(listenMock).toHaveBeenCalledWith('buddy:agent-inventory', expect.any(Function))
+    expect(listenMock).toHaveBeenCalledWith('buddy:agent-update', expect.any(Function))
+    expect(listenMock).toHaveBeenCalledWith('buddy:model-catalog', expect.any(Function))
+    expect(listenMock).toHaveBeenCalledWith('buddy:open-agents', expect.any(Function))
   })
 
   it('maps system ops to their Tauri commands', async () => {

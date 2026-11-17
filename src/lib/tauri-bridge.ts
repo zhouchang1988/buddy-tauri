@@ -27,6 +27,8 @@ import type {
   GlobalAcpAdaptersStatus,
   GlobalSettings,
   InstructionQueueItem,
+  ModelCatalogUpdate,
+  ModelListContext,
   RoundEventSummary,
   SendMessageInput,
   StartTaskInput,
@@ -37,8 +39,85 @@ import type {
   TaskStats,
   TestLauncherResult
 } from '../shared/types'
+import type {
+  AgentConfiguration,
+  AgentInventorySnapshot,
+  AgentUpdateJob,
+  AgentUpdateSnapshot,
+  LocalAgent
+} from '../shared/agents'
+import type {
+  LibraryBatchResult,
+  LibraryOpResult,
+  LibrarySnapshot
+} from '../shared/library'
+
+const subscribe = <T>(channel: string, callback: (payload: T) => void): (() => void) => {
+  const unlisten = listen<T>(channel, (event) => callback(event.payload))
+  return () => { unlisten.then((fn) => fn()) }
+}
 
 const buddy = {
+  getAgentInventory: (): Promise<AgentInventorySnapshot> =>
+    invoke<AgentInventorySnapshot>('buddy_get_agent_inventory'),
+  refreshLocalAgents: (mode: 'all' | 'scan' | 'updates' = 'all'): Promise<AgentInventorySnapshot> =>
+    invoke<AgentInventorySnapshot>('buddy_refresh_local_agents', { mode }),
+  getAgentUpdateState: (): Promise<AgentUpdateSnapshot> =>
+    invoke<AgentUpdateSnapshot>('buddy_get_agent_update_state'),
+  startAgentUpdates: (ids: string[], requestId: string): Promise<AgentUpdateSnapshot> =>
+    invoke<AgentUpdateSnapshot>('buddy_start_agent_updates', { ids, requestId }),
+  onAgentInventory: (callback: (state: AgentInventorySnapshot) => void): (() => void) =>
+    subscribe('buddy:agent-inventory', callback),
+  onAgentUpdate: (callback: (state: AgentUpdateSnapshot) => void): (() => void) =>
+    subscribe('buddy:agent-update', callback),
+  onModelCatalog: (callback: (update: ModelCatalogUpdate) => void): (() => void) =>
+    subscribe('buddy:model-catalog', callback),
+  onOpenAgentUpdates: (callback: () => void): (() => void) =>
+    subscribe('buddy:open-agents', callback),
+  listCliModels: (id: string, context?: ModelListContext): Promise<AcpModelList> =>
+    invoke<AcpModelList>('buddy_list_cli_models', { id, context }),
+  listLocalAgents: (force = false): Promise<LocalAgent[]> =>
+    invoke<LocalAgent[]>('buddy_list_local_agents', { force }),
+  configureAgent: (id: string, config: AgentConfiguration): Promise<void> =>
+    invoke<void>('buddy_configure_agent', { id, config }),
+  probeLocalAgent: (id: string): Promise<LocalAgent> =>
+    invoke<LocalAgent>('buddy_probe_local_agent', { id }),
+  checkAgentUpdates: (force = false): Promise<LocalAgent[]> =>
+    invoke<LocalAgent[]>('buddy_check_agent_updates', { force }),
+  updateLocalAgents: (ids: string[]): Promise<AgentUpdateJob[]> =>
+    invoke<AgentUpdateJob[]>('buddy_update_local_agents', { ids }),
+  getAgentUpdateJobs: (): Promise<AgentUpdateJob[]> =>
+    invoke<AgentUpdateJob[]>('buddy_get_agent_update_jobs'),
+  cancelAgentUpdates: (): Promise<void> =>
+    invoke<void>('buddy_cancel_agent_updates'),
+
+  getLibrarySnapshot: (force = false): Promise<LibrarySnapshot> =>
+    invoke<LibrarySnapshot>('buddy_get_library_snapshot', { force }),
+  refreshLibrary: (force = false): Promise<LibrarySnapshot> =>
+    invoke<LibrarySnapshot>('buddy_refresh_library', { force }),
+  importLibrarySkills: (discoveryIds: string[]): Promise<LibraryBatchResult> =>
+    invoke<LibraryBatchResult>('buddy_import_library_skills', { discoveryIds }),
+  setLibrarySkillAssignment: (skillId: string, targetId: string, enabled: boolean): Promise<LibraryOpResult> =>
+    invoke<LibraryOpResult>('buddy_set_library_skill_assignment', { skillId, targetId, enabled }),
+  ejectLibraryServer: (serverId: string): Promise<LibraryOpResult> =>
+    invoke<LibraryOpResult>('buddy_eject_library_server', { serverId }),
+  ejectLibrarySkill: (skillId: string): Promise<LibraryOpResult> =>
+    invoke<LibraryOpResult>('buddy_eject_library_skill', { skillId }),
+  addLibraryServer: (name: string, raw: Record<string, unknown>): Promise<LibraryOpResult> =>
+    invoke<LibraryOpResult>('buddy_add_library_server', { name, raw }),
+  importLibraryServers: (discoveryIds: string[]): Promise<LibraryBatchResult> =>
+    invoke<LibraryBatchResult>('buddy_import_library_servers', { discoveryIds }),
+  setLibraryServerAssignment: (serverId: string, targetId: string, enabled: boolean): Promise<LibraryOpResult> =>
+    invoke<LibraryOpResult>('buddy_set_library_server_assignment', { serverId, targetId, enabled }),
+  openLibraryAuthGuidance: (targetId: string, serverName: string): Promise<{ title: string; steps: string[] }> =>
+    invoke<{ title: string; steps: string[] }>('buddy_open_library_auth_guidance', { targetId, serverName }),
+  openLibraryDir: (): Promise<string> =>
+    invoke<string>('buddy_open_library_dir'),
+  openLibraryBackupsDir: (): Promise<string> =>
+    invoke<string>('buddy_open_library_backups_dir'),
+  ensureLibraryAcpHome: (agentId: string): Promise<{ home: string; notes: string[] }> =>
+    invoke<{ home: string; notes: string[] }>('buddy_ensure_library_acp_home', { agentId }),
+
   checkHealth: (): Promise<boolean> =>
     invoke<boolean>('buddy_check_health'),
   bootstrap: (): Promise<BootstrapResponse> =>
@@ -101,7 +180,7 @@ const buddy = {
     invoke<GitPushAvailability>('buddy_git_push_availability', { repoRoot, remote }),
   gitPush: (repoRoot: string, remote: string): Promise<GitPushResult> =>
     invoke<GitPushResult>('buddy_git_push', { repoRoot, remote }),
-  generateCommitMessage: (input: { repoRoot: string; actor: string; lang?: string; paths: string[]; taskSettings?: TaskSettings | null }): Promise<{ message: string }> =>
+  generateCommitMessage: (input: { repoRoot: string; actor: string; model?: string; lang?: string; paths: string[]; taskSettings?: TaskSettings | null }): Promise<{ message: string }> =>
     invoke<{ message: string }>('buddy_generate_commit_message', { input }),
   cancelGenerateCommitMessage: (): Promise<void> =>
     invoke<void>('buddy_cancel_generate_commit_message'),
@@ -109,8 +188,8 @@ const buddy = {
     invoke<TestLauncherResult>('buddy_test_launcher', { actor, command, env, protocol, args }),
   detectActorModels: (): Promise<Record<string, string | undefined>> =>
     invoke<Record<string, string | undefined>>('buddy_detect_actor_models'),
-  listAcpModels: (actor: string, cwd?: string): Promise<AcpModelList> =>
-    invoke<AcpModelList>('buddy_list_acp_models', { actor, cwd }),
+  listAcpModels: (actor: string, cwd?: string, context?: ModelListContext): Promise<AcpModelList> =>
+    invoke<AcpModelList>('buddy_list_acp_models', { actor, cwd, context }),
   updateTaskText: (taskId: string, workspaceKey: string, taskText: string): Promise<void> =>
     invoke<void>('buddy_update_task_text', { taskId, workspaceKey, taskText }),
   updateTaskLauncherModel: (taskId: string, workspaceKey: string, actor: string, model: string): Promise<TaskSettings> =>

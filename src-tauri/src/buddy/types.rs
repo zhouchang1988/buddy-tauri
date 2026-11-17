@@ -24,6 +24,8 @@ pub enum TaskStatus {
     RunningOpencode,
     #[serde(rename = "RUNNING_KIMI")]
     RunningKimi,
+    #[serde(rename = "RUNNING_DSH")]
+    RunningDsh,
     #[serde(rename = "RUNNING_WECODE_CLAUDE")]
     RunningWecodeClaude,
     #[serde(rename = "RUNNING_WECODE_CODEX")]
@@ -55,6 +57,7 @@ impl TaskStatus {
             TaskStatus::RunningAgy => "RUNNING_AGY",
             TaskStatus::RunningOpencode => "RUNNING_OPENCODE",
             TaskStatus::RunningKimi => "RUNNING_KIMI",
+            TaskStatus::RunningDsh => "RUNNING_DSH",
             TaskStatus::RunningWecodeClaude => "RUNNING_WECODE_CLAUDE",
             TaskStatus::RunningWecodeCodex => "RUNNING_WECODE_CODEX",
             TaskStatus::RunningWecodeOpencode => "RUNNING_WECODE_OPENCODE",
@@ -76,6 +79,7 @@ impl TaskStatus {
             "agy" => TaskStatus::RunningAgy,
             "opencode" => TaskStatus::RunningOpencode,
             "kimi" => TaskStatus::RunningKimi,
+            "dsh" => TaskStatus::RunningDsh,
             "wecode_claude" => TaskStatus::RunningWecodeClaude,
             "wecode_codex" => TaskStatus::RunningWecodeCodex,
             "wecode_opencode" => TaskStatus::RunningWecodeOpencode,
@@ -92,6 +96,7 @@ impl TaskStatus {
                 | TaskStatus::RunningAgy
                 | TaskStatus::RunningOpencode
                 | TaskStatus::RunningKimi
+                | TaskStatus::RunningDsh
                 | TaskStatus::RunningWecodeClaude
                 | TaskStatus::RunningWecodeCodex
                 | TaskStatus::RunningWecodeOpencode
@@ -218,6 +223,8 @@ pub struct TaskState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kimi_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dsh_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wecode_claude_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wecode_codex_thread_id: Option<String>,
@@ -310,11 +317,17 @@ pub struct TaskSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed_kimi_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_dsh_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed_wecode_claude_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed_wecode_codex_thread_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed_wecode_opencode_session_id: Option<String>,
+}
+
+fn default_launcher_timeout_seconds() -> u64 {
+    600
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -327,6 +340,7 @@ pub struct Launcher {
     pub args: Option<Vec<String>>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    #[serde(default = "default_launcher_timeout_seconds")]
     pub timeout_seconds: u64,
     /// Per-task ACP model id selected in the create-task modal or composer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -342,9 +356,29 @@ pub struct AcpModelInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AcpModelList {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     pub models: Vec<AcpModelInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_model_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelListContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launcher: Option<Launcher>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCatalogUpdate {
+    pub actor: String,
+    pub protocol: String,
+    pub list: AcpModelList,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -359,7 +393,7 @@ pub struct AcpPreset {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscriptEntry {
-    pub role: String, // 'human' | 'claude' | 'codex' | 'cursor' | 'agy' | 'opencode' | 'kimi' | 'wecode_claude' | 'wecode_codex' | 'wecode_opencode' | 'system'
+    pub role: String, // 'human' | native/dynamic actor id | 'wecode_*' | 'system'
     pub content: String,
     pub ts: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -432,6 +466,8 @@ pub struct BootstrapResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GlobalSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_management: Option<HashMap<String, crate::buddy::agents::AgentConfiguration>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub countdown_seconds: Option<u64>,
@@ -453,6 +489,8 @@ pub struct GlobalSettings {
     pub seed_opencode_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed_kimi_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_dsh_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed_wecode_claude_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -647,7 +685,17 @@ pub struct RoundEventEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct TokenAvailability {
+    pub input: bool,
+    pub output: bool,
+    pub cache: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RoundEventSummary {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_availability: Option<TokenAvailability>,
     pub run_id: String,
     pub events: Vec<RoundEventEntry>,
     pub input_tokens: u64,
@@ -664,6 +712,8 @@ pub struct RoundEventSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskActorStats {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_availability: Option<TokenAvailability>,
     pub actor: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -679,6 +729,8 @@ pub struct TaskActorStats {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskStats {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_availability: Option<TokenAvailability>,
     pub actors: Vec<TaskActorStats>,
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,

@@ -82,7 +82,7 @@ export const api = {
     buddy().gitPushAvailability(repoRoot, remote),
   gitPush: (repoRoot: string, remote: string): Promise<import('../shared/types').GitPushResult> =>
     buddy().gitPush(repoRoot, remote),
-  generateCommitMessage: (input: { repoRoot: string; actor: string; lang?: string; paths: string[]; taskSettings?: import('../shared/types').TaskSettings | null }) =>
+  generateCommitMessage: (input: { repoRoot: string; actor: string; model?: string; lang?: string; paths: string[]; taskSettings?: import('../shared/types').TaskSettings | null }) =>
     buddy().generateCommitMessage(input),
   cancelGenerateCommitMessage: () =>
     buddy().cancelGenerateCommitMessage(),
@@ -100,8 +100,10 @@ export const api = {
     ) as Promise<TestLauncherResult>,
   detectActorModels: () =>
     buddy().detectActorModels() as Promise<Record<string, string | undefined>>,
-  listAcpModels: (actor: string, cwd?: string) =>
-    buddy().listAcpModels(actor, cwd) as Promise<AcpModelList>,
+  listAcpModels: (actor: string, cwd?: string, context?: import('../shared/types').ModelListContext) =>
+    buddy().listAcpModels(actor, cwd, context) as Promise<AcpModelList>,
+  listCliModels: (id: string, context?: import('../shared/types').ModelListContext) =>
+    buddy().listCliModels(id, context) as Promise<AcpModelList>,
   updateTaskLauncherModel: (taskId: string, workspaceKey: string, actor: string, model: string) =>
     buddy().updateTaskLauncherModel(taskId, workspaceKey, actor, model) as Promise<TaskSettings>,
   checkAcpGlobalAdapters: () =>

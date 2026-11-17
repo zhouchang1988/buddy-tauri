@@ -2,7 +2,7 @@
 
 Buddy（Tauri 版）采用「Rust 单测 + 前端单测 + 手工冒烟」的三层测试策略。原 Electron 版的 Playwright E2E 未移植，原因与替代路径见文末。
 
-## 一、Rust 单元测试（257 个）
+## 一、Rust 单元测试（512 个）
 
 ```bash
 pnpm test:rust
@@ -16,29 +16,18 @@ cargo test --manifest-path src-tauri/Cargo.toml
 cargo test --manifest-path src-tauri/Cargo.toml store     # 只跑 store 模块
 ```
 
-各模块覆盖内容（257 个测试的分布）：
+当前共 512 个测试（含 1 个平台相关忽略项），主要覆盖：
 
-| 模块 | 测试数 | 覆盖内容 |
-|------|-------:|----------|
-| `buddy::runner` | 53 | 任务状态机、轮次调度、失败重试/恢复、倒计时跳过/暂停、打断与退出错误处理、健康检查、compact 设置与重试 |
-| `buddy::parsers` | 42 | 5 种 actor CLI 流式输出解析（Claude / Codex / Cursor / OpenCode / Kimi），含转义、截断、畸形行容错 |
-| `buddy::model_detect` | 33 | 从各 actor 配置文件与 CLI 参数检测实际生效模型，含 WeCode 命令识别与 `-m`/`--model` 优先规则 |
-| `buddy::queue_coordinator` | 27 | 指令队列的入队/出队/清空/插队、reconcile 合并、queue.blocked 去重 |
-| `buddy::launchers` | 17 | 原生/契约启动器判定、命令拆分、session 复用参数拼接、能力降级 |
-| `buddy::git` | 15 | status/diff/stage/commit/push、分支列表与切换、分支名合法性校验 |
-| `buddy::store` | 13 | 原子写（`.tmp` → rename）、events/transcript JSONL 读写、读时校验、`get_round_events`、`get_task_stats` |
-| `buddy::service` | 11 | `BuddyCoreService` 门面：bootstrap、任务 CRUD、设置更新、事件转发 |
-| `buddy::prompts` | 9 | 双 actor prompt 构建（与 Electron 版逐字节一致）、语言检测 |
-| `buddy::schemas` | 8 | 读时 schema 校验与默认值补齐、前向兼容（未知字段容忍） |
-| `buddy::notifications` | 8 | 任务完成/失败/暂停通知的 payload 构造 |
-| `buddy::session_insight` | 7 | 从 kimi `wire.jsonl` / opencode 会话存储归集模型与 token 用量 |
-| `buddy::redact` | 4 | 事件写入前的 API key 脱敏 |
-| `commands::tests` | 4 | command 层参数序列化契约 |
-| `menu::tests` | 3 | 菜单语言切换与事件名 |
-| `buddy::paths` | 2 | workspace key = slug + sha256(path) 前 12 位，与 Electron 版一致 |
-| `updater::tests` | 1 | `updater:event` payload 形状与前端 `useUpdater` 对齐 |
+- 任务状态机、Actor 启动器与原生 NDJSON/ACP 解析、失败重试/恢复、健康检查、compact 设置与重试
+- 指令队列、Git 操作、原子持久化、读时 schema、事件/统计、通知和脱敏
+- dsh 参数与输出、CodeBuddy 启动、ACP 凭据共享和用量完整性
+- Agent 版本比较、认证失败识别、模型目录解析、SHA-256 模型缓存
+- Skills 导入/eject、MCP 的 JSONC/TOML/dsh 局部写回与格式转换
+- `BuddyCoreService` 的 Agent 配置与资源库真实调用回归
 
-## 二、前端单元测试（96 个，vitest）
+按模块过滤时可直接使用测试名关键字，例如 `cargo test --manifest-path src-tauri/Cargo.toml library`。
+
+## 二、前端单元测试（304 个，vitest）
 
 ```bash
 pnpm test
@@ -46,11 +35,11 @@ pnpm test
 vitest run tests/unit
 ```
 
-12 个测试文件：
+27 个测试文件：
 
-- `tests/unit/bridge/tauri-bridge.test.ts` — 桥接层契约：mock `@tauri-apps/api`，验证每个 `window.buddy` / `window.api` 方法调用正确的 command 名与 camelCase 参数对象，事件订阅/退订行为
-- `tests/unit/renderer/`（10 个文件）— 从 Electron 版原样移植的组件与工具测试：sidebar、chat-area、message-bubble、task-list、status-bar、title-bar、keyboard、markdown（含 edge cases）、api
-- `tests/unit/format.test.ts` — 格式化工具
+- `tests/unit/bridge/tauri-bridge.test.ts` — 桥接层契约：mock `@tauri-apps/api`，验证 `window.buddy` / `window.api` 的 command 名、camelCase 参数、Agent/Library API 与事件订阅/退订
+- `tests/unit/renderer/`（25 个文件）— 组件、Composer/新建任务模型选择、Agent 更新、Skills/MCP、会话与主题相关行为
+- `tests/unit/format.test.ts` — 格式化、模型标签与恢复命令工具
 
 前端改动需同时保证 `pnpm typecheck` 干净。
 

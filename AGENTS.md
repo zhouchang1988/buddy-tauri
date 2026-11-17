@@ -6,7 +6,7 @@ This file provides guidance to AI agents (Codex, Claude Code, Kimi Code, etc.) w
 
 **Research experiment, not a stable product.** This repository exists to study **switching development stacks with AI-assisted coding** — having AI agents port a complete Electron app to Tauri 2 (Rust backend). It is experimental; functionality and quality are not guaranteed. For a reliable Buddy experience, use the original project: [davidhoo/buddy](https://github.com/davidhoo/buddy) (official site: https://davidhoo.github.io/buddy/).
 
-Buddy is a macOS desktop app that orchestrates **dual-AI-agent collaborative coding**. Two AI actors (implementer + reviewer) take turns on a task, and the loop ends when both actors confirm "break" (dual-break). Supported actors: Claude Code, Codex, Cursor CLI, Antigravity (agy), OpenCode, Kimi Code.
+Buddy is a macOS desktop app that orchestrates **dual-AI-agent collaborative coding**. Two AI actors (implementer + reviewer) take turns on a task, and the loop ends when both actors confirm "break" (dual-break). Supported actors: Claude Code, Codex, Cursor CLI, Antigravity (agy), OpenCode, Kimi Code, DeepSeek Harness (dsh), CodeBuddy, plus discovered ACP-compatible agents and WeCode variants.
 
 This repository is the **Tauri 2 port** of the Electron edition. The backend is Rust (`src-tauri/src/`), ported module by module from the Electron main process; the renderer is reused verbatim. Data directories (`~/Library/Application Support/buddy/`) are byte-for-byte compatible with the Electron edition.
 
@@ -26,7 +26,7 @@ pnpm dist:intel             # x86_64 (Intel) DMG
 pnpm dist:universal         # Universal DMG (both arches; needs rustup targets aarch64/x86_64-apple-darwin)
 ```
 
-Both test suites must stay green: `cargo test` (490 tests) **and** `pnpm test` (264 tests).
+Both test suites must stay green: `cargo test` (512 tests) **and** `pnpm test` (304 tests).
 
 ## Architecture
 
@@ -40,14 +40,16 @@ The renderer was ported with zero changes, so the bridge reconstructs the exact 
 
 When adding a command: implement `#[tauri::command]` in `src-tauri/src/commands.rs`, register it in `src-tauri/src/lib.rs`'s `generate_handler!`, and add the matching method in `src/lib/tauri-bridge.ts` — all three must agree.
 
-### Core: BuddyCoreService → BuddyStore + BuddyRunner + BuddyEventBus + QueueCoordinator
+### Core: BuddyCoreService → Store + Runner + EventBus + QueueCoordinator + Agent/Library services
 
-`src-tauri/src/buddy/service.rs` composes four modules:
+`src-tauri/src/buddy/service.rs` composes the task core plus local Agent and library services:
 
 - **Store** (`store.rs`): Filesystem persistence. All JSON writes are atomic (write `.tmp`, then `rename`). Schemas validate on read, not write, for forward compatibility.
 - **Runner** (`runner.rs`): Spawns actor CLIs, drives the task state machine, parses streaming output.
 - **EventBus** (`events.rs`): tokio broadcast pub/sub for task lifecycle events; `lib.rs` forwards every envelope to the frontend as a `buddy:event` emit.
 - **QueueCoordinator** (`queue_coordinator.rs`): Instruction queue scheduling — instructions sent while an actor runs are queued and auto-executed after the round.
+- **AgentManagementService** (`agents.rs`): Local Agent inventory, protocol configuration, model catalogs and persistent update batches; inventory/update/model events are forwarded to the renderer.
+- **LibraryService** (`library.rs`): Skills/MCP discovery, import, assignment and removal with atomic JSONC/TOML/dsh edits.
 
 ### Rust backend modules (`src-tauri/src/buddy/`)
 
@@ -64,7 +66,11 @@ When adding a command: implement `#[tauri::command]` in `src-tauri/src/commands.
 | `coalesce.rs` | `StdoutCoalescer` — merges high-frequency `actor.stdout` chunks before `lib.rs` emits them to the webview (keeps typing responsive during runs) |
 | `redact.rs` | API-key/secret redaction before events are written |
 | `shell_path.rs` | `fix_shell_path()` — login-shell PATH & proxy-env inheritance for GUI-launched apps (posix/fish/csh) |
-| `parsers.rs` | Streaming-output parsers for the 6 actor CLIs |
+| `parsers.rs` | Streaming-output parsers for native actor CLIs (including dsh) |
+| `agents.rs` | Local Agent discovery/configuration, inventory and update batches, CLI model catalogs |
+| `model_cache.rs` | SHA-256-keyed memory/disk model-catalog cache (never stores raw launch credentials) |
+| `library.rs` | Skills/MCP discovery, import, assignment/eject, JSONC/TOML/dsh edits and ACP-home bootstrap |
+| `token_usage.rs` | Normalizes explicit billable token counters and ignores context-window metrics |
 | `prompts.rs` | Byte-faithful prompt construction |
 | `launchers.rs` | Native vs contract launcher detection and spawning (node-pty → `portable-pty`) |
 | `queue_coordinator.rs` | Instruction queue coordination across rounds |
@@ -77,11 +83,11 @@ When adding a command: implement `#[tauri::command]` in `src-tauri/src/commands.
 | `notifications.rs` | Desktop notifications via tauri-plugin-notification |
 | `acp/` | ACP (Agent Client Protocol) channel, port of upstream v2.0 `src/main/buddy/acp/`: wire types, stdio transport, client, model extract/apply/probe (`models.rs`), Codex home isolation (`codex_home.rs`), and adapter lookup / env / binary resolution (`agent_catalog.rs`). Wired into the runner: `launcher.protocol == "acp"` routes `execute_actor`/ping through `AcpClient` (session/new + session/load resume, per-task model, `buddy_propose_break` → dual-break, context-overflow session reset); the service exposes `list_acp_models` / `check_acp_global_adapters` / `update_task_launcher_model` and the ACP `test_launcher` path |
 
-Plus at the crate root: `commands.rs` (47 `#[tauri::command]` handlers), `menu.rs` (native menu), `updater.rs` (tauri-plugin-updater flow), `lib.rs` (wiring).
+Plus at the crate root: `commands.rs` (72 `#[tauri::command]` handlers), `menu.rs` (native menu), `updater.rs` (tauri-plugin-updater flow), `lib.rs` (wiring).
 
 ### `lib.rs` wiring order
 
-`fix_shell_path()` → register plugins (dialog/notification/shell/opener/clipboard-manager/updater) → in `setup`: build `BuddyEventBus` + `BuddyCoreService` (with notifier factory) → spawn task forwarding the bus to `app.emit("buddy:event", ...)` → `block_on(service.recover_interrupted_runs())` (must run before the window is created, matching the Electron edition's `app.whenReady()` ordering) → `app.manage(service)` → `menu::setup_menu` → `updater::init_updater` → `generate_handler!` registers all 47 commands. On macOS, `CloseRequested` is intercepted to hide the window instead of closing it (so actor runs survive in the background), and `RunEvent::Reopen` (Dock click with no visible window) shows + focuses the main window — the Electron edition's `window-all-closed`/`activate` behavior.
+`fix_shell_path()` → register plugins (dialog/notification/shell/opener/clipboard-manager/updater) → in `setup`: build `BuddyEventBus` + `BuddyCoreService` (with notifier factory) → spawn forwarders for `buddy:event`, Agent inventory/update and model-catalog events → `block_on(service.recover_interrupted_runs())` (must run before the window is created, matching the Electron edition's `app.whenReady()` ordering) → `block_on(service.initialize_agents())` (cache/update recovery only) → `app.manage(service)` → spawn background Agent discovery/update checks → `menu::setup_menu` → `updater::init_updater` → `generate_handler!` registers all 72 commands. On macOS, `CloseRequested` is intercepted to hide the window instead of closing it (so actor runs survive in the background), and `RunEvent::Reopen` (Dock click with no visible window) shows + focuses the main window — the Electron edition's `window-all-closed`/`activate` behavior.
 
 ### Task state machine
 

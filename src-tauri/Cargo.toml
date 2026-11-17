@@ -1,6 +1,6 @@
 [package]
 name = "buddy"
-version = "2.0.5"
+version = "2.0.19"
 description = "Dual AI Agent collaborative coding desktop app (Tauri edition)"
 license = "MIT"
 edition = "2021"
@@ -36,6 +36,10 @@ dirs = "6"
 parking_lot = "0.12"
 async-trait = "0.1"
 thiserror = "2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+jsonc-parser = { version = "0.26", features = ["serde", "preserve_order"] }
+toml = "0.8"
+serde_yaml = "0.9"
 
 [dev-dependencies]
 tempfile = "3"

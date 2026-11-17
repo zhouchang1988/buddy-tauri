@@ -1,3 +1,6 @@
+import { AgentsSettings } from './settings/AgentsSettings'
+import { SkillsPage } from './library/SkillsPage'
+import { McpPage } from './library/McpPage'
 import { useEffect, useState, useMemo, useRef, useCallback, Fragment } from 'react'
 import { createPortal } from 'react-dom'
 import { HexColorPicker } from 'react-colorful'
@@ -25,12 +28,12 @@ import {
   bindingsEqual,
 } from '../lib/keyboard'
 import type { GlobalSettings, Launcher } from '../shared/types'
-import { DEFAULT_LAUNCHER_ORDER, KNOWN_ACP_PRESETS, defaultLauncherFor, normalizeGlobalSettings } from '../shared/defaults'
+import { DEFAULT_LAUNCHER_ORDER, KNOWN_ACP_PRESETS, defaultLauncherFor, globalLauncherTimeout, normalizeGlobalSettings } from '../shared/defaults'
 import { actorColorVar } from '../lib/format'
 import { CheckCircle, XCircle, Loader2, Zap, AlertCircle, Info, Copy, Check } from 'lucide-react'
 import { Switch } from './Switch'
 
-export type SettingsTab = 'general' | 'appearance' | 'keyboard' | 'prompts'
+export type SettingsTab = 'general' | 'agents' | 'skills' | 'mcp' | 'appearance' | 'keyboard' | 'prompts'
 
 interface SettingsContentProps {
   tab: SettingsTab
@@ -83,6 +86,13 @@ function launcherInfoFor(actor: string, t: TFunction): LauncherInfo {
         placeholder: 'kimi',
         hint: <HintWithCode template={t('settings.launcher.kimi.hint')} />
       }
+    case 'dsh':
+      return {
+        title: t('settings.launcher.dsh.title'),
+        label: t('settings.launcher.dsh.label'),
+        placeholder: 'dsh',
+        hint: <HintWithCode template={t('settings.launcher.dsh.hint')} />
+      }
     case 'wecode_claude':
       return {
         title: t('settings.launcher.wecode_claude.title'),
@@ -119,18 +129,22 @@ function HintWithCode({ template }: { template: string }) {
 
 export function SettingsContent({ tab, globalSettings }: SettingsContentProps) {
   const t = useT()
-  const pageTitle = tab === 'general'
-    ? t('settings.tab.general')
-    : tab === 'appearance'
-      ? t('settings.tab.appearance')
-      : tab === 'keyboard'
-        ? t('settings.tab.keyboard')
-        : t('settings.tab.prompts')
+  const pageTitle = tab === 'agents' ? t('settings.tab.agents')
+    : tab === 'skills' ? t('settings.tab.skills')
+    : tab === 'mcp' ? t('settings.tab.mcp')
+    : tab === 'general' ? t('settings.tab.general')
+    : tab === 'appearance' ? t('settings.tab.appearance')
+    : tab === 'keyboard' ? t('settings.tab.keyboard')
+    : t('settings.tab.prompts')
   return (
     <div className="flex-1 overflow-y-auto bg-bg-elevated">
       <div className="max-w-4xl mx-auto px-10 py-10">
         <h1 className="text-2xl font-semibold mb-8">{pageTitle}</h1>
-        {tab === 'general' ? (
+        {tab === 'agents' ? <AgentsSettings /> : tab === 'skills' ? (
+          <SkillsPage />
+        ) : tab === 'mcp' ? (
+          <McpPage />
+        ) : tab === 'general' ? (
           <GeneralSettings globalSettings={globalSettings} />
         ) : tab === 'appearance' ? (
           <AppearanceSettings />
@@ -319,49 +333,13 @@ function GeneralSettings({ globalSettings }: { globalSettings: GlobalSettings | 
     save({ launchers: nextLaunchers })
   }
 
-  const currentTimeout =
-    DEFAULT_LAUNCHER_ORDER.map((a) => launchers[a]?.timeout_seconds).find((v) => typeof v === 'number') ?? 7200
+  const currentTimeout = globalLauncherTimeout(normalizedSettings)
 
   const { data: globalAdapters, refetch: refetchGlobalAdapters } = useAcpGlobalAdapters()
 
   return (
     <div className="space-y-8">
       <GeneralSection />
-
-      <div className="pt-2">
-        <h2 className="text-base font-semibold text-fg mb-1">{t('settings.cli.title')}</h2>
-        <p className="text-sm text-fg-secondary mb-5">{t('settings.cli.desc')}</p>
-      </div>
-
-      <SettingsList>
-        {DEFAULT_LAUNCHER_ORDER.map((actor) => {
-          const launcher = launchers[actor] ?? defaultLauncherFor(actor)
-          const isFirstWecode = actor === 'wecode_claude'
-          return (
-            <Fragment key={actor}>
-              {isFirstWecode && (
-                <div className="px-4 py-2 bg-bg-subtle/50 flex items-center gap-2.5 select-none">
-                  <div className="h-px bg-border-subtle flex-1" />
-                  <span className="text-[11px] text-fg-muted font-medium tracking-wide">
-                    {t('settings.launcher.internalToolsHeader')}
-                  </span>
-                  <div className="h-px bg-border-subtle flex-1" />
-                </div>
-              )}
-              <LauncherSection
-                actor={actor}
-                launcher={launcher}
-                info={launcherInfoFor(actor, t)}
-                onSave={(patch) => saveLauncher(actor, patch)}
-                globalAdapters={globalAdapters}
-                onRefreshAdapters={() => {
-                  void refetchGlobalAdapters()
-                }}
-              />
-            </Fragment>
-          )
-        })}
-      </SettingsList>
 
       <div className="pt-4">
         <h2 className="text-base font-semibold text-fg mb-1">{t('settings.collab.title')}</h2>
@@ -783,13 +761,13 @@ function LauncherSection({
         )
       )}
 
-      {protocol === 'acp' && (actor === 'agy' || actor === 'kimi') && (
+      {protocol === 'acp' && (actor === 'agy' || actor === 'dsh') && (
         <div className="mb-3 px-3 py-2 rounded-lg text-xs bg-amber-500/10 text-amber-700 dark:text-amber-300 border border-amber-500/20 flex items-start gap-2">
           <AlertCircle size={14} className="shrink-0 mt-0.5" />
           <span>
             {actor === 'agy'
               ? t('settings.launcher.agyAcpWarning')
-              : t('settings.launcher.kimiAcpWarning')}
+              : t('settings.launcher.dshAcpWarning')}
           </span>
         </div>
       )}

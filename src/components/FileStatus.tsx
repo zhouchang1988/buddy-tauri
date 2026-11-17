@@ -6,11 +6,12 @@ import { useT, type TFunction } from '../hooks/useI18n'
 import { useLanguage } from '../hooks/useI18n'
 import { api } from '../lib/api'
 import { formatBinding, loadBindings } from '../lib/keyboard'
-import { useQueryClient } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { ChangesModal } from './ChangesModal'
 import { BranchModal } from './BranchModal'
-import { ACTOR_LABEL_KEY } from '../lib/format'
-import { DEFAULT_LAUNCHER_ORDER, normalizeLauncher, normalizeGlobalSettings } from '../shared/defaults'
+import { ACTOR_LABEL_KEY, modelOptionLabel } from '../lib/format'
+import { selectableAgentIds, resolveCommitAgentLaunch } from '../shared/agents'
+import { useAgentInventory } from '../hooks/useAgentUpdates'
 
 export interface CommitFeedback {
   type: 'success' | 'error'
@@ -301,7 +302,7 @@ export function CommitModal({ gitStatus, repoRoot, globalSettings, taskSettings,
   const queryClient = useQueryClient()
   const autoGenerate = globalSettings?.auto_generate_commit_message ?? true
   const [message, setMessage] = useState('')
-  const [isGenerating, setIsGenerating] = useState(autoGenerate)
+  const [isGenerating, setIsGenerating] = useState(false)
   const [generateFailed, setGenerateFailed] = useState(false)
   const [generateError, setGenerateError] = useState<string | null>(null)
   const [isStaging, setIsStaging] = useState(false)
@@ -325,72 +326,51 @@ export function CommitModal({ gitStatus, repoRoot, globalSettings, taskSettings,
   const stageAll = useGitStageAll()
   const commitAndPush = useGitCommitAndPush()
 
-  // Actor selection for commit message generation — all configured actors.
-  // Models are display-only (CLI config / task-or-global launcher.model); the
-  // commit modal never offers a separate model picker.
-  const commitActors = useMemo(() => [...DEFAULT_LAUNCHER_ORDER], [])
-
-  const resolveDefaultActor = (): string => {
-    try {
-      const stored = localStorage.getItem('buddy.lastCommitMessageActor')
-      if (stored && commitActors.includes(stored as typeof DEFAULT_LAUNCHER_ORDER[number])) return stored
-    } catch { /* localStorage not available */ }
-    const impl = taskSettings?.implementer_actor
-    if (impl && commitActors.includes(impl as typeof DEFAULT_LAUNCHER_ORDER[number])) return impl
-    return 'claude'
-  }
-  const [selectedActor, setSelectedActor] = useState<string>(resolveDefaultActor)
-
-  const normalizedGlobals = useMemo(
-    () => normalizeGlobalSettings(globalSettings),
-    [globalSettings]
-  )
-
-  const resolveLauncherForActor = useCallback((actor: string) => {
-    const fromTask = taskSettings?.launchers?.[actor]
-    const fromGlobal = normalizedGlobals.launchers?.[actor]
-    const base = fromTask
-      ? normalizeLauncher(actor, {
-          ...fromTask,
-          // Preserve ACP when the task snapshot omitted protocol but still
-          // points at the same global ACP launcher / npx adapter.
-          protocol:
-            fromTask.protocol
-            ?? (fromGlobal?.protocol === 'acp'
-              && (fromTask.command === fromGlobal.command || fromTask.command === 'npx')
-              ? 'acp'
-              : undefined),
-          args: fromTask.args ?? (fromGlobal?.protocol === 'acp' ? fromGlobal.args : undefined),
-          model: fromTask.model ?? fromGlobal?.model
-        })
-      : normalizeLauncher(actor, fromGlobal)
-    return base
-  }, [taskSettings?.launchers, normalizedGlobals.launchers])
-
-  const [cliModels, setCliModels] = useState<Record<string, string | undefined>>({})
+  const { data: inventory, error: inventoryError } = useAgentInventory()
+  const commitActors = useMemo(() => selectableAgentIds(inventory?.agents ?? []), [inventory])
+  const [selectedActor, setSelectedActor] = useState<string>(() => {
+    try { return localStorage.getItem('buddy.lastCommitMessageActor') || taskSettings?.implementer_actor || '' }
+    catch { return taskSettings?.implementer_actor || '' }
+  })
+  const actorAvailable = commitActors.includes(selectedActor)
+  const selectionInitialized = useRef(false)
   useEffect(() => {
-    let cancelled = false
-    window.buddy?.detectActorModels?.()
-      .then((models) => { if (!cancelled) setCliModels(models ?? {}) })
-      .catch(() => {})
-    return () => { cancelled = true }
-  }, [normalizedGlobals.launchers])
-
-  const actorOptionLabel = useCallback((actor: string): string => {
-    const nameKey = ACTOR_LABEL_KEY[actor]
-    const name = nameKey ? t(nameKey) : actor
-    const launcher = resolveLauncherForActor(actor)
-    if (launcher.protocol === 'acp') {
-      // Prefer the model already chosen for this task / global launcher —
-      // never a commit-modal override.
-      const model = launcher.model?.trim()
-      return model ? `${name} · ${model}` : name
+    if (!inventory || !commitActors.length) return
+    if (!selectionInitialized.current) {
+      selectionInitialized.current = true
+      if (!actorAvailable) setSelectedActor(
+        taskSettings?.implementer_actor && commitActors.includes(taskSettings.implementer_actor)
+          ? taskSettings.implementer_actor : commitActors[0] ?? '')
     }
-    const model = cliModels[actor]
-    return model ? `${name} (${model})` : name
-  }, [t, resolveLauncherForActor, cliModels])
+  }, [inventory, actorAvailable, commitActors, taskSettings])
+  const resolveLauncherForActor = useCallback((actor: string) => {
+    const agent = inventory?.agents.find(item => item.id === actor)
+    return agent ? resolveCommitAgentLaunch(agent, globalSettings, taskSettings) : undefined
+  }, [inventory, globalSettings, taskSettings])
+
+  const selectedAgent = inventory?.agents.find(agent => agent.id === selectedActor)
+  const launcher = resolveLauncherForActor(selectedActor)
+  const protocol = launcher?.protocol ?? 'cli'
+  const modelCatalog = useQuery({
+    queryKey: ['taskActorModels', selectedActor, protocol, launcher?.command, launcher?.args, launcher?.env, selectedAgent?.installationId, selectedAgent?.version],
+    queryFn: () => (protocol === 'acp' ? window.buddy.listAcpModels(selectedActor) : window.buddy.listCliModels(selectedActor)),
+    enabled: actorAvailable && !!(protocol === 'acp' ? window.buddy?.listAcpModels : window.buddy?.listCliModels),
+    retry: false,
+    staleTime: 300000,
+    gcTime: 30 * 60 * 1000
+  })
+  const [modelChoices, setModelChoices] = useState<Record<string, string>>({})
+  const modelKey = JSON.stringify([selectedActor, protocol, launcher?.command, launcher?.args, launcher?.env])
+  const selectedModel = modelChoices[modelKey] ?? launcher?.model ?? '__native__'
+  const models = modelCatalog.data?.models ?? []
+  const modelUnavailable = protocol === 'acp' && selectedModel !== '__native__' && models.length > 0 && !models.some(model => model.id === selectedModel)
+  const actorOptionLabel = (actor: string): string => {
+    const key = ACTOR_LABEL_KEY[actor]
+    return key ? t(key) : inventory?.agents.find(agent => agent.id === actor)?.name || actor
+  }
 
   const handleActorChange = useCallback((actor: string) => {
+    autoGenerationStarted.current = true
     setSelectedActor(actor)
     try { localStorage.setItem('buddy.lastCommitMessageActor', actor) } catch { /* ignore */ }
     // Cancel any in-progress generation when switching actor
@@ -446,7 +426,7 @@ export function CommitModal({ gitStatus, repoRoot, globalSettings, taskSettings,
   }, [repoRoot, stageAll, onError])
 
   const handleGenerate = useCallback(async (paths: string[]) => {
-    if (!paths.length) {
+    if (!actorAvailable || modelUnavailable || !paths.length) {
       setMessage('')
       setIsGenerating(false)
       return
@@ -459,6 +439,7 @@ export function CommitModal({ gitStatus, repoRoot, globalSettings, taskSettings,
       const result = await api.generateCommitMessage({
         repoRoot,
         actor: selectedActor,
+        model: selectedModel,
         lang,
         paths,
         taskSettings
@@ -484,7 +465,7 @@ export function CommitModal({ gitStatus, repoRoot, globalSettings, taskSettings,
     } finally {
       if (seq === generateSeq.current) setIsGenerating(false)
     }
-  }, [repoRoot, lang, selectedActor, taskSettings])
+  }, [repoRoot, lang, selectedActor, taskSettings, actorAvailable, selectedModel, modelUnavailable])
 
   // 打断正在进行的生成,恢复为可点击的“生成”按钮
   const handleCancelGenerate = useCallback(() => {
@@ -517,16 +498,19 @@ export function CommitModal({ gitStatus, repoRoot, globalSettings, taskSettings,
     if (isGenerating) restartGenerate([...next])
   }, [selectedPaths, allFiles, isGenerating, restartGenerate])
 
-  // 打开时自动生成(基于初始全选)
+  // Wait for inventory and initial selection; background changes must never regenerate.
+  const autoGenerationStarted = useRef(false)
   useEffect(() => {
-    if (!autoGenerate) {
-      setIsGenerating(false)
-      return
-    }
-    void handleGenerate(allFiles.map((f) => f.path))
-    // 仅在打开时触发一次;allFiles 来自打开时的快照
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [handleGenerate, autoGenerate])
+    if (!autoGenerate || (inventoryError && !inventory) || (inventory && !commitActors.length)) return
+    if (!inventory || !actorAvailable || modelUnavailable || !allFiles.length || autoGenerationStarted.current) return
+    // StrictMode replays mount effects: defer starting the process until after
+    // that cleanup, otherwise it cancels the request and consumes this guard.
+    const timer = setTimeout(() => {
+      autoGenerationStarted.current = true
+      void handleGenerate([...selectedPaths])
+    }, 0)
+    return () => clearTimeout(timer)
+  }, [autoGenerate, inventory, inventoryError, commitActors.length, actorAvailable, modelUnavailable, allFiles.length, selectedPaths, handleGenerate])
 
   useEffect(() => {
     if (!isGenerating) {
@@ -726,23 +710,55 @@ export function CommitModal({ gitStatus, repoRoot, globalSettings, taskSettings,
 
           {/* 提交信息 */}
           <div>
-            <div className="flex items-center justify-between mb-1">
+            <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
               <label className="text-xs font-medium text-fg-secondary">{t('git.commitMessage')}</label>
-              <div className="flex items-center gap-2">
-                <select
-                  value={selectedActor}
-                  onChange={(e) => handleActorChange(e.target.value)}
-                  disabled={false}
-                  title={t('git.commitMessageActor')}
-                  className="appearance-none px-2 py-0.5 text-xs border border-border rounded focus:outline-none focus:border-accent bg-bg max-w-[220px]"
-                >
-                  {commitActors.map((actor) => (
-                    <option key={actor} value={actor}>{actorOptionLabel(actor)}</option>
-                  ))}
-                </select>
+              <div className="flex flex-wrap items-center gap-2 min-w-0">
+                <div className="relative min-w-0 w-40 max-w-full">
+                  <select
+                    value={selectedActor}
+                    onChange={(e) => handleActorChange(e.target.value)}
+                    disabled={!commitActors.length}
+                    title={t('git.commitMessageActor')}
+                    className="w-full appearance-none pl-3 pr-7 py-1.5 border border-border rounded-lg focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent bg-bg text-xs disabled:opacity-60"
+                  >
+                    {!actorAvailable && <option value={selectedActor}>{t(!inventory && !inventoryError ? 'git.agentsLoading' : !commitActors.length ? 'git.noAvailableAgents' : 'git.agentUnavailable')}</option>}
+                    {commitActors.map((actor) => (
+                      <option key={actor} value={actor}>{actorOptionLabel(actor)}</option>
+                    ))}
+                  </select>
+                  <ChevronDown size={14} className="absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none text-fg-muted" />
+                </div>
+                <div className="relative min-w-0 w-48 max-w-full">
+                  <select
+                    aria-label={t('modal.create.model')}
+                    value={selectedModel}
+                    disabled={!actorAvailable}
+                    aria-busy={modelCatalog.isFetching}
+                    aria-invalid={modelUnavailable || undefined}
+                    className="w-full appearance-none pl-3 pr-7 py-1.5 border border-border rounded-lg focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent bg-bg text-xs disabled:opacity-60"
+                    onChange={event => {
+                      autoGenerationStarted.current = true
+                      setModelChoices(current => ({ ...current, [modelKey]: event.target.value }))
+                      if (isGenerating) {
+                        generateSeq.current++
+                        api.cancelGenerateCommitMessage()
+                        setIsGenerating(false)
+                      }
+                    }}
+                  >
+                    <option value="__native__">{t('agents.native')}</option>
+                    {selectedModel !== '__native__' && !models.some(model => model.id === selectedModel) && (
+                      <option value={selectedModel} disabled={modelUnavailable}>{modelOptionLabel(selectedModel, models)}{modelUnavailable ? ` (${t('modal.create.modelUnavailable')})` : ''}</option>
+                    )}
+                    {models.map(model => <option key={model.id} value={model.id}>{model.name}</option>)}
+                    {modelCatalog.isLoading && !models.length && <option disabled>{t('common.loading')}</option>}
+                    {!modelCatalog.isLoading && !models.length && <option disabled>{t(modelCatalog.error || modelCatalog.data?.error ? 'modal.create.modelLoadFailed' : 'modal.create.modelUnavailable')}</option>}
+                  </select>
+                  <ChevronDown size={14} className="absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none text-fg-muted" />
+                </div>
                 <button
                   onClick={isGenerating ? handleCancelGenerate : () => void handleGenerate([...selectedPaths])}
-                  disabled={isStaging || isCommitting || selectedPaths.size === 0}
+                  disabled={isStaging || isCommitting || selectedPaths.size === 0 || ((!actorAvailable || modelUnavailable) && !isGenerating)}
                   title={isGenerating ? t('git.cancelGenerate') : undefined}
                   className="flex items-center gap-1 text-xs text-accent hover:text-accent-hover disabled:opacity-50"
                 >

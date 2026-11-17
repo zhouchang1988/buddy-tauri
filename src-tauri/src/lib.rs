@@ -49,6 +49,28 @@ pub fn run() {
                 ..Default::default()
             });
 
+            let mut agent_inventory = service.agents().subscribe_inventory();
+            let agent_emitter = app_handle.clone();
+            tauri::async_runtime::spawn(async move {
+                while let Ok(snapshot) = agent_inventory.recv().await {
+                    let _ = agent_emitter.emit("buddy:agent-inventory", snapshot);
+                }
+            });
+            let mut agent_updates = service.agents().subscribe_updates();
+            let update_emitter = app_handle.clone();
+            tauri::async_runtime::spawn(async move {
+                while let Ok(snapshot) = agent_updates.recv().await {
+                    let _ = update_emitter.emit("buddy:agent-update", snapshot);
+                }
+            });
+            let mut model_catalog = service.subscribe_model_catalog();
+            let model_emitter = app_handle.clone();
+            tauri::async_runtime::spawn(async move {
+                while let Ok(update) = model_catalog.recv().await {
+                    let _ = model_emitter.emit("buddy:model-catalog", update);
+                }
+            });
+
             // Forward the event bus to the frontend (TS:
             // `buddyEvents.subscribe(e => win.webContents.send('buddy:event', e))`).
             // High-frequency `actor.stdout` chunks are coalesced for a short
@@ -107,7 +129,14 @@ pub fn run() {
                 eprintln!("[buddy] startup recovery failed: {error}");
             }
 
+            if let Err(error) = tauri::async_runtime::block_on(service.initialize_agents()) {
+                eprintln!("[buddy] Agent initialization failed: {error}");
+            }
             app.manage(service);
+            let agent_startup = app_handle.clone();
+            tauri::async_runtime::spawn(async move {
+                agent_startup.state::<BuddyCoreService>().refresh_agents_on_startup().await;
+            });
 
             menu::setup_menu(app.handle())?;
             updater::init_updater(app.handle());
@@ -150,6 +179,31 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::buddy_get_agent_inventory,
+            commands::buddy_refresh_local_agents,
+            commands::buddy_get_agent_update_state,
+            commands::buddy_start_agent_updates,
+            commands::buddy_list_cli_models,
+            commands::buddy_list_local_agents,
+            commands::buddy_configure_agent,
+            commands::buddy_probe_local_agent,
+            commands::buddy_check_agent_updates,
+            commands::buddy_update_local_agents,
+            commands::buddy_get_agent_update_jobs,
+            commands::buddy_cancel_agent_updates,
+            commands::buddy_get_library_snapshot,
+            commands::buddy_refresh_library,
+            commands::buddy_import_library_skills,
+            commands::buddy_set_library_skill_assignment,
+            commands::buddy_eject_library_skill,
+            commands::buddy_eject_library_server,
+            commands::buddy_add_library_server,
+            commands::buddy_import_library_servers,
+            commands::buddy_set_library_server_assignment,
+            commands::buddy_open_library_auth_guidance,
+            commands::buddy_open_library_dir,
+            commands::buddy_open_library_backups_dir,
+            commands::buddy_ensure_library_acp_home,
             commands::buddy_check_health,
             commands::buddy_bootstrap,
             commands::buddy_get_tasks,

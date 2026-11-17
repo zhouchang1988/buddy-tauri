@@ -12,12 +12,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::Mutex;
 
-const BOOTSTRAP_FILES: [&str; 4] = [
-    "config.toml",
-    "auth.json",
-    "AGENTS.md",
-    "AGENTS.override.md",
-];
+const BOOTSTRAP_FILES: [&str; 3] = ["config.toml", "AGENTS.md", "AGENTS.override.md"];
 const LINKED_DIRS: [&str; 2] = ["skills", "rules"];
 
 fn home_gates() -> &'static Mutex<HashMap<String, Arc<Mutex<()>>>> {
@@ -96,17 +91,121 @@ pub async fn prepare_codex_home(
         }
     }
     // Skills and rules retain their original relative resources. Runtime state
-    // and credentials are deliberately not linked.
+    // stays private; the rotating OAuth credential is shared as one file.
     for name in LINKED_DIRS {
         if existing.contains(name) {
             continue;
         }
         tokio::fs::symlink(source.join(name), home.join(name)).await?;
     }
+    share_auth_file(&source, &home).await?;
     if let Some(session_id) = session_id.filter(|id| valid_session_id(id)) {
         import_session(&source, &home, session_id).await?;
     }
     Ok(home.to_string_lossy().into_owned())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AuthKind {
+    OAuth,
+    ApiKey,
+    Other,
+}
+
+struct AuthRecord {
+    kind: AuthKind,
+    refresh: Option<i64>,
+    account: Option<String>,
+}
+
+async fn read_auth_record(path: &Path) -> Option<AuthRecord> {
+    let value: serde_json::Value =
+        serde_json::from_slice(&tokio::fs::read(path).await.ok()?).ok()?;
+    let mode = value.get("auth_mode").and_then(serde_json::Value::as_str);
+    let api_key = value
+        .get("OPENAI_API_KEY")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|key| !key.is_empty());
+    let tokens = value.get("tokens").and_then(serde_json::Value::as_object);
+    let oauth_tokens = tokens.is_some_and(|tokens| {
+        ["refresh_token", "access_token"].iter().any(|key| {
+            tokens
+                .get(*key)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|token| !token.is_empty())
+        })
+    });
+    let kind = match mode {
+        Some("chatgpt" | "chatgptAuthTokens") => AuthKind::OAuth,
+        Some("apikey") => AuthKind::ApiKey,
+        Some(_) => AuthKind::Other,
+        None if api_key && !oauth_tokens => AuthKind::ApiKey,
+        None if oauth_tokens && !api_key => AuthKind::OAuth,
+        None => AuthKind::Other,
+    };
+    let refresh = value
+        .get("last_refresh")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.timestamp_millis());
+    let account = tokens
+        .and_then(|tokens| tokens.get("account_id"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|account| !account.is_empty())
+        .map(String::from);
+    Some(AuthRecord {
+        kind,
+        refresh,
+        account,
+    })
+}
+
+fn should_publish_private_auth(desktop: &AuthRecord, private: &AuthRecord) -> bool {
+    desktop.kind == AuthKind::OAuth
+        && private.kind == AuthKind::OAuth
+        && desktop
+            .account
+            .as_ref()
+            .is_some_and(|account| !account.is_empty())
+        && desktop.account == private.account
+        && matches!((desktop.refresh, private.refresh), (Some(desktop), Some(private)) if private > desktop)
+}
+
+async fn share_auth_file(source_home: &Path, home: &Path) -> Result<(), AcpError> {
+    let source = source_home.join("auth.json");
+    let target = home.join("auth.json");
+    let (source_auth, target_auth) =
+        tokio::join!(read_auth_record(&source), read_auth_record(&target));
+    let Some(source_auth) = source_auth else {
+        return Ok(());
+    };
+    if tokio::fs::symlink_metadata(&target)
+        .await
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    if let Some(target_auth) = target_auth {
+        if should_publish_private_auth(&source_auth, &target_auth) {
+            let destination = tokio::fs::canonicalize(&source)
+                .await
+                .unwrap_or_else(|_| source.clone());
+            write_private(&destination, &tokio::fs::read(&target).await?, 0o600).await?;
+        }
+    }
+    let temporary = tmp_sibling(&target);
+    let result = async {
+        tokio::fs::symlink(&source, &temporary).await?;
+        tokio::fs::rename(&temporary, &target).await?;
+        Ok::<(), std::io::Error>(())
+    }
+    .await;
+    if result.is_err() {
+        write_private(&target, &tokio::fs::read(&source).await?, 0o600).await?;
+    }
+    let _ = tokio::fs::remove_file(&temporary).await;
+    Ok(())
 }
 
 async fn import_session(source_home: &Path, home: &Path, session_id: &str) -> Result<(), AcpError> {

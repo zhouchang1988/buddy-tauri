@@ -1,9 +1,22 @@
 // @vitest-environment jsdom
 
 import '@testing-library/jest-dom/vitest'
+import { StrictMode } from 'react'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
 import type { GitStatusResult, GlobalSettings, TaskSettings } from '../../../src/shared/types'
+
+import { AGENT_RECIPES, type AgentInventorySnapshot } from '../../../src/shared/agents'
+const makeInventory = (): AgentInventorySnapshot => ({ revision: 1, refreshing: false, agents: AGENT_RECIPES.slice(0, 10).map(recipe => ({
+  id: recipe.id, name: recipe.name, enabled: true, runnable: true, selectedProtocol: 'cli',
+  installationId: recipe.id, path: recipe.command, realPath: recipe.command, source: 'unknown',
+  cli: {command: recipe.command, env: {}, timeout_seconds: 7200}
+})) })
+let inventory: AgentInventorySnapshot | undefined
+vi.mock('../../../src/hooks/useAgentUpdates', () => ({
+  useAgentInventory: () => ({ data: inventory })
+}))
+beforeEach(() => { inventory = makeInventory() })
 
 vi.mock('../../../src/hooks/useI18n', () => ({
   useT: () => (key: string, params?: Record<string, string | number>) => {
@@ -40,6 +53,7 @@ vi.mock('../../../src/lib/api', () => ({
 
 vi.mock('@tanstack/react-query', () => ({
   useQueryClient: () => ({ cancelQueries: vi.fn() }),
+  useQuery: () => ({ data: { models: [{ id: 'model-a', name: 'Model A' }, { id: 'model-b', name: 'Model B' }] }, isFetching: false, isLoading: false }),
 }))
 
 vi.mock('../../../src/components/ChangesModal', () => ({
@@ -177,6 +191,71 @@ describe('CommitModal actor selection', () => {
     vi.restoreAllMocks()
   })
 
+  it('filters disabled and unready entries and includes newly discovered agents', () => {
+    inventory!.agents[0].enabled = false
+    inventory!.agents[1].runnable = false
+    inventory!.agents.push({ ...inventory!.agents[2], id: 'gemini', name: 'Gemini CLI' })
+    renderModal()
+    const values = [...(screen.getByTitle('git.commitMessageActor') as HTMLSelectElement).options].map(o => o.value)
+    expect(values).not.toContain('claude')
+    expect(values).not.toContain('codex')
+    expect(values).toContain('gemini')
+    expect((screen.getByTitle('git.commitMessageActor') as HTMLSelectElement).value).toBe('cursor')
+  })
+
+  it('allows manual editing without available agents and has no management button', () => {
+    inventory!.agents = []
+    renderModal()
+    expect(screen.getByTitle('git.commitMessageActor')).toBeDisabled()
+    expect(screen.getByText('git.generateMessage').closest('button')).toBeDisabled()
+    expect(screen.getByPlaceholderText('git.commitMessagePlaceholder')).toBeEnabled()
+    expect(screen.queryByText('git.manageAgents')).not.toBeInTheDocument()
+  })
+
+  it('waits for inventory and generates only once across background refreshes', async () => {
+    inventory = undefined
+    const generate = vi.mocked(api.generateCommitMessage).mockClear().mockResolvedValue({ message: 'feat: ready' })
+    const props = { gitStatus: makeGitStatus(), repoRoot: '/tmp/repo', globalSettings: makeSettings(true),
+      taskSettings: null, onClose: vi.fn(), onSuccess: vi.fn(), onError: vi.fn() }
+    const { rerender } = render(<CommitModal {...props} />)
+    expect(generate).not.toHaveBeenCalled()
+    inventory = makeInventory()
+    rerender(<CommitModal {...props} />)
+    await waitFor(() => expect(generate).toHaveBeenCalledOnce())
+    inventory = { ...inventory, revision: 2 }
+    rerender(<CommitModal {...props} />)
+    expect(generate).toHaveBeenCalledOnce()
+    inventory = { ...inventory, agents: [] }
+    rerender(<CommitModal {...props} />)
+    expect(screen.getByTitle('git.commitMessageActor')).toBeDisabled()
+    expect(generate).toHaveBeenCalledOnce()
+  })
+
+  it('automatically generates once under the app StrictMode lifecycle', async () => {
+    localStorage.setItem('buddy.lastCommitMessageActor', 'claude')
+    const generate = vi.mocked(api.generateCommitMessage).mockClear().mockResolvedValue({ message: 'feat: automatic' })
+    const cancel = vi.mocked(api.cancelGenerateCommitMessage).mockClear()
+    render(<StrictMode><CommitModal gitStatus={makeGitStatus()} repoRoot="/tmp/repo"
+      globalSettings={makeSettings(true)} taskSettings={null}
+      onClose={vi.fn()} onSuccess={vi.fn()} onError={vi.fn()} /></StrictMode>)
+    await waitFor(() => expect(generate).toHaveBeenCalledOnce())
+    expect(screen.getByDisplayValue('feat: automatic')).toBeInTheDocument()
+    // StrictMode cleanup runs before the deferred process starts.
+    expect(cancel.mock.invocationCallOrder[0]).toBeLessThan(generate.mock.invocationCallOrder[0])
+  })
+
+  it('waits for a populated inventory before choosing the initial agent', async () => {
+    inventory = { revision: 1, refreshing: true, agents: [] }
+    const generate = vi.mocked(api.generateCommitMessage).mockClear().mockResolvedValue({ message: 'feat: discovered' })
+    const props = { gitStatus: makeGitStatus(), repoRoot: '/tmp/repo', globalSettings: makeSettings(true),
+      taskSettings: null, onClose: vi.fn(), onSuccess: vi.fn(), onError: vi.fn() }
+    const { rerender } = render(<CommitModal {...props} />)
+    expect(generate).not.toHaveBeenCalled()
+    inventory = makeInventory()
+    rerender(<CommitModal {...props} />)
+    await waitFor(() => expect(generate).toHaveBeenCalledOnce())
+  })
+
   it('defaults to task implementer when no stored actor', () => {
     const { props } = renderModal({ taskSettings: { implementer_actor: 'codex' } })
     const select = screen.getByTitle('git.commitMessageActor') as HTMLSelectElement
@@ -202,6 +281,21 @@ describe('CommitModal actor selection', () => {
     renderModal({ taskSettings: null })
     const select = screen.getByTitle('git.commitMessageActor') as HTMLSelectElement
     expect(select.value).toBe('claude')
+  })
+
+  it('offers separate agent and model lists and sends the selected model', async () => {
+    const generate = vi.mocked(api.generateCommitMessage).mockClear().mockResolvedValue({ message: 'feat: model' })
+    renderModal()
+    const agentSelect = screen.getByTitle('git.commitMessageActor')
+    const modelSelect = screen.getByLabelText('modal.create.model')
+    expect(screen.getByRole('option', { name: 'Model A' })).toBeInTheDocument()
+    fireEvent.change(modelSelect, { target: { value: 'model-b' } })
+    fireEvent.click(screen.getByText('git.generateMessage'))
+    await waitFor(() => expect(generate).toHaveBeenCalledWith(expect.objectContaining({ actor: 'claude', model: 'model-b' })))
+    fireEvent.change(agentSelect, { target: { value: 'codex' } })
+    expect(modelSelect).toHaveValue('__native__')
+    fireEvent.change(agentSelect, { target: { value: 'claude' } })
+    expect(modelSelect).toHaveValue('model-b')
   })
 
   it('generates commit message with correct actor', async () => {

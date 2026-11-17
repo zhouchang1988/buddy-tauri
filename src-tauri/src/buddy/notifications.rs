@@ -141,10 +141,16 @@ impl TaskNotifier for SystemTaskNotifier {
                     actor_display_name(second)
                 )
             } else {
-                done_body_with_stats(task_id, self.store.get_task_stats(task_id, workspace_key).await)
+                done_body_with_stats(
+                    task_id,
+                    self.store.get_task_stats(task_id, workspace_key).await,
+                )
             }
         } else {
-            done_body_with_stats(task_id, self.store.get_task_stats(task_id, workspace_key).await)
+            done_body_with_stats(
+                task_id,
+                self.store.get_task_stats(task_id, workspace_key).await,
+            )
         };
         self.sender.send("Buddy - 任务已完成", &body);
     }
@@ -192,9 +198,18 @@ fn done_body_with_stats(task_id: &str, stats: Option<TaskStats>) -> String {
             "任务：{task_id}\n状态：已完成\n合计：{} 轮 · {} · 输入 {} · 输出 {} · Cache {}",
             stats.total_rounds,
             format_duration(stats.total_duration_ms),
-            format_number(stats.total_input_tokens),
-            format_number(stats.total_output_tokens),
-            format_number(stats.total_cache_read_tokens),
+            format_token_count(
+                stats.total_input_tokens,
+                stats.token_availability.as_ref().map(|value| value.input)
+            ),
+            format_token_count(
+                stats.total_output_tokens,
+                stats.token_availability.as_ref().map(|value| value.output)
+            ),
+            format_token_count(
+                stats.total_cache_read_tokens,
+                stats.token_availability.as_ref().map(|value| value.cache)
+            ),
         ),
         None => format!("任务：{task_id}\n状态：已完成\n双方均已确认任务结束。"),
     }
@@ -232,6 +247,18 @@ pub fn format_duration(ms: u64) -> String {
     parts.join("")
 }
 
+fn format_token_count(n: u64, available: Option<bool>) -> String {
+    if available == Some(false) {
+        if n > 0 {
+            format!("{}（统计不完整）", format_number(n))
+        } else {
+            "未提供".to_string()
+        }
+    } else {
+        format_number(n)
+    }
+}
+
 /// Format a number with comma thousands separators (JS `toLocaleString()` in
 /// the default Node ICU locale).
 pub fn format_number(n: u64) -> String {
@@ -262,14 +289,9 @@ mod tests {
         }
     }
 
-    fn test_notifier(
-        store: Arc<BuddyStore>,
-    ) -> (SystemTaskNotifier, Arc<RecordingSender>) {
+    fn test_notifier(store: Arc<BuddyStore>) -> (SystemTaskNotifier, Arc<RecordingSender>) {
         let sender = Arc::new(RecordingSender::default());
-        (
-            SystemTaskNotifier::new(store, sender.clone()),
-            sender,
-        )
+        (SystemTaskNotifier::new(store, sender.clone()), sender)
     }
 
     async fn store_with_notifications_enabled(enabled: Option<bool>) -> Arc<BuddyStore> {
@@ -341,9 +363,7 @@ mod tests {
         notifier
             .notify_task_failed("t", "ws", "claude", "err")
             .await;
-        notifier
-            .notify_task_paused("t", "ws", "codex", 3, 3)
-            .await;
+        notifier.notify_task_paused("t", "ws", "codex", 3, 3).await;
         notifier
             .notify_task_done("t", "ws", REASON_DUAL_BREAK_CONFIRMED, None, None)
             .await;
@@ -398,6 +418,9 @@ mod tests {
             .await;
         let sent = sender.sent.lock();
         assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].1, "任务：ghost\n状态：已完成\n双方均已确认任务结束。");
+        assert_eq!(
+            sent[0].1,
+            "任务：ghost\n状态：已完成\n双方均已确认任务结束。"
+        );
     }
 }

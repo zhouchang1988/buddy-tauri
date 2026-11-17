@@ -41,6 +41,7 @@ pub struct AcpPromptHandlers {
     pub on_thinking_delta: Option<Arc<dyn Fn(String) + Send + Sync>>,
     pub on_tool_call: Option<Arc<dyn Fn(String, String, Map<String, Value>) + Send + Sync>>,
     pub on_tool_result: Option<Arc<dyn Fn(String, Value, bool) + Send + Sync>>,
+    pub on_usage: Option<Arc<dyn Fn(Map<String, Value>) + Send + Sync>>,
     pub on_break: Option<Arc<dyn Fn(Option<String>) + Send + Sync>>,
     /// Host-provided tool executor for `tools/call` requests.
     pub on_execute_tool: Option<ExecuteToolFn>,
@@ -504,6 +505,11 @@ fn handle_notification(inner: &AcpClientInner, method: &str, params: Option<&Val
 }
 
 fn dispatch_session_update(handlers: &AcpPromptHandlers, update: &Map<String, Value>) {
+    if let Some(usage) = update.get("usage").and_then(Value::as_object) {
+        if let Some(cb) = &handlers.on_usage {
+            cb(usage.clone());
+        }
+    }
     let session_update = update.get("sessionUpdate").and_then(Value::as_str);
     match session_update {
         Some("agent_message_chunk") | Some("content_chunk") => {

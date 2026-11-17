@@ -15,12 +15,14 @@ export interface Task {
 export type TaskStatus =
   | 'QUEUED'
   | 'READY'
+  | 'RUNNING_AGENT'
   | 'RUNNING_CLAUDE'
   | 'RUNNING_CODEX'
   | 'RUNNING_CURSOR'
   | 'RUNNING_AGY'
   | 'RUNNING_OPENCODE'
   | 'RUNNING_KIMI'
+  | 'RUNNING_DSH'
   | 'RUNNING_WECODE_CLAUDE'
   | 'RUNNING_WECODE_CODEX'
   | 'RUNNING_WECODE_OPENCODE'
@@ -84,6 +86,7 @@ export interface TaskState {
   agy_session_id?: string | null
   opencode_session_id?: string | null
   kimi_session_id?: string | null
+  dsh_session_id?: string | null
   wecode_claude_session_id?: string | null
   wecode_codex_thread_id?: string | null
   wecode_opencode_session_id?: string | null
@@ -124,6 +127,7 @@ export interface ActiveRun {
 }
 
 export interface TaskSettings {
+  seed_actor_sessions?: Record<string,string>
   protocol_version: string
   flow_policy: string
   role_mode: string
@@ -137,6 +141,7 @@ export interface TaskSettings {
   seed_agy_session_id?: string
   seed_opencode_session_id?: string
   seed_kimi_session_id?: string
+  seed_dsh_session_id?: string
   seed_wecode_claude_session_id?: string
   seed_wecode_codex_thread_id?: string
   seed_wecode_opencode_session_id?: string
@@ -158,8 +163,24 @@ export interface AcpModelInfo {
 }
 
 export interface AcpModelList {
+  error?: string
   models: AcpModelInfo[]
   currentModelId?: string
+}
+
+/** Optional task/launcher context so model queries do not guess from global settings. */
+export interface ModelListContext {
+  /** Explicit launcher (e.g. from task settings). Wins over global/inventory. */
+  launcher?: Partial<Launcher> | null
+  taskId?: string
+  workspaceKey?: string
+}
+
+/** Pushed when a background model-catalog refresh replaces a stale list. */
+export interface ModelCatalogUpdate {
+  actor: string
+  protocol: 'cli' | 'acp'
+  list: AcpModelList
 }
 
 export interface AcpPreset {
@@ -172,7 +193,7 @@ export interface AcpPreset {
 }
 
 export interface TranscriptEntry {
-  role: 'human' | 'claude' | 'codex' | 'cursor' | 'agy' | 'opencode' | 'kimi' | 'wecode_claude' | 'wecode_codex' | 'wecode_opencode' | 'system'
+  role: (string & {}) | 'human' | 'claude' | 'codex' | 'cursor' | 'agy' | 'opencode' | 'kimi' | 'dsh' | 'wecode_claude' | 'wecode_codex' | 'wecode_opencode' | 'system'
   content: string
   ts: string
   round?: number
@@ -218,6 +239,7 @@ export interface BootstrapResponse {
 }
 
 export interface GlobalSettings {
+  agent_management?: Record<string, import('./agents').AgentConfiguration>
   protocol_version?: string
   countdown_seconds?: number
   max_rounds?: number
@@ -229,6 +251,7 @@ export interface GlobalSettings {
   seed_agy_session_id?: string
   seed_opencode_session_id?: string
   seed_kimi_session_id?: string
+  seed_dsh_session_id?: string
   seed_wecode_claude_session_id?: string
   seed_wecode_codex_thread_id?: string
   seed_wecode_opencode_session_id?: string
@@ -344,7 +367,16 @@ export interface RoundEventEntry {
   model?: string
 }
 
+/** True only when every contributing round reported this counter. Numeric
+ * totals retain the known subtotal when availability is false. */
+export interface TokenAvailability {
+  input: boolean
+  output: boolean
+  cache: boolean
+}
+
 export interface RoundEventSummary {
+  tokenAvailability?: TokenAvailability
   runId: string
   events: RoundEventEntry[]
   inputTokens: number
@@ -356,6 +388,7 @@ export interface RoundEventSummary {
 }
 
 export interface TaskActorStats {
+  tokenAvailability?: TokenAvailability
   actor: string
   model?: string
   inputTokens: number
@@ -367,6 +400,7 @@ export interface TaskActorStats {
 }
 
 export interface TaskStats {
+  tokenAvailability?: TokenAvailability
   actors: TaskActorStats[]
   totalInputTokens: number
   totalOutputTokens: number

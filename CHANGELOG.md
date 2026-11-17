@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.0.19-tauri] - 2026-11-17
+
+### Added
+- 同步上游 Electron 版 v2.0.6–v2.0.19（`davidhoo/buddy`，上游提交 `edfd283`）：DeepSeek Harness（dsh）原生 Actor；本机 Agent 声明式发现、CLI/ACP 配置、模型目录与批量更新；Skills/MCP 资源库及共享 `~/.agents` 发现；提交信息生成复用动态 Agent 与模型选择
+- Rust 端新增 `agents.rs`（库存缓存、协议探测、模型枚举、版本检查和持久化后台更新队列）、`model_cache.rs`（SHA-256 启动上下文摘引、内存/磁盘 Cache-First）与 `library.rs`（Skills 导入/分配/eject、MCP 发现/新增/分配/解除管理、认证指引和 Codex ACP home 初始化）
+- 渲染层同步 Agent 设置、Composer/提交弹窗模型选择、Skills/MCP 页面与用量完整性提示；桥接新增 25 个 Agent/Library 命令及 `buddy:agent-inventory`、`buddy:agent-update`、`buddy:model-catalog` 事件
+
+### Changed
+- CLI 启动器完整保留配置参数并按任务注入模型；新增 CodeBuddy 原生 CLI 适配；OpenCode 分轮 Token/费用累加；ACP 流式及最终用量落盘，任务统计与系统通知标记不完整用量
+- Skills/MCP 写回支持 JSONC、TOML 与 dsh `cordis.patch.yml`，保留原生字段、冲突检测、备份和原子替换；MCP 按规范化配置聚合多来源，Skills 按物理目录去重
+
+### Fixed
+- Codex/WeCode Codex ACP 与桌面端共享 `auth.json` 符号链接，且仅在同 OAuth 账号且私有副本明确更新时回写，避免 refresh token 轮换导致认证失败
+- dsh 支持直接二进制及 `npx [-y] @deepseek-ai/dsh`，规范 `--profile`/`--json` 参数顺序、stdin prompt、`--session-id` 续接和工具输出中的 Buddy 控制信号
+- macOS 任务服务进程组探测将 `EPERM` 视为仍存活，避免清理误报；ACP 认证失败区分握手/会话阶段并支持重新验证
+
+### Not ported（上游该区间未同步的内容）
+- Electron 45 升级、`node-abi` 固定及 Apple 时间戳服务重试脚本：Tauri 版不使用 Electron 打包或上游发布脚本，沿用现有 Tauri 签名与更新方案
+- Playwright E2E：维持不移植的既定决策，新增功能由 Rust 单测与前端 Vitest 覆盖
+
 ## [1.3.1-tauri] - 2026-09-16
 
 ### Fixed

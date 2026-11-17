@@ -12,6 +12,7 @@ export const ACTOR_LABEL_KEY: Record<string, TranslationKey> = {
   agy: 'actor.agy',
   opencode: 'actor.opencode',
   kimi: 'actor.kimi',
+  dsh: 'actor.dsh',
   wecode_claude: 'actor.wecode_claude',
   wecode_codex: 'actor.wecode_codex',
   wecode_opencode: 'actor.wecode_opencode',
@@ -37,9 +38,38 @@ export const ACTOR_DISPLAY_NAME: Record<string, string> = {
   agy: 'Antigravity',
   opencode: 'OpenCode',
   kimi: 'Kimi Code',
+  dsh: 'DeepSeek Harness',
   wecode_claude: 'WeCode Claude',
   wecode_codex: 'WeCode Codex',
-  wecode_opencode: 'WeCode OpenCode'
+  wecode_opencode: 'WeCode OpenCode',
+  codebuddy: 'CodeBuddy',
+  gemini: 'Gemini CLI',
+  qwen: 'Qwen Code',
+  copilot: 'GitHub Copilot CLI',
+  goose: 'Goose',
+  droid: 'Factory Droid',
+  pi: 'Pi',
+  omp: 'Oh My Pi',
+  cline: 'Cline CLI',
+  crush: 'Crush',
+  qoder: 'Qoder',
+  qoder_cn: 'Qoder CN',
+  hermes: 'Hermes Agent',
+  mimo: 'MiMo Code',
+  mcode: 'MiniMax Code',
+  deveco: 'DevEco Code',
+  stepcode: 'StepCode',
+  commandcode: 'Command Code',
+  atomcode: 'AtomCode',
+  snow: 'Snow CLI',
+  jcode: 'jcode',
+  devin: 'Devin',
+  mothx: 'MothX',
+  penguin: 'PenguinHarness',
+  omo: 'OmO',
+  prime_agent: 'Prime Agent',
+  empryo: 'Empryo',
+  ante: 'Ante'
 }
 
 /**
@@ -53,13 +83,49 @@ const ACTOR_COLOR_TOKEN: Record<string, string> = {
   agy: 'var(--actor-agy)',
   opencode: 'var(--actor-opencode)',
   kimi: 'var(--actor-kimi)',
+  dsh: 'var(--actor-dsh)',
   wecode_claude: 'var(--actor-claude)',
   wecode_codex: 'var(--actor-codex)',
-  wecode_opencode: 'var(--actor-opencode)'
+  wecode_opencode: 'var(--actor-opencode)',
+  codebuddy: 'var(--actor-claude)',
+  gemini: 'var(--actor-agy)',
+  qwen: 'var(--actor-opencode)',
+  copilot: 'var(--actor-codex)',
+  goose: 'var(--actor-cursor)',
+  droid: 'var(--actor-dsh)',
+  pi: 'var(--actor-cursor)',
+  omp: 'var(--actor-cursor)',
+  cline: 'var(--actor-opencode)',
+  crush: 'var(--actor-agy)',
+  qoder: 'var(--actor-codex)',
+  qoder_cn: 'var(--actor-codex)',
+  hermes: 'var(--actor-claude)',
+  mimo: 'var(--actor-opencode)',
+  mcode: 'var(--actor-agy)',
+  deveco: 'var(--actor-opencode)',
+  stepcode: 'var(--actor-kimi)',
+  commandcode: 'var(--actor-cursor)',
+  atomcode: 'var(--actor-dsh)',
+  snow: 'var(--actor-cursor)',
+  jcode: 'var(--actor-kimi)',
+  devin: 'var(--actor-claude)',
+  mothx: 'var(--actor-agy)',
+  penguin: 'var(--actor-dsh)',
+  omo: 'var(--actor-cursor)',
+  prime_agent: 'var(--actor-claude)',
+  empryo: 'var(--actor-opencode)',
+  ante: 'var(--actor-kimi)'
 }
 
 export function actorColorVar(actor: string): string {
   return ACTOR_COLOR_TOKEN[actor] ?? 'var(--border)'
+}
+
+/** Localized label when known; otherwise stable product display name or raw id. */
+export function actorOptionLabel(actor: string, t: (key: TranslationKey) => string): string {
+  const key = ACTOR_LABEL_KEY[actor]
+  if (key) return t(key)
+  return ACTOR_DISPLAY_NAME[actor] || actor
 }
 
 const EVENT_TYPE_KEY: Record<string, TranslationKey> = {
@@ -120,7 +186,7 @@ export function eventTypeLabel(type: string, lang: Language): string {
   return key ? translate(lang, key) : type
 }
 
-export type Actor = 'claude' | 'codex' | 'cursor' | 'agy' | 'opencode' | 'kimi' | 'wecode_claude' | 'wecode_codex' | 'wecode_opencode'
+export type Actor = string
 
 export function taskActors(settings: TaskSettings | null | undefined): {
   impl: Actor
@@ -172,6 +238,29 @@ export function buildSessionResumeCommand(
 export function shortId(value: string | undefined | null): string {
   if (!value) return ''
   return value.length > 20 ? `${value.slice(0, 8)}...${value.slice(-6)}` : value
+}
+
+/**
+ * Label for a saved model id.
+ * - empty → nativeLabel (Buddy『使用 Agent 自身默认』), never conflated with Cursor Auto
+ * - catalog hit → advertised name
+ * - Cursor ACP `default[]` / bare default|auto without catalog → Auto (product name)
+ * - other `id[params]` → strip the variant suffix for cold display
+ */
+export function modelOptionLabel(
+  id: string,
+  models?: ReadonlyArray<{ id: string; name: string }>,
+  options?: { nativeLabel?: string; autoLabel?: string }
+): string {
+  const trimmed = id.trim()
+  if (!trimmed) return options?.nativeLabel || ''
+  const named = models?.find(model => model.id === trimmed)?.name?.trim()
+  if (named) return named
+  const bare = trimmed.replace(/\[[^\]]*\]$/, '').trim()
+  if (!bare || /^default$/i.test(bare) || /^auto$/i.test(bare)) {
+    return options?.autoLabel || 'Auto'
+  }
+  return bare
 }
 
 export function formatDuration(ms: number): string {

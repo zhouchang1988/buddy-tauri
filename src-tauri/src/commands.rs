@@ -12,13 +12,20 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::Serialize;
 use tauri::{AppHandle, State};
 
+use crate::buddy::agents::{
+    AgentConfiguration, AgentInventorySnapshot, AgentUpdateJob, AgentUpdateSnapshot, LocalAgent,
+};
 use crate::buddy::commit_message::GenerateCommitMessageInput;
+use crate::buddy::library::{
+    AuthGuidanceResult, EnsureAcpHomeResult, LibraryBatchResult, LibraryOpResult, LibrarySnapshot,
+};
 use crate::buddy::service::{BuddyCoreService, EventsResponse};
 use crate::buddy::types::{
     AcpModelList, AttachmentMeta, BootstrapResponse, CountdownInput, CreateTaskInput,
-    CreateTaskResult, GitCommitPushResult, GitPushAvailability, GitPushResult, GlobalAcpAdaptersStatus,
-    GlobalSettings, GitStatusResult, InstructionQueueItem, RoundEventSummary,
-    SendMessageInput, StartTaskInput, Task, TaskDetail, TaskSettings, TaskStats, TestLauncherResult,
+    CreateTaskResult, GitCommitPushResult, GitPushAvailability, GitPushResult, GitStatusResult,
+    GlobalAcpAdaptersStatus, GlobalSettings, InstructionQueueItem, ModelListContext,
+    RoundEventSummary, SendMessageInput, StartTaskInput, Task, TaskDetail, TaskSettings, TaskStats,
+    TestLauncherResult,
 };
 use crate::{menu, updater};
 
@@ -33,14 +40,232 @@ fn err<E: std::fmt::Display>(error: E) -> String {
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
+pub async fn buddy_get_agent_inventory(
+    service: State<'_, BuddyCoreService>,
+) -> CmdResult<AgentInventorySnapshot> {
+    Ok(service.get_agent_inventory().await)
+}
+
+#[tauri::command]
+pub async fn buddy_refresh_local_agents(
+    service: State<'_, BuddyCoreService>,
+    mode: Option<String>,
+) -> CmdResult<AgentInventorySnapshot> {
+    service
+        .refresh_local_agents(mode.as_deref().unwrap_or("all"))
+        .await
+        .map_err(err)
+}
+
+#[tauri::command]
+pub async fn buddy_get_agent_update_state(
+    service: State<'_, BuddyCoreService>,
+) -> CmdResult<AgentUpdateSnapshot> {
+    service.get_agent_update_state().await.map_err(err)
+}
+
+#[tauri::command]
+pub async fn buddy_start_agent_updates(
+    service: State<'_, BuddyCoreService>,
+    ids: Vec<String>,
+    request_id: String,
+) -> CmdResult<AgentUpdateSnapshot> {
+    service
+        .start_agent_updates(ids, request_id)
+        .await
+        .map_err(err)
+}
+
+#[tauri::command]
+pub async fn buddy_list_cli_models(
+    service: State<'_, BuddyCoreService>,
+    id: String,
+    context: Option<ModelListContext>,
+) -> CmdResult<AcpModelList> {
+    service.list_cli_models(&id, context).await.map_err(err)
+}
+
+#[tauri::command]
+pub async fn buddy_list_local_agents(
+    service: State<'_, BuddyCoreService>,
+    force: Option<bool>,
+) -> CmdResult<Vec<LocalAgent>> {
+    service
+        .list_local_agents(force.unwrap_or(false))
+        .await
+        .map_err(err)
+}
+
+#[tauri::command]
+pub async fn buddy_configure_agent(
+    service: State<'_, BuddyCoreService>,
+    id: String,
+    config: AgentConfiguration,
+) -> CmdResult<()> {
+    service.configure_agent(&id, config).await.map_err(err)
+}
+
+#[tauri::command]
+pub async fn buddy_probe_local_agent(
+    service: State<'_, BuddyCoreService>,
+    id: String,
+) -> CmdResult<LocalAgent> {
+    service.probe_local_agent(&id).await.map_err(err)
+}
+
+#[tauri::command]
+pub async fn buddy_check_agent_updates(
+    service: State<'_, BuddyCoreService>,
+    force: Option<bool>,
+) -> CmdResult<Vec<LocalAgent>> {
+    service
+        .check_agent_updates(force.unwrap_or(false))
+        .await
+        .map_err(err)
+}
+
+#[tauri::command]
+pub async fn buddy_update_local_agents(
+    service: State<'_, BuddyCoreService>,
+    ids: Vec<String>,
+) -> CmdResult<Vec<AgentUpdateJob>> {
+    service.update_local_agents(ids).await.map_err(err)
+}
+
+#[tauri::command]
+pub async fn buddy_get_agent_update_jobs(
+    service: State<'_, BuddyCoreService>,
+) -> CmdResult<Vec<AgentUpdateJob>> {
+    service.get_agent_update_jobs().await.map_err(err)
+}
+
+#[tauri::command]
+pub async fn buddy_cancel_agent_updates(service: State<'_, BuddyCoreService>) -> CmdResult<()> {
+    service.cancel_agent_updates().await.map_err(err)
+}
+
+#[tauri::command]
+pub async fn buddy_get_library_snapshot(
+    service: State<'_, BuddyCoreService>,
+    force: Option<bool>,
+) -> CmdResult<LibrarySnapshot> {
+    Ok(service.get_library_snapshot(force.unwrap_or(false)).await)
+}
+
+#[tauri::command]
+pub async fn buddy_refresh_library(
+    service: State<'_, BuddyCoreService>,
+    force: Option<bool>,
+) -> CmdResult<LibrarySnapshot> {
+    Ok(service.refresh_library(force.unwrap_or(false)).await)
+}
+
+#[tauri::command]
+pub async fn buddy_import_library_skills(
+    service: State<'_, BuddyCoreService>,
+    discovery_ids: Vec<String>,
+) -> CmdResult<LibraryBatchResult> {
+    Ok(service.import_library_skills(discovery_ids).await)
+}
+
+#[tauri::command]
+pub async fn buddy_set_library_skill_assignment(
+    service: State<'_, BuddyCoreService>,
+    skill_id: String,
+    target_id: String,
+    enabled: bool,
+) -> CmdResult<LibraryOpResult> {
+    Ok(service
+        .set_library_skill_assignment(&skill_id, &target_id, enabled)
+        .await)
+}
+
+#[tauri::command]
+pub async fn buddy_eject_library_skill(
+    service: State<'_, BuddyCoreService>,
+    skill_id: String,
+) -> CmdResult<LibraryOpResult> {
+    Ok(service.eject_library_skill(&skill_id).await)
+}
+
+#[tauri::command]
+pub async fn buddy_eject_library_server(
+    service: State<'_, BuddyCoreService>,
+    server_id: String,
+) -> CmdResult<LibraryOpResult> {
+    Ok(service.eject_library_server(&server_id).await)
+}
+
+#[tauri::command]
+pub async fn buddy_add_library_server(
+    service: State<'_, BuddyCoreService>,
+    name: String,
+    raw: serde_json::Map<String, serde_json::Value>,
+) -> CmdResult<LibraryOpResult> {
+    Ok(service.add_library_server(&name, raw).await)
+}
+
+#[tauri::command]
+pub async fn buddy_import_library_servers(
+    service: State<'_, BuddyCoreService>,
+    discovery_ids: Vec<String>,
+) -> CmdResult<LibraryBatchResult> {
+    Ok(service.import_library_servers(discovery_ids).await)
+}
+
+#[tauri::command]
+pub async fn buddy_set_library_server_assignment(
+    service: State<'_, BuddyCoreService>,
+    server_id: String,
+    target_id: String,
+    enabled: bool,
+) -> CmdResult<LibraryOpResult> {
+    Ok(service
+        .set_library_server_assignment(&server_id, &target_id, enabled)
+        .await)
+}
+
+#[tauri::command]
+pub async fn buddy_open_library_auth_guidance(
+    service: State<'_, BuddyCoreService>,
+    target_id: String,
+    server_name: String,
+) -> CmdResult<AuthGuidanceResult> {
+    Ok(service
+        .open_library_auth_guidance(&target_id, &server_name)
+        .await)
+}
+
+#[tauri::command]
+pub async fn buddy_open_library_dir(service: State<'_, BuddyCoreService>) -> CmdResult<String> {
+    service.open_library_dir().await.map_err(err)
+}
+
+#[tauri::command]
+pub async fn buddy_open_library_backups_dir(
+    service: State<'_, BuddyCoreService>,
+) -> CmdResult<String> {
+    service.open_library_backups_dir().await.map_err(err)
+}
+
+#[tauri::command]
+pub async fn buddy_ensure_library_acp_home(
+    service: State<'_, BuddyCoreService>,
+    agent_id: String,
+) -> CmdResult<EnsureAcpHomeResult> {
+    service
+        .ensure_library_acp_home(&agent_id)
+        .await
+        .map_err(err)
+}
+
+#[tauri::command]
 pub async fn buddy_check_health(service: State<'_, BuddyCoreService>) -> CmdResult<bool> {
     Ok(service.check_health().await)
 }
 
 #[tauri::command]
-pub async fn buddy_bootstrap(
-    service: State<'_, BuddyCoreService>,
-) -> CmdResult<BootstrapResponse> {
+pub async fn buddy_bootstrap(service: State<'_, BuddyCoreService>) -> CmdResult<BootstrapResponse> {
     service.bootstrap().await.map_err(err)
 }
 
@@ -268,7 +493,10 @@ pub async fn buddy_git_stage_files(
     repo_root: String,
     paths: Vec<String>,
 ) -> CmdResult<()> {
-    service.git_stage_files(&repo_root, &paths).await.map_err(err)
+    service
+        .git_stage_files(&repo_root, &paths)
+        .await
+        .map_err(err)
 }
 
 #[tauri::command]
@@ -408,8 +636,12 @@ pub async fn buddy_list_acp_models(
     service: State<'_, BuddyCoreService>,
     actor: String,
     cwd: Option<String>,
+    context: Option<ModelListContext>,
 ) -> CmdResult<AcpModelList> {
-    service.list_acp_models(&actor, cwd).await.map_err(err)
+    service
+        .list_acp_models(&actor, cwd, context)
+        .await
+        .map_err(err)
 }
 
 #[tauri::command]
@@ -630,6 +862,9 @@ mod tests {
             size: 12,
         })
         .unwrap();
-        assert_eq!(value, serde_json::json!({ "path": "/tmp/a.txt", "size": 12 }));
+        assert_eq!(
+            value,
+            serde_json::json!({ "path": "/tmp/a.txt", "size": 12 })
+        );
     }
 }

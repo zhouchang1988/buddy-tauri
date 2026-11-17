@@ -345,6 +345,7 @@ pub async fn probe_acp_models(options: ProbeAcpModelsOptions) -> Result<AcpModel
             .await?;
         let extracted = extract_acp_session_models(&created);
         Ok(AcpModelList {
+            error: None,
             models: extracted.models,
             current_model_id: extracted.current_model_id,
         })

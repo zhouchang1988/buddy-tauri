@@ -24,11 +24,11 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
-#[cfg(unix)]
-use std::os::unix::fs::DirBuilderExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, Notify};
 
@@ -416,8 +416,7 @@ pub fn parse_service_request(input: &Value) -> Result<ServiceRequest, String> {
             value
                 .as_u64()
                 .filter(|pid| *pid > 0)
-                .ok_or_else(|| "`pid` must be a positive integer".to_string())?
-                as u32,
+                .ok_or_else(|| "`pid` must be a positive integer".to_string())? as u32,
         ),
     };
     Ok(ServiceRequest {
@@ -481,12 +480,13 @@ fn atomic_json_sync(path: &Path, value: &Value) -> Result<(), String> {
             .create(parent)
             .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
     }
-    let tmp = path.with_extension(format!(
-        "{}.tmp",
-        uuid::Uuid::new_v4().simple().to_string()
-    ));
-    write_file_mode(&tmp, serde_json::to_string_pretty(value).unwrap().as_bytes(), 0o600)
-        .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    let tmp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4().simple().to_string()));
+    write_file_mode(
+        &tmp,
+        serde_json::to_string_pretty(value).unwrap().as_bytes(),
+        0o600,
+    )
+    .map_err(|e| format!("write {}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, path).map_err(|e| format!("rename to {}: {e}", path.display()))
 }
 
@@ -524,18 +524,17 @@ fn create_temp_dir(prefix: &str) -> Result<PathBuf, String> {
     for _ in 0..16 {
         let candidate = std::env::temp_dir().join(format!(
             "{prefix}{}",
-        &uuid::Uuid::new_v4().simple().to_string()[..8]
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
         ));
-        match std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&candidate)
-        {
+        match std::fs::DirBuilder::new().mode(0o700).create(&candidate) {
             Ok(()) => return Ok(candidate),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(format!("mkdtemp {prefix}: {error}")),
         }
     }
-    Err(format!("mkdtemp {prefix}: could not allocate a unique directory"))
+    Err(format!(
+        "mkdtemp {prefix}: could not allocate a unique directory"
+    ))
 }
 
 fn is_not_found(error: &StoreError) -> bool {
@@ -563,7 +562,9 @@ async fn socket_request(
         let mut stream = tokio::net::UnixStream::connect(socket_path)
             .await
             .map_err(|e| e.to_string())?;
-        let payload = body.map(|b| serde_json::to_string(b).unwrap()).unwrap_or_default();
+        let payload = body
+            .map(|b| serde_json::to_string(b).unwrap())
+            .unwrap_or_default();
         let request = format!(
             "POST {path} HTTP/1.1\r\nHost: localhost\r\nauthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
             payload.len()
@@ -603,7 +604,10 @@ async fn socket_request(
 }
 
 /// Read one HTTP request (headers + Content-Length body) from a stream.
-async fn read_http_request<S>(stream: &mut S, max_body: usize) -> Result<(String, String, HashMap<String, String>, Vec<u8>), String>
+async fn read_http_request<S>(
+    stream: &mut S,
+    max_body: usize,
+) -> Result<(String, String, HashMap<String, String>, Vec<u8>), String>
 where
     S: AsyncReadExt + Unpin,
 {
@@ -613,10 +617,7 @@ where
         if let Some(pos) = find_subsequence(&raw, b"\r\n\r\n") {
             break pos;
         }
-        let n = stream
-            .read(&mut buf)
-            .await
-            .map_err(|e| e.to_string())?;
+        let n = stream.read(&mut buf).await.map_err(|e| e.to_string())?;
         if n == 0 {
             return Err("connection closed before headers".to_string());
         }
@@ -648,10 +649,7 @@ where
     }
     let mut body = raw[header_end + 4..].to_vec();
     while body.len() < content_length {
-        let n = stream
-            .read(&mut buf)
-            .await
-            .map_err(|e| e.to_string())?;
+        let n = stream.read(&mut buf).await.map_err(|e| e.to_string())?;
         if n == 0 {
             break;
         }
@@ -744,10 +742,7 @@ impl SupervisorState {
         if self.signal_present {
             map.insert(
                 "signal".to_string(),
-                self.signal
-                    .clone()
-                    .map(Value::from)
-                    .unwrap_or(Value::Null),
+                self.signal.clone().map(Value::from).unwrap_or(Value::Null),
             );
         }
         if let Some(reason) = &self.reason {
@@ -770,9 +765,14 @@ fn process_group_alive(pid: Option<u32>) -> bool {
     std::process::Command::new("kill")
         .args(["-0", "--", &format!("-{pid}")])
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|status| status.success())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map(|output| {
+            output.status.success() || {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                stderr.contains("Operation not permitted") || stderr.contains("Not owner")
+            }
+        })
         .unwrap_or(false)
 }
 
@@ -878,9 +878,7 @@ pub async fn run_service_supervisor(config: SupervisorConfig) -> Result<(), Stri
 
     let listener = tokio::net::UnixListener::bind(&config.socket)
         .map_err(|e| format!("bind {}: {e}", config.socket))?;
-    let socket_dir = Path::new(&config.socket)
-        .parent()
-        .map(Path::to_path_buf);
+    let socket_dir = Path::new(&config.socket).parent().map(Path::to_path_buf);
 
     // Spawn the service in its own process group so the supervisor — and only
     // the supervisor — can signal every process it forked.
@@ -1003,8 +1001,8 @@ pub async fn run_service_supervisor(config: SupervisorConfig) -> Result<(), Stri
                         shared.quit.notify_one();
                     }
                     Err(error) => {
-                        let body = serde_json::to_string(&serde_json::json!({ "error": error }))
-                            .unwrap();
+                        let body =
+                            serde_json::to_string(&serde_json::json!({ "error": error })).unwrap();
                         let _ = write_http_response(&mut stream, 500, &body).await;
                     }
                 }
@@ -1089,7 +1087,9 @@ fn client_request(
     stream
         .set_write_timeout(Some(std::time::Duration::from_secs(15)))
         .ok();
-    let payload = body.map(|b| serde_json::to_string(b).unwrap()).unwrap_or_default();
+    let payload = body
+        .map(|b| serde_json::to_string(b).unwrap())
+        .unwrap_or_default();
     let request = format!(
         "POST {path} HTTP/1.1\r\nHost: localhost\r\nauthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
         payload.len()
@@ -1195,22 +1195,24 @@ pub(crate) fn service_client_run_with(
     }
     match action {
         "start" => {
-            let separator = rest
-                .iter()
-                .position(|arg| *arg == "--")
-                .ok_or_else(|| "Usage: start NAME [--keep REASON] -- COMMAND [ARGS...]".to_string())?;
+            let separator = rest.iter().position(|arg| *arg == "--").ok_or_else(|| {
+                "Usage: start NAME [--keep REASON] -- COMMAND [ARGS...]".to_string()
+            })?;
             if separator + 1 >= rest.len() {
                 return Err("Usage: start NAME [--keep REASON] -- COMMAND [ARGS...]".to_string());
             }
             let options = &rest[..separator];
-            if !options.is_empty()
-                && !(options.len() == 2 && options[0] == "--keep")
-            {
+            if !options.is_empty() && !(options.len() == 2 && options[0] == "--keep") {
                 return Err("Expected --keep REASON or no options".to_string());
             }
             body.insert(
                 "command".to_string(),
-                Value::Array(rest[separator + 1..].iter().map(|s| Value::from(*s)).collect()),
+                Value::Array(
+                    rest[separator + 1..]
+                        .iter()
+                        .map(|s| Value::from(*s))
+                        .collect(),
+                ),
             );
             let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
             body.insert(
@@ -1294,8 +1296,9 @@ impl LeaseHandle {
     }
 }
 
-pub type SupervisorSpawner =
-    Arc<dyn Fn(&SupervisorConfig, &Path, &HashMap<String, String>) -> Result<(), String> + Send + Sync>;
+pub type SupervisorSpawner = Arc<
+    dyn Fn(&SupervisorConfig, &Path, &HashMap<String, String>) -> Result<(), String> + Send + Sync,
+>;
 
 pub struct ServiceTools {
     pub client: PathBuf,
@@ -1337,11 +1340,7 @@ impl TaskServiceManager {
             .join(sha24(&format!("{workspace_key}\0{task_id}")))
     }
 
-    async fn locked<T>(
-        &self,
-        key: &Path,
-        fut: impl std::future::Future<Output = T>,
-    ) -> T {
+    async fn locked<T>(&self, key: &Path, fut: impl std::future::Future<Output = T>) -> T {
         let lock = {
             let mut locks = self.locks.lock().unwrap();
             locks
@@ -1420,8 +1419,14 @@ impl TaskServiceManager {
         else {
             unreachable!()
         };
-        match socket_request(socket, token, "/status", None, std::time::Duration::from_secs(5))
-            .await
+        match socket_request(
+            socket,
+            token,
+            "/status",
+            None,
+            std::time::Duration::from_secs(5),
+        )
+        .await
         {
             Ok(value) => parse_service_status(&value),
             Err(error) => {
@@ -1500,7 +1505,13 @@ impl TaskServiceManager {
     }
 
     async fn stop(&self, record: &TaskServiceRecord) -> Result<(), String> {
-        let TaskServiceRecord::Buddy { socket, token, name, .. } = record else {
+        let TaskServiceRecord::Buddy {
+            socket,
+            token,
+            name,
+            ..
+        } = record
+        else {
             return Err("Existing external services are never stopped by Buddy".to_string());
         };
         let status = self.status(record).await?;
@@ -1512,9 +1523,15 @@ impl TaskServiceManager {
         {
             return Ok(());
         }
-        let result = socket_request(socket, token, "/stop", None, std::time::Duration::from_secs(5))
-            .await
-            .and_then(|value| parse_service_status(&value))?;
+        let result = socket_request(
+            socket,
+            token,
+            "/stop",
+            None,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .and_then(|value| parse_service_status(&value))?;
         if !result
             .get("status")
             .and_then(Value::as_str)
@@ -1621,8 +1638,14 @@ impl TaskServiceManager {
                     tokio::spawn(async move {
                         manager
                             .handle_broker_connection(
-                                stream, &lease, &directory, &task_id, &workspace_key, &run_id,
-                                &token, &run_env,
+                                stream,
+                                &lease,
+                                &directory,
+                                &task_id,
+                                &workspace_key,
+                                &run_id,
+                                &token,
+                                &run_env,
                             )
                             .await;
                         let _ = stream;
@@ -1687,7 +1710,13 @@ impl TaskServiceManager {
                 serde_json::from_slice(&body).map_err(|e| format!("invalid JSON: {e}"))?;
             let input = parse_service_request(&input)?;
             self.handle_service_action(
-                lease, directory, task_id, workspace_key, run_id, &input, run_env,
+                lease,
+                directory,
+                task_id,
+                workspace_key,
+                run_id,
+                &input,
+                run_env,
             )
             .await
         }
@@ -1749,8 +1778,7 @@ impl TaskServiceManager {
                 .ok_or_else(|| "Service name is required".to_string())?;
             let existing = records.iter().find(|record| record.name() == name).cloned();
             if input.action == "stop" {
-                let existing =
-                    existing.ok_or_else(|| "Service not found".to_string())?;
+                let existing = existing.ok_or_else(|| "Service not found".to_string())?;
                 self.stop(&existing).await?;
                 self.store
                     .append_task_event(
@@ -1770,16 +1798,10 @@ impl TaskServiceManager {
             if input.action == "keep" {
                 let (Some(existing), Some(reason)) = (existing.clone(), input.keep_reason.clone())
                 else {
-                    return Err(
-                        "Service and explicit retention reason are required".to_string()
-                    );
+                    return Err("Service and explicit retention reason are required".to_string());
                 };
                 let kept = existing.with_keep_reason(Some(reason));
-                atomic_json(
-                    &Self::record_path(directory, &name),
-                    &kept.to_json(),
-                )
-                .await?;
+                atomic_json(&Self::record_path(directory, &name), &kept.to_json()).await?;
                 return self.describe(directory, &kept).await;
             }
             if let Some(existing) = existing.clone() {
@@ -1798,17 +1820,12 @@ impl TaskServiceManager {
                         }
                     }
                     let same_command = match (&existing, &input.command) {
-                        (
-                            TaskServiceRecord::Buddy { command, cwd, .. },
-                            Some(new_command),
-                        ) => {
+                        (TaskServiceRecord::Buddy { command, cwd, .. }, Some(new_command)) => {
                             let new_cwd = input.cwd.clone().unwrap_or_default();
                             let new_cwd = std::fs::canonicalize(&new_cwd)
                                 .map(|p| p.to_string_lossy().to_string())
                                 .unwrap_or(new_cwd);
-                            input.action == "start"
-                                && command == new_command
-                                && cwd == &new_cwd
+                            input.action == "start" && command == new_command && cwd == &new_cwd
                         }
                         _ => false,
                     };
@@ -1820,7 +1837,8 @@ impl TaskServiceManager {
                     }
                     let reused = existing.with_keep_reason(input.keep_reason.clone());
                     if input.keep_reason.is_some() {
-                        atomic_json(&Self::record_path(directory, &name), &reused.to_json()).await?;
+                        atomic_json(&Self::record_path(directory, &name), &reused.to_json())
+                            .await?;
                     }
                     let mut described = self.describe(directory, &reused).await?;
                     if let Some(map) = described.as_object_mut() {
@@ -1866,9 +1884,18 @@ impl TaskServiceManager {
                 command: command.clone(),
                 cwd: cwd.clone(),
                 token: random_token(),
-                socket: supervisor_socket_dir.join("s").to_string_lossy().to_string(),
-                status_path: directory.join(format!("{id}.status.json")).to_string_lossy().to_string(),
-                log_path: directory.join(format!("{id}.log")).to_string_lossy().to_string(),
+                socket: supervisor_socket_dir
+                    .join("s")
+                    .to_string_lossy()
+                    .to_string(),
+                status_path: directory
+                    .join(format!("{id}.status.json"))
+                    .to_string_lossy()
+                    .to_string(),
+                log_path: directory
+                    .join(format!("{id}.log"))
+                    .to_string_lossy()
+                    .to_string(),
             };
             // Persist ownership before spawn, so a Buddy crash cannot lose a
             // service.
@@ -2015,8 +2042,9 @@ impl TaskServiceManager {
                 let text = tokio::fs::read_to_string(entry.path().join("task.json"))
                     .await
                     .map_err(|e| e.to_string())?;
-                let manifest =
-                    parse_service_task_manifest(&serde_json::from_str(&text).map_err(|e| e.to_string())?)?;
+                let manifest = parse_service_task_manifest(
+                    &serde_json::from_str(&text).map_err(|e| e.to_string())?,
+                )?;
                 let state = match self
                     .store
                     .read_task_state(&manifest.task_id, &manifest.workspace_key)
@@ -2042,19 +2070,20 @@ impl TaskServiceManager {
                         errors.extend(failures.iter().cloned());
                         if state.is_some() {
                             self.store
-                                .update_task_state(&manifest.task_id, &manifest.workspace_key, |mut current| {
-                                    current.status = crate::buddy::types::TaskStatus::Paused;
-                                    current.active_run = None;
-                                    current.service_cleanup_pending = Some(true);
-                                    current
-                                })
+                                .update_task_state(
+                                    &manifest.task_id,
+                                    &manifest.workspace_key,
+                                    |mut current| {
+                                        current.status = crate::buddy::types::TaskStatus::Paused;
+                                        current.active_run = None;
+                                        current.service_cleanup_pending = Some(true);
+                                        current
+                                    },
+                                )
                                 .await
                                 .map_err(|e| e.to_string())?;
                             let mut meta = Map::new();
-                            meta.insert(
-                                "kind".to_string(),
-                                Value::from("service_cleanup_failed"),
-                            );
+                            meta.insert("kind".to_string(), Value::from("service_cleanup_failed"));
                             self.store
                                 .append_transcript(
                                     &manifest.task_id,
@@ -2077,10 +2106,14 @@ impl TaskServiceManager {
                         .unwrap_or(false)
                     {
                         self.store
-                            .update_task_state(&manifest.task_id, &manifest.workspace_key, |mut current| {
-                                current.service_cleanup_pending = Some(false);
-                                current
-                            })
+                            .update_task_state(
+                                &manifest.task_id,
+                                &manifest.workspace_key,
+                                |mut current| {
+                                    current.service_cleanup_pending = Some(false);
+                                    current
+                                },
+                            )
                             .await
                             .map_err(|e| e.to_string())?;
                     }
@@ -2274,7 +2307,11 @@ mod tests {
                 let path = entry.path();
                 if entry.file_type().await.unwrap().is_dir() {
                     stack.push(path);
-                } else if entry.file_name().to_string_lossy().ends_with(".service.json") {
+                } else if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".service.json")
+                {
                     out.push(path);
                 }
             }
@@ -2299,15 +2336,35 @@ mod tests {
         open_run(&mut f, "r1", "demo").await;
         open_run(&mut f, "other-run", "other").await;
         let mut command = service_command(60);
-        let first = client(&f.leases[0], &[&["start", "worker", "--"], command.as_slice()].concat()).await.unwrap();
+        let first = client(
+            &f.leases[0],
+            &[&["start", "worker", "--"], command.as_slice()].concat(),
+        )
+        .await
+        .unwrap();
         command = service_command(60);
-        let other = client(&f.leases[1], &[&["start", "worker", "--"], command.as_slice()].concat()).await.unwrap();
+        let other = client(
+            &f.leases[1],
+            &[&["start", "worker", "--"], command.as_slice()].concat(),
+        )
+        .await
+        .unwrap();
         assert_ne!(json_pid(&first), json_pid(&other));
 
-        assert!(f.manager.cleanup_task("demo", &f.workspace).await.unwrap().is_empty());
+        assert!(f
+            .manager
+            .cleanup_task("demo", &f.workspace)
+            .await
+            .unwrap()
+            .is_empty());
         assert!(!alive(json_pid(&first)));
         assert!(alive(json_pid(&other)));
-        assert!(f.manager.cleanup_task("other", &f.workspace).await.unwrap().is_empty());
+        assert!(f
+            .manager
+            .cleanup_task("other", &f.workspace)
+            .await
+            .unwrap()
+            .is_empty());
         assert!(!alive(json_pid(&other)));
     }
 
@@ -2316,10 +2373,29 @@ mod tests {
         let mut f = fixture("demo").await;
         open_run(&mut f, "r1", "demo").await;
         let command = service_command(60);
-        let worker = client(&f.leases[0], &[&["start", "worker", "--"], command.as_slice()].concat()).await.unwrap();
+        let worker = client(
+            &f.leases[0],
+            &[&["start", "worker", "--"], command.as_slice()].concat(),
+        )
+        .await
+        .unwrap();
         assert!(client(&f.leases[0], &["keep", "worker"]).await.is_err());
-        client(&f.leases[0], &["keep", "worker", "User explicitly requested a persistent preview"]).await.unwrap();
-        assert!(f.manager.cleanup_task("demo", &f.workspace).await.unwrap().is_empty());
+        client(
+            &f.leases[0],
+            &[
+                "keep",
+                "worker",
+                "User explicitly requested a persistent preview",
+            ],
+        )
+        .await
+        .unwrap();
+        assert!(f
+            .manager
+            .cleanup_task("demo", &f.workspace)
+            .await
+            .unwrap()
+            .is_empty());
         assert!(alive(json_pid(&worker)));
         // Fixture teardown: stop the retained service so no processes leak.
         let records = registry_files(&f.store.data_root).await;
@@ -2342,12 +2418,22 @@ mod tests {
             child_pid_file.to_string_lossy()
         );
         open_run(&mut f, "r1", "demo").await;
-        let first = client(&f.leases[0], &["start", "worker", "--", "sh", "-c", &script]).await.unwrap();
+        let first = client(
+            &f.leases[0],
+            &["start", "worker", "--", "sh", "-c", &script],
+        )
+        .await
+        .unwrap();
         assert!(alive(json_pid(&first)));
         f.leases.pop().unwrap().close();
 
         open_run(&mut f, "r2", "demo").await;
-        let second = client(&f.leases[0], &["start", "worker", "--", "sh", "-c", &script]).await.unwrap();
+        let second = client(
+            &f.leases[0],
+            &["start", "worker", "--", "sh", "-c", &script],
+        )
+        .await
+        .unwrap();
         assert_eq!(json_pid(&second), json_pid(&first));
         assert_eq!(second.get("reused"), Some(&Value::from(true)));
 
@@ -2358,11 +2444,21 @@ mod tests {
             .parse()
             .unwrap();
         assert!(alive(child));
-        assert!(f.manager.cleanup_task("demo", &f.workspace).await.unwrap().is_empty());
+        assert!(f
+            .manager
+            .cleanup_task("demo", &f.workspace)
+            .await
+            .unwrap()
+            .is_empty());
         assert!(!alive(json_pid(&first)));
         assert!(!alive(child));
         // A closed run cannot start new services through its broker.
-        assert!(client(&f.leases[0], &["start", "late", "--", "sh", "-c", "exec sleep 60"]).await.is_err());
+        assert!(client(
+            &f.leases[0],
+            &["start", "late", "--", "sh", "-c", "exec sleep 60"]
+        )
+        .await
+        .is_err());
     }
 
     #[tokio::test]
@@ -2379,13 +2475,33 @@ mod tests {
         let command = service_command(60);
         let kept = client(
             &f.leases[0],
-            &[&["start", "keep", "--keep", "user asked to keep preview", "--"], command.as_slice()].concat(),
+            &[
+                &[
+                    "start",
+                    "keep",
+                    "--keep",
+                    "user asked to keep preview",
+                    "--",
+                ],
+                command.as_slice(),
+            ]
+            .concat(),
         )
         .await
         .unwrap();
         let command = service_command(60);
-        let managed = client(&f.leases[0], &[&["start", "worker", "--"], command.as_slice()].concat()).await.unwrap();
-        client(&f.leases[0], &["external", "existing", &external_pid.to_string()]).await.unwrap();
+        let managed = client(
+            &f.leases[0],
+            &[&["start", "worker", "--"], command.as_slice()].concat(),
+        )
+        .await
+        .unwrap();
+        client(
+            &f.leases[0],
+            &["external", "existing", &external_pid.to_string()],
+        )
+        .await
+        .unwrap();
         let stop_external = client(&f.leases[0], &["stop", "existing"]).await;
         assert!(stop_external.unwrap_err().contains("never stopped"));
 
@@ -2396,7 +2512,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        service.delete_task("demo", Some(&f.workspace)).await.unwrap();
+        service
+            .delete_task("demo", Some(&f.workspace))
+            .await
+            .unwrap();
         assert!(!alive(json_pid(&managed)));
         assert!(alive(json_pid(&kept)));
         assert!(alive(external_pid));
@@ -2425,7 +2544,12 @@ mod tests {
         let mut f = fixture("demo").await;
         open_run(&mut f, "r1", "demo").await;
         let command = service_command(60);
-        let worker = client(&f.leases[0], &[&["start", "worker", "--"], command.as_slice()].concat()).await.unwrap();
+        let worker = client(
+            &f.leases[0],
+            &[&["start", "worker", "--"], command.as_slice()].concat(),
+        )
+        .await
+        .unwrap();
         f.leases.pop().unwrap().close();
         f.store
             .update_task_state("demo", &f.workspace, |mut state| {
@@ -2460,7 +2584,12 @@ mod tests {
         let mut f = fixture("demo").await;
         open_run(&mut f, "r1", "demo").await;
         let command = service_command(60);
-        let worker = client(&f.leases[0], &[&["start", "worker", "--"], command.as_slice()].concat()).await.unwrap();
+        let worker = client(
+            &f.leases[0],
+            &[&["start", "worker", "--"], command.as_slice()].concat(),
+        )
+        .await
+        .unwrap();
         client(&f.leases[0], &["stop", "worker"]).await.unwrap();
         assert!(!alive(json_pid(&worker)));
 
@@ -2469,7 +2598,8 @@ mod tests {
         let records = registry_files(&f.store.data_root).await;
         assert_eq!(records.len(), 1);
         let record_text = tokio::fs::read_to_string(&records[0]).await.unwrap();
-        let record = parse_task_service_record(&serde_json::from_str(&record_text).unwrap()).unwrap();
+        let record =
+            parse_task_service_record(&serde_json::from_str(&record_text).unwrap()).unwrap();
         let TaskServiceRecord::Buddy { status_path, .. } = &record else {
             panic!("expected buddy record");
         };
@@ -2492,10 +2622,19 @@ mod tests {
     async fn cleans_a_failed_start_without_losing_its_record() {
         let mut f = fixture("demo").await;
         open_run(&mut f, "r1", "demo").await;
-        let error = client(&f.leases[0], &["start", "bad", "--", "/definitely/not/a/program"]).await
-            .unwrap_err();
+        let error = client(
+            &f.leases[0],
+            &["start", "bad", "--", "/definitely/not/a/program"],
+        )
+        .await
+        .unwrap_err();
         assert!(error.contains("failed to stay running"), "{error}");
-        assert!(f.manager.cleanup_task("demo", &f.workspace).await.unwrap().is_empty());
+        assert!(f
+            .manager
+            .cleanup_task("demo", &f.workspace)
+            .await
+            .unwrap()
+            .is_empty());
         assert_eq!(registry_files(&f.store.data_root).await.len(), 1);
     }
 
@@ -2504,13 +2643,22 @@ mod tests {
         let mut f = fixture("demo").await;
         open_run(&mut f, "r1", "demo").await;
         // Missing `--` separator.
-        assert!(client(&f.leases[0], &["start", "worker", "sleep"]).await.is_err());
+        assert!(client(&f.leases[0], &["start", "worker", "sleep"])
+            .await
+            .is_err());
         // Unknown action.
         assert!(client(&f.leases[0], &["restart", "worker"]).await.is_err());
         // Malformed name rejected by the read-time schema.
-        assert!(client(&f.leases[0], &["start", "bad name!", "--", "sleep", "1"]).await.is_err());
+        assert!(
+            client(&f.leases[0], &["start", "bad name!", "--", "sleep", "1"])
+                .await
+                .is_err()
+        );
         // The broker rejects requests without the bearer token.
         let socket = f.leases[0].env.get("BUDDY_SERVICE_SOCKET").unwrap().clone();
-        assert!(service_client_run_with(&["list".to_string()], Some(&socket), Some("wrong-token")).is_err());
+        assert!(
+            service_client_run_with(&["list".to_string()], Some(&socket), Some("wrong-token"))
+                .is_err()
+        );
     }
 }

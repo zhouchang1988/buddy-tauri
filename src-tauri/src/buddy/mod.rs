@@ -2,13 +2,16 @@
 //! parsers, git integration — the Rust port of `src/main/buddy/`.
 
 pub mod acp;
+pub mod agents;
 pub mod coalesce;
 pub mod commit_message;
 pub mod defaults;
 pub mod events;
 pub mod git;
 pub mod launchers;
+pub mod library;
 pub mod locks;
+pub mod model_cache;
 pub mod model_detect;
 pub mod notifications;
 pub mod parsers;
@@ -22,6 +25,7 @@ pub mod service;
 pub mod session_insight;
 pub mod shell_path;
 pub mod store;
-pub mod task_services;
 pub mod task_id;
+pub mod task_services;
+pub mod token_usage;
 pub mod types;

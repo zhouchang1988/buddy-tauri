@@ -13,6 +13,7 @@ interface TitleBarProps {
   isFullScreen: boolean
   showToggles?: boolean
   bare?: boolean
+  agentStatus?: React.ReactNode
   onToggleSidebar: () => void
   onToggleStatusBar: () => void
   onRetry?: () => void
@@ -51,6 +52,7 @@ export function TitleBar({
   isFullScreen,
   showToggles = true,
   bare = false,
+  agentStatus,
   onToggleSidebar,
   onToggleStatusBar,
   onRetry,
@@ -83,6 +85,7 @@ export function TitleBar({
         {bare ? '' : (taskName || t('app.brand'))}
       </div>
 
+      {agentStatus}
       {/* 紧凑状态指示（仅在右侧栏隐藏时显示） */}
       {showToggles && compact && (
         <CompactStatus

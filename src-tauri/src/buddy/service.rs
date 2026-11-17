@@ -9,12 +9,16 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
-use super::commit_message::{self, GenerateCommitMessageInput};
 use super::acp::{
     check_global_acp_adapters, default_acp_args, prepare_acp_environment, probe_acp_models,
     resolve_acp_binary, AcpClient, AcpClientOptions, AcpStdioTransport, AcpTransport,
     ProbeAcpModelsOptions, StdioTransportOptions,
 };
+use super::agents::{
+    resolve_commit_agent_launch, resolve_protocol_launcher, AgentConfiguration,
+    AgentManagementService, AgentUpdateJob, AgentUpdateSnapshot, LocalAgent,
+};
+use super::commit_message::{self, GenerateCommitMessageInput};
 use super::defaults::{default_launcher_for, normalize_global_settings, DEFAULT_LAUNCHER_ORDER};
 use super::events::BuddyEventBus;
 use super::git;
@@ -22,6 +26,14 @@ use super::launchers::{
     build_launcher_command, kind_needs_pty, launcher_timeout_message, parser_actor_for_kind,
     run_launcher, run_launcher_with_pty, split_command, LauncherCommandInput, PtyRunInput,
     RunLauncherInput,
+};
+use super::library::{
+    AuthGuidanceResult, EnsureAcpHomeResult, LibraryBatchResult, LibraryOpResult, LibraryService,
+    LibrarySnapshot,
+};
+use super::model_cache::{
+    model_catalog_cache_key, ModelCacheMemEntry, ModelCatalogDiskCache, MODEL_CACHE_ERROR_TTL_MS,
+    MODEL_CACHE_TTL_MS,
 };
 use super::model_detect::detect_model_from_config;
 use super::parsers::{parse_actor_events, parse_buddy_message, BuddyMessage};
@@ -37,9 +49,9 @@ use super::store::{BuddyStore, StoreError};
 use super::types::{
     AcpModelList, AttachmentMeta, BootstrapResponse, CountdownInput, CreateTaskInput,
     CreateTaskResult, Event, ExecutionMode, GitCommitPushResult, GitPushAvailability,
-    GitPushResult, GitStatusResult, GlobalAcpAdaptersStatus, GlobalSettings,
-    InstructionQueueItem, RoundEventSummary, SendMessageInput, StartTaskInput, Task, TaskDetail,
-    TaskSettings, TaskStats, TestLauncherResult, TaskStatus,
+    GitPushResult, GitStatusResult, GlobalAcpAdaptersStatus, GlobalSettings, InstructionQueueItem,
+    ModelCatalogUpdate, ModelListContext, RoundEventSummary, SendMessageInput, StartTaskInput,
+    Task, TaskDetail, TaskSettings, TaskStats, TaskStatus, TestLauncherResult,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -101,12 +113,16 @@ impl BuddyCoreServiceOptions {
 /// The core service. `Send + Sync`; managed as Tauri state by `commands.rs`.
 pub struct BuddyCoreService {
     store: Arc<BuddyStore>,
+    agents: Arc<AgentManagementService>,
+    library: LibraryService,
+    model_disk_cache: ModelCatalogDiskCache,
+    model_catalog_events: tokio::sync::broadcast::Sender<ModelCatalogUpdate>,
     runner: Arc<BuddyRunner>,
     coordinator: QueueCoordinator,
     locale: Option<String>,
     /// Brief cache of `listAcpModels` results so the create-task modal can
     /// reopen without re-spawning the agent (TS: 5-minute TTL).
-    acp_model_cache: parking_lot::Mutex<HashMap<String, (AcpModelList, std::time::Instant)>>,
+    acp_model_cache: parking_lot::Mutex<HashMap<String, ModelCacheMemEntry>>,
     /// In-flight `listAcpModels` probes, deduplicating concurrent callers onto
     /// one spawn (TS: the `acpModelInflight` promise map).
     acp_model_inflight:
@@ -118,6 +134,10 @@ impl BuddyCoreService {
         let store = Arc::new(BuddyStore::new(
             options.data_root.clone().unwrap_or_else(default_data_root),
         ));
+        let agents = Arc::new(AgentManagementService::new(store.clone()));
+        let library = LibraryService::new(&store.data_root, agents.clone());
+        let model_disk_cache = ModelCatalogDiskCache::new(&store.data_root);
+        let (model_catalog_events, _) = tokio::sync::broadcast::channel(64);
         let notifier = match (options.notifier, options.notifier_factory) {
             (Some(notifier), _) => Some(notifier),
             (None, Some(factory)) => Some(factory(store.clone())),
@@ -146,6 +166,10 @@ impl BuddyCoreService {
         });
         BuddyCoreService {
             store,
+            agents,
+            library,
+            model_disk_cache,
+            model_catalog_events,
             runner,
             coordinator,
             locale: options.locale.or_else(detect_system_locale),
@@ -160,6 +184,208 @@ impl BuddyCoreService {
 
     pub fn get_store(&self) -> Arc<BuddyStore> {
         self.store.clone()
+    }
+
+    pub fn agents(&self) -> Arc<AgentManagementService> {
+        self.agents.clone()
+    }
+
+    pub fn subscribe_model_catalog(&self) -> tokio::sync::broadcast::Receiver<ModelCatalogUpdate> {
+        self.model_catalog_events.subscribe()
+    }
+
+    pub async fn initialize_agents(&self) -> Result<(), ServiceError> {
+        self.agents.initialize().await.map_err(ServiceError::msg)?;
+        self.model_disk_cache.ensure_loaded().await;
+        Ok(())
+    }
+
+    pub async fn refresh_agents_on_startup(&self) {
+        let snapshot = self.agents.get_inventory().await;
+        if self.agents.needs_startup_refresh(&snapshot) {
+            let _ = self.agents.refresh().await;
+        }
+        let _ = self.agents.check_updates(false).await;
+    }
+
+    pub async fn get_agent_inventory(&self) -> crate::buddy::agents::AgentInventorySnapshot {
+        self.agents.get_inventory().await
+    }
+
+    pub async fn refresh_local_agents(
+        &self,
+        mode: &str,
+    ) -> Result<crate::buddy::agents::AgentInventorySnapshot, ServiceError> {
+        if mode != "updates" {
+            super::shell_path::fix_shell_path();
+            self.agents.refresh().await.map_err(ServiceError::msg)?;
+        }
+        if mode != "scan" {
+            self.agents
+                .check_updates(mode == "all" || mode == "updates")
+                .await
+                .map_err(ServiceError::msg)?;
+        }
+        Ok(self.agents.get_inventory().await)
+    }
+
+    pub async fn list_local_agents(&self, force: bool) -> Result<Vec<LocalAgent>, ServiceError> {
+        self.agents
+            .list_local_agents(force)
+            .await
+            .map_err(ServiceError::msg)
+    }
+
+    pub async fn configure_agent(
+        &self,
+        id: &str,
+        config: AgentConfiguration,
+    ) -> Result<(), ServiceError> {
+        self.agents
+            .configure(id, config)
+            .await
+            .map_err(ServiceError::msg)
+    }
+
+    pub async fn probe_local_agent(&self, id: &str) -> Result<LocalAgent, ServiceError> {
+        self.agents.probe(id).await.map_err(ServiceError::msg)
+    }
+
+    pub async fn check_agent_updates(&self, force: bool) -> Result<Vec<LocalAgent>, ServiceError> {
+        self.agents
+            .check_updates(force)
+            .await
+            .map_err(ServiceError::msg)
+    }
+
+    pub async fn get_agent_update_state(&self) -> Result<AgentUpdateSnapshot, ServiceError> {
+        self.agents
+            .get_update_state()
+            .await
+            .map_err(ServiceError::msg)
+    }
+
+    pub async fn start_agent_updates(
+        &self,
+        ids: Vec<String>,
+        request_id: String,
+    ) -> Result<AgentUpdateSnapshot, ServiceError> {
+        self.agents
+            .start_updates(ids, request_id)
+            .await
+            .map_err(ServiceError::msg)
+    }
+
+    pub async fn update_local_agents(
+        &self,
+        ids: Vec<String>,
+    ) -> Result<Vec<AgentUpdateJob>, ServiceError> {
+        self.agents
+            .update_local_agents(ids)
+            .await
+            .map_err(ServiceError::msg)
+    }
+
+    pub async fn get_agent_update_jobs(&self) -> Result<Vec<AgentUpdateJob>, ServiceError> {
+        self.agents
+            .get_update_jobs()
+            .await
+            .map_err(ServiceError::msg)
+    }
+
+    pub async fn cancel_agent_updates(&self) -> Result<(), ServiceError> {
+        self.agents
+            .cancel_updates()
+            .await
+            .map_err(ServiceError::msg)
+    }
+
+    pub async fn get_library_snapshot(&self, force: bool) -> LibrarySnapshot {
+        self.library.get_snapshot(force).await
+    }
+
+    pub async fn refresh_library(&self, _force: bool) -> LibrarySnapshot {
+        self.library.refresh().await
+    }
+
+    pub async fn import_library_skills(&self, discovery_ids: Vec<String>) -> LibraryBatchResult {
+        self.library.import_skills(discovery_ids).await
+    }
+
+    pub async fn set_library_skill_assignment(
+        &self,
+        skill_id: &str,
+        target_id: &str,
+        enabled: bool,
+    ) -> LibraryOpResult {
+        self.library
+            .set_skill_assignment(skill_id, target_id, enabled)
+            .await
+    }
+
+    pub async fn eject_library_skill(&self, skill_id: &str) -> LibraryOpResult {
+        self.library.eject_skill(skill_id).await
+    }
+
+    pub async fn eject_library_server(&self, server_id: &str) -> LibraryOpResult {
+        self.library.eject_server(server_id).await
+    }
+
+    pub async fn add_library_server(
+        &self,
+        name: &str,
+        raw: serde_json::Map<String, serde_json::Value>,
+    ) -> LibraryOpResult {
+        self.library.add_server(name, raw).await
+    }
+
+    pub async fn import_library_servers(&self, discovery_ids: Vec<String>) -> LibraryBatchResult {
+        self.library.import_servers(discovery_ids).await
+    }
+
+    pub async fn set_library_server_assignment(
+        &self,
+        server_id: &str,
+        target_id: &str,
+        enabled: bool,
+    ) -> LibraryOpResult {
+        self.library
+            .set_server_assignment(server_id, target_id, enabled)
+            .await
+    }
+
+    pub async fn open_library_auth_guidance(
+        &self,
+        target_id: &str,
+        server_name: &str,
+    ) -> AuthGuidanceResult {
+        self.library
+            .open_auth_guidance(target_id, server_name)
+            .await
+    }
+
+    pub async fn open_library_dir(&self) -> Result<String, ServiceError> {
+        self.library
+            .open_library_dir()
+            .await
+            .map_err(ServiceError::msg)
+    }
+
+    pub async fn open_library_backups_dir(&self) -> Result<String, ServiceError> {
+        self.library
+            .open_backups_dir()
+            .await
+            .map_err(ServiceError::msg)
+    }
+
+    pub async fn ensure_library_acp_home(
+        &self,
+        agent_id: &str,
+    ) -> Result<EnsureAcpHomeResult, ServiceError> {
+        self.library
+            .ensure_acp_home(agent_id)
+            .await
+            .map_err(ServiceError::msg)
     }
 
     pub async fn update_task_text(
@@ -222,7 +448,10 @@ impl BuddyCoreService {
         Ok(self.store.get_task_detail(task_id, workspace_key).await?)
     }
 
-    pub async fn create_task(&self, input: CreateTaskInput) -> Result<CreateTaskResult, ServiceError> {
+    pub async fn create_task(
+        &self,
+        input: CreateTaskInput,
+    ) -> Result<CreateTaskResult, ServiceError> {
         let result = self.store.create_task(input).await?;
         // A newly created queued task may be the next to run; an immediate task
         // may now block the queue. Either way the workspace scheduling
@@ -257,7 +486,11 @@ impl BuddyCoreService {
             .clone()
             .filter(|k| !k.is_empty())
             .ok_or_else(|| ServiceError::msg("workspace_key is required"))?;
-        let state = self.store.read_task_state(task_id, &workspace_key).await.ok();
+        let state = self
+            .store
+            .read_task_state(task_id, &workspace_key)
+            .await
+            .ok();
         if state
             .as_ref()
             .map(|s| s.status == TaskStatus::Cancelled)
@@ -270,12 +503,10 @@ impl BuddyCoreService {
         // manual user start on a queued task goes through the coordinator's
         // manual activation path, which preserves queue identity and supersede
         // logic.
-        if state
-            .as_ref()
-            .and_then(|s| s.execution_mode)
-            == Some(ExecutionMode::Queued)
-        {
-            self.coordinator.start_queued_now(task_id, &workspace_key).await?;
+        if state.as_ref().and_then(|s| s.execution_mode) == Some(ExecutionMode::Queued) {
+            self.coordinator
+                .start_queued_now(task_id, &workspace_key)
+                .await?;
             return Ok(());
         }
         self.runner.start_task(task_id, input).await?;
@@ -424,7 +655,40 @@ impl BuddyCoreService {
         &self,
         settings: &GlobalSettings,
     ) -> Result<GlobalSettings, ServiceError> {
-        Ok(self.store.update_global_settings(settings).await?)
+        let current = self.store.read_global_settings().await?;
+        let mut merged = settings.clone();
+        let mut launchers = settings.launchers.clone().unwrap_or_default();
+        let mut management = current.agent_management.clone().unwrap_or_default();
+        if let Some(current_management) = &current.agent_management {
+            for id in current_management.keys() {
+                if let Some(existing) = current.launchers.as_ref().and_then(|items| items.get(id)) {
+                    let mut preserved = existing.clone();
+                    if let Some(timeout) = settings
+                        .launchers
+                        .as_ref()
+                        .and_then(|items| items.get(id))
+                        .map(|launcher| launcher.timeout_seconds)
+                    {
+                        preserved.timeout_seconds = timeout;
+                    }
+                    launchers.insert(id.clone(), preserved);
+                }
+            }
+        }
+        for (id, config) in &mut management {
+            let timeout = launchers.get(id).map(|launcher| launcher.timeout_seconds);
+            if let Some(timeout) = timeout {
+                if let Some(cli) = &mut config.cli {
+                    cli.timeout_seconds = timeout;
+                }
+                if let Some(acp) = &mut config.acp {
+                    acp.timeout_seconds = timeout;
+                }
+            }
+        }
+        merged.launchers = Some(launchers);
+        merged.agent_management = Some(management);
+        Ok(self.store.update_global_settings(&merged).await?)
     }
 
     pub async fn git_status(&self, repo_root: &str) -> GitStatusResult {
@@ -502,17 +766,28 @@ impl BuddyCoreService {
         &self,
         input: GenerateCommitMessageInput,
     ) -> Result<String, ServiceError> {
-        let actor = if commit_message::is_supported_actor(&input.actor) {
-            input.actor.clone()
-        } else {
-            "claude".to_string()
-        };
+        let actor = input.actor.clone();
         let global_settings = self.store.read_global_settings().await?;
-        let launcher = commit_message::resolve_launcher(
-            &actor,
-            input.task_settings.as_ref(),
-            Some(&global_settings),
-        );
+        let agent = self
+            .agents
+            .get_inventory()
+            .await
+            .agents
+            .into_iter()
+            .find(|agent| agent.id == actor);
+        let mut launcher = agent
+            .as_ref()
+            .and_then(|agent| {
+                resolve_commit_agent_launch(agent, &global_settings, input.task_settings.as_ref())
+            })
+            .ok_or_else(|| ServiceError::msg(format!("Agent unavailable: {actor}")))?;
+        if let Some(model) = &input.model {
+            launcher.model = if model == "__native__" {
+                None
+            } else {
+                Some(model.trim().to_string()).filter(|model| !model.is_empty())
+            };
+        }
         let result = commit_message::generate_commit_message_with_actor(
             &commit_message::GenerateCommitMessageActorInput {
                 repo_root: input.repo_root,
@@ -578,36 +853,104 @@ impl BuddyCoreService {
         Ok(result)
     }
 
-    /// Probe an ACP actor for the models it currently advertises. CLI actors
-    /// resolve to an empty list. Results are cached briefly (5 minutes) and
-    /// concurrent probes are deduplicated (TS `listAcpModels`).
+    async fn resolve_model_list_launcher(
+        &self,
+        actor: &str,
+        protocol: &str,
+        context: Option<&ModelListContext>,
+    ) -> Result<Option<super::types::Launcher>, ServiceError> {
+        if let Some(launcher) = context
+            .and_then(|context| context.launcher.as_ref())
+            .filter(|launcher| !launcher.command.is_empty())
+        {
+            let mut launcher = launcher.clone();
+            launcher.protocol = Some(protocol.to_string());
+            return Ok(Some(super::defaults::normalize_launcher(
+                actor,
+                Some(&launcher),
+            )));
+        }
+        if let Some(context) = context {
+            if let (Some(task_id), Some(workspace_key)) = (&context.task_id, &context.workspace_key)
+            {
+                if let Ok(settings) = self.store.read_task_settings(task_id, workspace_key).await {
+                    if let Some(launcher) = settings.launchers.get(actor).filter(|launcher| {
+                        !launcher.command.is_empty()
+                            && launcher.protocol.as_deref().unwrap_or("cli") == protocol
+                    }) {
+                        return Ok(Some(super::defaults::normalize_launcher(
+                            actor,
+                            Some(launcher),
+                        )));
+                    }
+                }
+            }
+        }
+        let settings = self.store.read_global_settings().await?;
+        let inventory = self.agents.get_inventory().await;
+        let agent = inventory.agents.iter().find(|agent| agent.id == actor);
+        Ok(resolve_protocol_launcher(protocol, agent, &settings, actor)
+            .map(|launcher| super::defaults::normalize_launcher(actor, Some(&launcher))))
+    }
+
+    pub async fn list_cli_models(
+        &self,
+        id: &str,
+        context: Option<ModelListContext>,
+    ) -> Result<AcpModelList, ServiceError> {
+        self.list_models(id, "cli", None, context).await
+    }
+
     pub async fn list_acp_models(
         &self,
         actor: &str,
         cwd: Option<String>,
+        context: Option<ModelListContext>,
+    ) -> Result<AcpModelList, ServiceError> {
+        self.list_models(actor, "acp", cwd, context).await
+    }
+
+    async fn list_models(
+        &self,
+        actor: &str,
+        protocol: &str,
+        cwd: Option<String>,
+        context: Option<ModelListContext>,
     ) -> Result<AcpModelList, ServiceError> {
         let empty = AcpModelList {
+            error: None,
             models: Vec::new(),
             current_model_id: None,
         };
-        let settings = self.store.read_global_settings().await?;
-        let normalized = normalize_global_settings(Some(&settings));
-        let launchers = normalized.launchers.unwrap_or_default();
-        let Some(launcher) = launchers.get(actor) else {
+        let Some(launcher) = self
+            .resolve_model_list_launcher(actor, protocol, context.as_ref())
+            .await?
+        else {
             return Ok(empty);
         };
-        if launcher.protocol.as_deref() != Some("acp") {
-            return Ok(empty);
-        }
-
-        let cache_key = format!(
-            "{actor}|{}|{}",
-            launcher.command,
-            launcher.args.clone().unwrap_or_default().join(" ")
+        let args = launcher.args.clone().unwrap_or_default();
+        let cache_key = model_catalog_cache_key(
+            protocol,
+            actor,
+            &launcher.command,
+            &args,
+            &launcher.env,
+            cwd.as_deref(),
         );
-        if let Some((list, expires_at)) = self.acp_model_cache.lock().get(&cache_key) {
-            if *expires_at > std::time::Instant::now() {
-                return Ok(list.clone());
+        self.model_disk_cache.ensure_loaded().await;
+        let now = super::model_cache::now_ms();
+        let mut cached = self.acp_model_cache.lock().get(&cache_key).cloned();
+        if cached.is_none() {
+            cached = self.model_disk_cache.get(&cache_key).await;
+            if let Some(entry) = &cached {
+                self.acp_model_cache
+                    .lock()
+                    .insert(cache_key.clone(), entry.clone());
+            }
+        }
+        if let Some(entry) = &cached {
+            if entry.expires_at > now {
+                return Ok(entry.list.clone());
             }
         }
 
@@ -620,42 +963,94 @@ impl BuddyCoreService {
         };
         let launcher = launcher.clone();
         let data_root = self.store.data_root.clone();
-        let actor = actor.to_string();
+        let actor_owned = actor.to_string();
+        let protocol_owned = protocol.to_string();
+        let agents = self.agents.clone();
         let list = cell
             .get_or_init(|| async move {
-                let probe = async {
+                let result = if protocol_owned == "acp" {
                     let base_args = launcher
                         .args
                         .clone()
                         .filter(|args| !args.is_empty())
-                        .unwrap_or_else(|| default_acp_args(&launcher.command, Some(&actor)));
+                        .unwrap_or_else(|| default_acp_args(&launcher.command, Some(&actor_owned)));
                     let resolved = resolve_acp_binary(&launcher.command, &base_args);
-                    let acp_env =
-                        prepare_acp_environment(&actor, launcher.env.clone(), Some(&data_root), None)
-                            .await?;
-                    probe_acp_models(ProbeAcpModelsOptions {
-                        command: resolved.command,
-                        args: resolved.args,
-                        cwd,
-                        env: Some(acp_env),
-                        timeout_ms: None,
-                    })
+                    match prepare_acp_environment(
+                        &actor_owned,
+                        launcher.env.clone(),
+                        Some(&data_root),
+                        None,
+                    )
                     .await
+                    {
+                        Ok(acp_env) => probe_acp_models(ProbeAcpModelsOptions {
+                            command: resolved.command,
+                            args: resolved.args,
+                            cwd,
+                            env: Some(acp_env),
+                            timeout_ms: None,
+                        })
+                        .await
+                        .map_err(|error| error.to_string()),
+                        Err(error) => Err(error.to_string()),
+                    }
+                } else {
+                    agents.models(&actor_owned, Some(launcher.clone())).await
+                };
+                match result {
+                    Ok(list) => {
+                        if protocol_owned == "acp" {
+                            agents.record_acp_probe_async(&actor_owned, Ok(())).await;
+                        }
+                        list
+                    }
+                    Err(error) => AcpModelList {
+                        models: Vec::new(),
+                        current_model_id: None,
+                        error: Some(redact_sensitive_text(&error)),
+                    },
                 }
-                .await;
-                probe.unwrap_or(AcpModelList {
-                    models: Vec::new(),
-                    current_model_id: None,
-                })
             })
             .await
             .clone();
         self.acp_model_inflight.lock().remove(&cache_key);
+        if protocol == "acp" && list.error.is_some() {
+            self.agents
+                .record_acp_probe_async(actor, Err(list.error.clone().unwrap_or_default()))
+                .await;
+        }
+        let final_list = if let Some(error) = &list.error {
+            cached
+                .as_ref()
+                .map(|entry| AcpModelList {
+                    error: Some(error.clone()),
+                    ..entry.list.clone()
+                })
+                .unwrap_or(list.clone())
+        } else {
+            list.clone()
+        };
+        let ttl = if final_list.error.is_some() {
+            MODEL_CACHE_ERROR_TTL_MS
+        } else {
+            MODEL_CACHE_TTL_MS
+        };
         self.acp_model_cache.lock().insert(
-            cache_key,
-            (list.clone(), std::time::Instant::now() + std::time::Duration::from_secs(300)),
+            cache_key.clone(),
+            ModelCacheMemEntry {
+                list: final_list.clone(),
+                expires_at: super::model_cache::now_ms() + ttl,
+            },
         );
-        Ok(list)
+        if list.error.is_none() {
+            let _ = self.model_disk_cache.set(&cache_key, &list).await;
+        }
+        let _ = self.model_catalog_events.send(ModelCatalogUpdate {
+            actor: actor.to_string(),
+            protocol: protocol.to_string(),
+            list: final_list.clone(),
+        });
+        Ok(final_list)
     }
 
     /// TS `checkAcpGlobalAdapters`: whether the claude/codex ACP adapter
@@ -922,6 +1317,8 @@ async fn run_ping(
     let launcher_command = build_launcher_command(&LauncherCommandInput {
         actor: actor.to_string(),
         command: command.to_string(),
+        args: None,
+        model: None,
         mode: Some("start".to_string()),
         prompt_file: prompt_file.to_string_lossy().to_string(),
         prompt_text: Some(prompt),
@@ -985,8 +1382,7 @@ async fn run_ping(
         Ok(result) => result,
         Err(error) => {
             let stderr_text = stderr_lines.join("\n").trim().to_string();
-            let is_only_warning =
-                !stderr_text.is_empty() && is_cli_warning_only(&stderr_text);
+            let is_only_warning = !stderr_text.is_empty() && is_cli_warning_only(&stderr_text);
             let message = error.to_string();
             let raw_detail = if !message.is_empty() {
                 message
@@ -1374,7 +1770,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let service = service_in(dir.path());
         let result = service
-            .test_launcher("claude", "buddy-definitely-not-a-real-command-xyz", None, None, None)
+            .test_launcher(
+                "claude",
+                "buddy-definitely-not-a-real-command-xyz",
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert!(!result.success);
@@ -1419,7 +1821,10 @@ mod tests {
             ),
         )
         .await;
-        let result = service.test_launcher("agy", &fake, None, None, None).await.unwrap();
+        let result = service
+            .test_launcher("agy", &fake, None, None, None)
+            .await
+            .unwrap();
         assert!(result.success, "error: {:?}", result.error);
         assert_eq!(
             result.response_preview.as_deref(),
@@ -1449,7 +1854,10 @@ mod tests {
             "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exit 0; fi\nkill -TERM $$\n",
         )
         .await;
-        let result = service.test_launcher("agy", &fake, None, None, None).await.unwrap();
+        let result = service
+            .test_launcher("agy", &fake, None, None, None)
+            .await
+            .unwrap();
         assert!(!result.success);
         let error = result.error.unwrap();
         assert!(error.contains("SIGTERM"), "{error}");
@@ -1468,7 +1876,10 @@ mod tests {
             "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exit 0; fi\necho \"Authentication error: credentials expired\" >&2\nexit 1\n",
         )
         .await;
-        let result = service.test_launcher("agy", &fake, None, None, None).await.unwrap();
+        let result = service
+            .test_launcher("agy", &fake, None, None, None)
+            .await
+            .unwrap();
         assert!(!result.success);
         let error = result.error.unwrap();
         assert!(
@@ -1497,10 +1908,7 @@ mod tests {
         assert!(!result.success);
         assert_eq!(result.phase, "ping");
         let error = result.error.unwrap();
-        assert!(
-            error.contains("timed out after 1 seconds"),
-            "{error}"
-        );
+        assert!(error.contains("timed out after 1 seconds"), "{error}");
         assert!(!error.contains("code null"), "{error}");
         assert_eq!(result.timed_out, Some(true));
     }
@@ -1542,5 +1950,86 @@ mod tests {
         // Just verify the flow reads settings and still resolves every actor.
         let models = service.detect_actor_models().await.unwrap();
         assert_eq!(models.len(), DEFAULT_LAUNCHER_ORDER.len());
+    }
+}
+
+#[cfg(test)]
+mod upstream_agent_library_tests {
+    use super::*;
+    use crate::buddy::types::Launcher;
+
+    fn service_in(dir: &std::path::Path) -> BuddyCoreService {
+        BuddyCoreService::new(BuddyCoreServiceOptions {
+            data_root: Some(dir.to_path_buf()),
+            locale: Some("en-US".to_string()),
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn agent_configuration_and_general_settings_stay_in_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = service_in(dir.path());
+        let launcher = Launcher {
+            protocol: Some("cli".to_string()),
+            command: "/tmp/custom-claude".to_string(),
+            args: Some(vec!["--model".to_string(), "sonnet".to_string()]),
+            env: HashMap::new(),
+            timeout_seconds: 7200,
+            model: None,
+        };
+        service
+            .configure_agent(
+                "claude",
+                AgentConfiguration {
+                    enabled: Some(true),
+                    protocol: Some("cli".to_string()),
+                    cli: Some(launcher),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        service
+            .update_global_settings(&GlobalSettings {
+                countdown_seconds: Some(45),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let settings = service.get_store().read_global_settings().await.unwrap();
+        let saved = &settings.launchers.unwrap()["claude"];
+        assert_eq!(saved.command, "/tmp/custom-claude");
+        assert_eq!(saved.args.as_ref().unwrap().len(), 2);
+        assert_eq!(
+            settings.agent_management.unwrap()["claude"]
+                .protocol
+                .as_deref(),
+            Some("cli")
+        );
+    }
+
+    #[tokio::test]
+    async fn library_add_snapshot_and_eject_use_real_service_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = service_in(dir.path());
+        let raw = serde_json::json!({ "type": "stdio", "command": "demo-server", "args": ["run"] })
+            .as_object()
+            .unwrap()
+            .clone();
+        let added = service.add_library_server("docs", raw).await;
+        assert_eq!(added.status, "ok");
+        let snapshot = service.get_library_snapshot(true).await;
+        assert!(snapshot.servers.iter().any(
+            |server| server.name == "docs" && server.command.as_deref() == Some("demo-server")
+        ));
+        assert!(snapshot
+            .targets
+            .iter()
+            .any(|target| target.agent_id == "shared"));
+        let ejected = service.eject_library_server(&added.id.unwrap()).await;
+        assert_eq!(ejected.status, "ok");
+        let snapshot = service.get_library_snapshot(true).await;
+        assert!(!snapshot.servers.iter().any(|server| server.name == "docs"));
     }
 }

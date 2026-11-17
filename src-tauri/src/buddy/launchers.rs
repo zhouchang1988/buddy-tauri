@@ -22,24 +22,28 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LauncherCommandKind {
+    NativeCodebuddy,
     NativeClaude,
     NativeCodex,
     NativeCursor,
     NativeAgy,
     NativeOpencode,
     NativeKimi,
+    NativeDsh,
     Contract,
 }
 
 impl LauncherCommandKind {
     pub fn as_str(&self) -> &'static str {
         match self {
+            LauncherCommandKind::NativeCodebuddy => "native_codebuddy",
             LauncherCommandKind::NativeClaude => "native_claude",
             LauncherCommandKind::NativeCodex => "native_codex",
             LauncherCommandKind::NativeCursor => "native_cursor",
             LauncherCommandKind::NativeAgy => "native_agy",
             LauncherCommandKind::NativeOpencode => "native_opencode",
             LauncherCommandKind::NativeKimi => "native_kimi",
+            LauncherCommandKind::NativeDsh => "native_dsh",
             LauncherCommandKind::Contract => "contract",
         }
     }
@@ -51,6 +55,8 @@ impl LauncherCommandKind {
 pub struct LauncherCommandInput {
     pub actor: String,
     pub command: String,
+    pub args: Option<Vec<String>>,
+    pub model: Option<String>,
     pub mode: Option<String>,
     pub prompt_file: String,
     pub prompt_text: Option<String>,
@@ -109,8 +115,10 @@ pub fn kind_needs_pty(kind: LauncherCommandKind) -> bool {
 /// so we need the opencode parser.
 pub fn parser_actor_for_kind(actor: &str, kind: LauncherCommandKind) -> String {
     match kind {
+        LauncherCommandKind::NativeCodebuddy => "claude".to_string(),
         LauncherCommandKind::NativeOpencode => "opencode".to_string(),
         LauncherCommandKind::NativeKimi => "kimi".to_string(),
+        LauncherCommandKind::NativeDsh => "dsh".to_string(),
         LauncherCommandKind::NativeClaude => "claude".to_string(),
         LauncherCommandKind::NativeCodex => "codex".to_string(),
         LauncherCommandKind::NativeCursor => "cursor".to_string(),
@@ -171,6 +179,9 @@ pub fn command_kind_for(actor: &str, command: &str) -> LauncherCommandKind {
 /// `wecode opencode ...` runs opencode; otherwise `wecode` runs claude.
 pub fn command_kind_for_tokens(actor: &str, base_cmd: &[String]) -> LauncherCommandKind {
     let executable = basename(base_cmd.first().map(String::as_str).unwrap_or(""));
+    if executable == "codebuddy" || executable == "cbc" {
+        return LauncherCommandKind::NativeCodebuddy;
+    }
     if executable == "claude" || is_wecode_claude_command_tokens(base_cmd) {
         return LauncherCommandKind::NativeClaude;
     }
@@ -189,12 +200,15 @@ pub fn command_kind_for_tokens(actor: &str, base_cmd: &[String]) -> LauncherComm
     if executable == "kimi" {
         return LauncherCommandKind::NativeKimi;
     }
+    if executable == "dsh" || is_npx_deepseek_harness_command(base_cmd) {
+        return LauncherCommandKind::NativeDsh;
+    }
     // Fallback: when no command is specified, infer from actor name.
     // Also: the Antigravity settings card always speaks agy's native protocol.
     // Never fall through to contract flags (--actor, etc.) just because the
     // command string used a wrapper basename we do not recognize — that is
     // exactly what produces "flags provided but not defined: -actor".
-    if executable.is_empty() || executable == "wecode" || actor == "agy" {
+    if executable.is_empty() || executable == "wecode" || actor == "agy" || actor == "dsh" {
         match actor {
             "claude" | "wecode_claude" => return LauncherCommandKind::NativeClaude,
             "codex" | "wecode_codex" => return LauncherCommandKind::NativeCodex,
@@ -202,6 +216,7 @@ pub fn command_kind_for_tokens(actor: &str, base_cmd: &[String]) -> LauncherComm
             "agy" => return LauncherCommandKind::NativeAgy,
             "opencode" | "wecode_opencode" => return LauncherCommandKind::NativeOpencode,
             "kimi" => return LauncherCommandKind::NativeKimi,
+            "dsh" => return LauncherCommandKind::NativeDsh,
             _ => {}
         }
     }
@@ -268,11 +283,120 @@ fn clean_codex_base_command(base_cmd: &[String]) -> Vec<String> {
     cleaned
 }
 
+fn is_npx_deepseek_harness_command(base_cmd: &[String]) -> bool {
+    basename(base_cmd.first().map(String::as_str).unwrap_or("")) == "npx"
+        && base_cmd.iter().skip(1).any(|arg| {
+            Regex::new(r"^@deepseek-ai/dsh(?:@.+)?$")
+                .map(|pattern| pattern.is_match(arg))
+                .unwrap_or(false)
+        })
+}
+
+fn split_dsh_profile_args(args: &[String]) -> (Option<String>, Vec<String>) {
+    const VALUE_FLAGS: [&str; 4] = [
+        "--profile",
+        "--from-default-profile",
+        "--patch",
+        "--session-id",
+    ];
+    let mut profile = None;
+    let mut rest = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--" {
+            break;
+        }
+        if !arg.starts_with('-') {
+            if index == 0 {
+                profile = Some(arg.clone());
+            }
+            index += 1;
+            continue;
+        }
+        let (flag, inline_value) = arg
+            .strip_prefix("--")
+            .and_then(|_| arg.split_once('='))
+            .map(|(flag, value)| (flag, Some(value)))
+            .unwrap_or((arg.as_str(), None));
+        let mut value = inline_value;
+        if value.is_none() && VALUE_FLAGS.contains(&flag) && index + 1 < args.len() {
+            index += 1;
+            value = Some(args[index].as_str());
+        }
+        if flag == "--profile" {
+            profile = value.filter(|value| !value.is_empty()).map(String::from);
+        } else if flag != "--session-id" && flag != "--json" {
+            rest.push(arg.clone());
+            if inline_value.is_none() {
+                if let Some(value) = value {
+                    rest.push(value.to_string());
+                }
+            }
+        }
+        index += 1;
+    }
+    (profile, rest)
+}
+
 /// Build the full command line for an actor invocation. Port of
 /// `buildLauncherCommand`; see the Electron edition for the per-actor flag
 /// rationale.
 pub fn build_launcher_command(input: &LauncherCommandInput) -> LauncherCommand {
     let mut base_cmd = split_command(&input.command);
+    base_cmd.extend(input.args.clone().unwrap_or_default());
+    if let Some(model) = input
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    {
+        let supports_model = !matches!(
+            input.actor.as_str(),
+            "copilot"
+                | "goose"
+                | "crush"
+                | "qoder"
+                | "qoder_cn"
+                | "hermes"
+                | "stepcode"
+                | "commandcode"
+                | "atomcode"
+                | "snow"
+                | "jcode"
+                | "devin"
+                | "mothx"
+                | "penguin"
+                | "omo"
+                | "prime_agent"
+                | "empryo"
+                | "ante"
+                | "claude_desktop"
+                | "zed"
+                | "vscode"
+                | "workbuddy"
+        );
+        if supports_model {
+            let mut filtered = Vec::new();
+            let mut skip = false;
+            for arg in base_cmd {
+                if skip {
+                    skip = false;
+                    continue;
+                }
+                if matches!(arg.as_str(), "--model" | "-m") {
+                    skip = true;
+                    continue;
+                }
+                if arg.starts_with("--model=") {
+                    continue;
+                }
+                filtered.push(arg);
+            }
+            base_cmd = filtered;
+            base_cmd.extend(["--model".to_string(), model.to_string()]);
+        }
+    }
     let kind = command_kind_for_tokens(&input.actor, &base_cmd);
     if base_cmd.first().map(String::is_empty).unwrap_or(true)
         && kind != LauncherCommandKind::Contract
@@ -293,9 +417,13 @@ pub fn build_launcher_command(input: &LauncherCommandInput) -> LauncherCommand {
     let prefix_args: Vec<String> = base_cmd.iter().skip(1).cloned().collect();
 
     match kind {
-        LauncherCommandKind::NativeClaude => {
+        LauncherCommandKind::NativeClaude | LauncherCommandKind::NativeCodebuddy => {
             let mut args = prefix_args;
-            if !args.iter().any(|arg| arg == "--dangerously-skip-permissions") {
+            if kind == LauncherCommandKind::NativeClaude
+                && !args
+                    .iter()
+                    .any(|arg| arg == "--dangerously-skip-permissions")
+            {
                 args.push("--dangerously-skip-permissions".to_string());
             }
             args.extend([
@@ -470,11 +598,49 @@ pub fn build_launcher_command(input: &LauncherCommandInput) -> LauncherCommand {
                 stdin_text: None,
             }
         }
+        LauncherCommandKind::NativeDsh => {
+            let mut tokens = vec![command.clone()];
+            tokens.extend(prefix_args);
+            let mut wrapper_args = Vec::new();
+            let mut dsh_args = tokens.split_off(1);
+            if basename(&command) == "npx" {
+                if let Some(package_index) = dsh_args.iter().position(|arg| {
+                    Regex::new(r"^@deepseek-ai/dsh(?:@.+)?$")
+                        .map(|pattern| pattern.is_match(arg))
+                        .unwrap_or(false)
+                }) {
+                    let split_at = package_index + 1;
+                    wrapper_args = dsh_args.drain(..split_at).collect();
+                }
+            }
+            let (profile, rest) = split_dsh_profile_args(&dsh_args);
+            let mut args = wrapper_args;
+            args.extend([
+                "--profile".to_string(),
+                profile.unwrap_or_else(|| "headless".to_string()),
+            ]);
+            args.extend(rest);
+            args.push("--json".to_string());
+            if let Some(session_id) = &input.session_id {
+                args.extend(["--session-id".to_string(), session_id.clone()]);
+            }
+            LauncherCommand {
+                command,
+                args,
+                env: None,
+                kind,
+                stdin_text: input.prompt_text.clone(),
+            }
+        }
         LauncherCommandKind::Contract => {
-            let mode = input
-                .mode
-                .clone()
-                .unwrap_or_else(|| if input.session_id.is_some() { "resume" } else { "start" }.to_string());
+            let mode = input.mode.clone().unwrap_or_else(|| {
+                if input.session_id.is_some() {
+                    "resume"
+                } else {
+                    "start"
+                }
+                .to_string()
+            });
             let repo_root = input.repo_root.clone().unwrap_or_default();
             let task_dir = input.task_dir.clone().unwrap_or_default();
             let run_id = input.run_id.clone().unwrap_or_default();
@@ -769,7 +935,9 @@ where
         };
         match trigger {
             Trigger::Exit(status) => status?,
-            Trigger::Io(result) => result.map(|_| unreachable!("no exit status")).map_err(LauncherError::Io)?,
+            Trigger::Io(result) => result
+                .map(|_| unreachable!("no exit status"))
+                .map_err(LauncherError::Io)?,
             Trigger::Timeout | Trigger::Abort => {
                 if matches!(trigger, Trigger::Timeout) {
                     timed_out = input
@@ -895,7 +1063,8 @@ fn send_signal(pid: Option<u32>, signal: &str) {
 /// ANSI escape sequence pattern for stripping TTY output.
 fn ansi_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
-    PATTERN.get_or_init(|| Regex::new("\x1b\\[[0-9;]*[a-zA-Z]|\x1b\\].*?(?:\x07|\x1b\\\\)").unwrap())
+    PATTERN
+        .get_or_init(|| Regex::new("\x1b\\[[0-9;]*[a-zA-Z]|\x1b\\].*?(?:\x07|\x1b\\\\)").unwrap())
 }
 
 /// Strip ANSI escape codes and carriage returns before forwarding PTY data.
@@ -1062,17 +1231,18 @@ where
     // TS `onAbort`: SIGTERM, then SIGKILL 1.5s later if the child still has
     // not exited (CLIs may trap SIGTERM). The delayed kill is a no-op when
     // the process already exited (ESRCH).
-    let kill_with_escalation = |pid: Option<u32>, killer: &mut Box<dyn portable_pty::ChildKiller + Send + Sync>| {
-        send_sigterm(pid);
-        if let Some(pid) = pid {
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-                send_sigkill(Some(pid));
-            });
-        } else {
-            let _ = killer.kill();
-        }
-    };
+    let kill_with_escalation =
+        |pid: Option<u32>, killer: &mut Box<dyn portable_pty::ChildKiller + Send + Sync>| {
+            send_sigterm(pid);
+            if let Some(pid) = pid {
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                    send_sigkill(Some(pid));
+                });
+            } else {
+                let _ = killer.kill();
+            }
+        };
 
     let mut drained = false;
     let mut decoder = Utf8StreamDecoder::default();
@@ -1179,7 +1349,11 @@ mod tests {
 
     #[test]
     fn builds_claude_non_interactive_stream_json_command() {
-        let mut i = input("claude", "claude --dangerously-skip-permissions", "/tmp/prompt.md");
+        let mut i = input(
+            "claude",
+            "claude --dangerously-skip-permissions",
+            "/tmp/prompt.md",
+        );
         i.prompt_text = Some("hello".to_string());
         assert_eq!(
             build_launcher_command(&i),
@@ -1237,7 +1411,11 @@ mod tests {
 
     #[test]
     fn builds_codex_exec_resume_command_after_exec_options() {
-        let mut i = input("codex", "codex --profile native --full-auto", "/tmp/prompt.md");
+        let mut i = input(
+            "codex",
+            "codex --profile native --full-auto",
+            "/tmp/prompt.md",
+        );
         i.prompt_text = Some("hello".to_string());
         i.output_file = Some("/tmp/output.md".to_string());
         i.repo_root = Some("/tmp/repo".to_string());
@@ -1342,7 +1520,8 @@ mod tests {
                 env: None,
                 kind: LauncherCommandKind::NativeAgy,
                 stdin_text: Some(
-                    "{\"event\":\"user\",\"message\":{\"content\":\"hello from agy\"}}\n".to_string()
+                    "{\"event\":\"user\",\"message\":{\"content\":\"hello from agy\"}}\n"
+                        .to_string()
                 ),
             }
         );
@@ -1366,10 +1545,7 @@ mod tests {
             command_kind_for("agy", "agy"),
             LauncherCommandKind::NativeAgy
         );
-        assert_eq!(
-            command_kind_for("agy", ""),
-            LauncherCommandKind::NativeAgy
-        );
+        assert_eq!(command_kind_for("agy", ""), LauncherCommandKind::NativeAgy);
         assert_eq!(
             command_kind_for("agy", "antigravity"),
             LauncherCommandKind::NativeAgy
@@ -1382,7 +1558,9 @@ mod tests {
         let mut i = input("agy", "my-agy-wrapper", "/tmp/prompt.md");
         i.prompt_text = Some("hi".to_string());
         i.timeout_seconds = Some(120);
-        assert!(!build_launcher_command(&i).args.contains(&"--actor".to_string()));
+        assert!(!build_launcher_command(&i)
+            .args
+            .contains(&"--actor".to_string()));
     }
 
     #[test]
@@ -1583,7 +1761,9 @@ mod tests {
     fn wecode_detection_mirrors_command_kind_for() {
         assert!(is_wecode_command("/usr/local/bin/wecode --flag"));
         assert!(is_wecode_claude_command("wecode"));
-        assert!(is_wecode_claude_command("wecode --dangerously-skip-permissions"));
+        assert!(is_wecode_claude_command(
+            "wecode --dangerously-skip-permissions"
+        ));
         assert!(!is_wecode_claude_command("wecode codex"));
         assert!(!is_wecode_claude_command("wecode opencode"));
         assert!(is_wecode_codex_command("wecode codex --profile native"));
@@ -1630,14 +1810,21 @@ mod tests {
         let built = build_launcher_command(&bare);
         assert_eq!(built.args[0], "--dangerously-skip-permissions");
         assert_eq!(
-            built.args.iter().filter(|arg| *arg == "--dangerously-skip-permissions").count(),
+            built
+                .args
+                .iter()
+                .filter(|arg| *arg == "--dangerously-skip-permissions")
+                .count(),
             1
         );
 
         let wecode = input("wecode_claude", "", "/tmp/prompt.md");
         let built = build_launcher_command(&wecode);
         assert_eq!(built.command, "wecode");
-        assert!(built.args.iter().any(|arg| arg == "--dangerously-skip-permissions"));
+        assert!(built
+            .args
+            .iter()
+            .any(|arg| arg == "--dangerously-skip-permissions"));
 
         let codex = input("wecode_codex", "", "/tmp/prompt.md");
         let built = build_launcher_command(&codex);
@@ -1716,7 +1903,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.exit_code, Some(0));
-        assert!(data.contains("hello-pty"), "expected pty output, got {data:?}");
+        assert!(
+            data.contains("hello-pty"),
+            "expected pty output, got {data:?}"
+        );
     }
 
     /// Manual reproduction against the real opencode CLI — run with:
@@ -1741,9 +1931,22 @@ mod tests {
         let result = run_launcher_with_pty(&input, |chunk| data.push_str(&chunk))
             .await
             .unwrap();
-        eprintln!("exit={:?} signal={:?} bytes={}", result.exit_code, result.signal, data.len());
-        assert_eq!(result.exit_code, Some(0), "opencode should exit 0; got {result:?}");
-        assert!(data.contains("step_start") || data.contains("text"), "expected json events, got: {}", &data[..data.len().min(500)]);
+        eprintln!(
+            "exit={:?} signal={:?} bytes={}",
+            result.exit_code,
+            result.signal,
+            data.len()
+        );
+        assert_eq!(
+            result.exit_code,
+            Some(0),
+            "opencode should exit 0; got {result:?}"
+        );
+        assert!(
+            data.contains("step_start") || data.contains("text"),
+            "expected json events, got: {}",
+            &data[..data.len().min(500)]
+        );
     }
 
     #[test]
@@ -1794,20 +1997,17 @@ mod tests {
             command: "sh".to_string(),
             args: vec![
                 "-c".to_string(),
-                "i=0; while [ $i -lt 1000 ]; do printf '测试输出中文内容😀\\n'; i=$((i+1)); done".to_string(),
+                "i=0; while [ $i -lt 1000 ]; do printf '测试输出中文内容😀\\n'; i=$((i+1)); done"
+                    .to_string(),
             ],
             cwd: "/tmp".to_string(),
             timeout_ms: 10_000,
             ..Default::default()
         };
         let mut out = String::new();
-        run_launcher(
-            &input,
-            |line| out.push_str(&line),
-            |_| {},
-        )
-        .await
-        .unwrap();
+        run_launcher(&input, |line| out.push_str(&line), |_| {})
+            .await
+            .unwrap();
         assert!(
             !out.contains('\u{FFFD}'),
             "mojibake in output: {}",
@@ -1951,5 +2151,73 @@ mod tests {
         abort.store(true, Ordering::SeqCst);
         let result = run_launcher(&input, |_| {}, |_| {}).await.unwrap();
         assert!(!result.timed_out);
+    }
+}
+
+#[cfg(test)]
+mod upstream_dsh_tests {
+    use super::*;
+
+    #[test]
+    fn builds_direct_dsh_headless_command_with_stdin_and_session() {
+        let built = build_launcher_command(&LauncherCommandInput {
+            actor: "dsh".to_string(),
+            command: "dsh --patch extra.yml ignored-task".to_string(),
+            session_id: Some("session-1".to_string()),
+            prompt_text: Some("fresh prompt".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(built.kind, LauncherCommandKind::NativeDsh);
+        assert_eq!(built.command, "dsh");
+        assert_eq!(
+            built.args,
+            vec![
+                "--profile",
+                "headless",
+                "--patch",
+                "extra.yml",
+                "--json",
+                "--session-id",
+                "session-1"
+            ]
+        );
+        assert_eq!(built.stdin_text.as_deref(), Some("fresh prompt"));
+        assert!(!built.args.iter().any(|arg| arg == "ignored-task"));
+    }
+
+    #[test]
+    fn preserves_npx_dsh_package_prefix() {
+        let built = build_launcher_command(&LauncherCommandInput {
+            actor: "dsh".to_string(),
+            command: "npx -y @deepseek-ai/dsh headless".to_string(),
+            prompt_text: Some("hello".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(built.kind, LauncherCommandKind::NativeDsh);
+        assert_eq!(built.command, "npx");
+        assert_eq!(
+            built.args,
+            vec!["-y", "@deepseek-ai/dsh", "--profile", "headless", "--json"]
+        );
+    }
+
+    #[test]
+    fn appends_cli_args_and_selected_model() {
+        let built = build_launcher_command(&LauncherCommandInput {
+            actor: "claude".to_string(),
+            command: "claude".to_string(),
+            args: Some(vec!["--settings".to_string(), "team.json".to_string()]),
+            model: Some("claude-sonnet-4".to_string()),
+            prompt_text: Some("hello".to_string()),
+            ..Default::default()
+        });
+        assert!(built
+            .args
+            .windows(2)
+            .any(|args| args == ["--settings", "team.json"]));
+        assert!(built
+            .args
+            .windows(2)
+            .any(|args| args == ["--model", "claude-sonnet-4"]));
     }
 }

@@ -405,12 +405,18 @@ mod tests {
                 .await
                 .unwrap();
             assert!(config.contains("test-model"));
-            let auth_mode = std::fs::symlink_metadata(expected.join("auth.json"))
+            assert!(std::fs::symlink_metadata(expected.join("auth.json"))
                 .unwrap()
-                .permissions()
-                .mode()
-                & 0o777;
-            assert_eq!(auth_mode, 0o600);
+                .file_type()
+                .is_symlink());
+            assert_eq!(
+                tokio::fs::canonicalize(expected.join("auth.json"))
+                    .await
+                    .unwrap(),
+                tokio::fs::canonicalize(source.join("auth.json"))
+                    .await
+                    .unwrap()
+            );
             assert!(!std::fs::symlink_metadata(expected.join("config.toml"))
                 .unwrap()
                 .file_type()

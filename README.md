@@ -14,7 +14,8 @@ Buddy 是一个双 AI Agent 协作编码的 macOS 桌面应用（两个 AI Actor
 ## 特性
 
 - **双 Actor 协作**：执行方实现代码，审查方检查修正，循环推进直到双方确认完成
-- **5 种 AI Actor**：Claude Code、Codex、Cursor CLI、OpenCode、Kimi Code
+- **本机 Agent 动态发现**：Claude Code、Codex、Cursor CLI、Antigravity、OpenCode、Kimi Code、DeepSeek Harness、CodeBuddy，以及可用 ACP 驱动的其他 Agent
+- **Agent 与资源管理**：统一配置 CLI/ACP 和模型、检查并批量更新 Agent；在 Skills/MCP 资源库中发现、导入并按 Agent 分配扩展
 - **双确认结束**：双方均发出 `type=break` 才结束任务，单方 break 不终止
 - **指令队列**：在 Actor 运行期间排队发送指令，轮次结束后自动执行
 - **Git 集成**：本地化 conventional commit 消息生成、变更查看、提交与推送
@@ -134,6 +135,8 @@ buddy/
 | Cursor | `{cmd} --print --force --output-format stream-json [--resume SID] PROMPT` | `--resume` |
 | OpenCode | `{cmd} run --format json [--session SID]` | `--session` |
 | Kimi | `{cmd} --print --output-format stream-json --input-format text [--session SID]` | `--session` |
+| DeepSeek Harness | `{cmd} --profile headless --json [--session-id SID]`（prompt 经 stdin） | `--session-id` |
+| CodeBuddy | `{cmd} -p --output-format stream-json --input-format text [--resume SID]` | `--resume` |
 
 非原生命令使用契约模式，传递 `BUDDY_ACTOR`、`BUDDY_MODE` 等环境变量。
 

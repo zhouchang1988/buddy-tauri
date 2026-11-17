@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { decodeUnicodeEscapes, decodeErrorText, eventPayloadSummary, formatDuration, buildSessionResumeCommand } from '../../src/lib/format'
+import { decodeUnicodeEscapes, decodeErrorText, eventPayloadSummary, formatDuration, buildSessionResumeCommand, modelOptionLabel } from '../../src/lib/format'
 
 describe('buildSessionResumeCommand', () => {
   it('builds per-actor resume commands', () => {
@@ -25,6 +25,24 @@ describe('buildSessionResumeCommand', () => {
       .toBe('cd "/r" && codex --profile native resume t1')
     expect(buildSessionResumeCommand('claude', 's1', '  ', null)).toBe('claude --resume s1')
     expect(buildSessionResumeCommand('claude', 's1', null, null)).toBe('claude --resume s1')
+  })
+})
+
+describe('modelOptionLabel', () => {
+  it('prefers the catalog display name over the wire id', () => {
+    expect(modelOptionLabel('default[]', [{ id: 'default[]', name: 'Auto' }], { nativeLabel: '使用 Agent 自身默认' })).toBe('Auto')
+  })
+
+  it('keeps empty (native) distinct from Cursor Auto when the catalog is cold', () => {
+    expect(modelOptionLabel('', undefined, { nativeLabel: '使用 Agent 自身默认' })).toBe('使用 Agent 自身默认')
+    expect(modelOptionLabel('default[]', undefined, { nativeLabel: '使用 Agent 自身默认' })).toBe('Auto')
+    expect(modelOptionLabel('auto[fast=true]')).toBe('Auto')
+    expect(modelOptionLabel('grok-4.7[context=256k,reasoning_effort=high,fast=true]')).toBe('grok-4.7')
+  })
+
+  it('keeps ordinary model ids unchanged', () => {
+    expect(modelOptionLabel('claude-opus-4')).toBe('claude-opus-4')
+
   })
 })
 

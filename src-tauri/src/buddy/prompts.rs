@@ -40,6 +40,7 @@ pub const ACTOR_CURSOR: &str = "cursor";
 pub const ACTOR_AGY: &str = "agy";
 pub const ACTOR_OPENCODE: &str = "opencode";
 pub const ACTOR_KIMI: &str = "kimi";
+pub const ACTOR_DSH: &str = "dsh";
 pub const ACTOR_WECODE_CLAUDE: &str = "wecode_claude";
 pub const ACTOR_WECODE_CODEX: &str = "wecode_codex";
 pub const ACTOR_WECODE_OPENCODE: &str = "wecode_opencode";
@@ -141,7 +142,11 @@ pub fn build_actor_prompt(input: &BuildActorPromptInput) -> String {
     let implementer = implementer_actor(settings);
     let reviewer = reviewer_actor(settings);
     let is_implementer = input.actor == implementer;
-    let other_actor = if is_implementer { &reviewer } else { &implementer };
+    let other_actor = if is_implementer {
+        &reviewer
+    } else {
+        &implementer
+    };
     let role_label = if is_implementer {
         "implementer (执行者)"
     } else {
@@ -190,7 +195,10 @@ pub fn build_actor_prompt(input: &BuildActorPromptInput) -> String {
 
     if let Some(pending_break) = pending_break {
         let requester_label = actor_display_name(
-            pending_break.get("actor").and_then(Value::as_str).unwrap_or(""),
+            pending_break
+                .get("actor")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
         );
         parts.push(String::new());
         parts.push("## Break confirmation required".to_string());
@@ -205,9 +213,8 @@ pub fn build_actor_prompt(input: &BuildActorPromptInput) -> String {
         parts.push("**Important**: This is a priority decision. Do NOT start new work or investigate new questions. Either confirm the break or reject it with a specific reason.".to_string());
     }
 
-    let break_rejected_by_other = break_rejected_by.filter(|marker| {
-        marker.get("actor").and_then(Value::as_str) != Some(input.actor.as_str())
-    });
+    let break_rejected_by_other = break_rejected_by
+        .filter(|marker| marker.get("actor").and_then(Value::as_str) != Some(input.actor.as_str()));
     if let Some(rejected) = break_rejected_by_other {
         let rejected_label =
             actor_display_name(rejected.get("actor").and_then(Value::as_str).unwrap_or(""));
@@ -273,7 +280,10 @@ pub fn build_actor_prompt(input: &BuildActorPromptInput) -> String {
     );
     if let Some(pending_break) = pending_break {
         let requester_name = actor_display_name(
-            pending_break.get("actor").and_then(Value::as_str).unwrap_or(""),
+            pending_break
+                .get("actor")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
         );
         parts.push(format!(
             "You are the {role_label}. {requester_name} has requested to end the task. Confirm with `type=break` or continue with `type=chat`."
@@ -370,14 +380,15 @@ pub fn runtime_settings_lines(
                 js_number_string(max_rounds)
             }
         ),
-        format!(
-            "- Automatic rounds remaining in this window: {}",
-            remaining
-        ),
+        format!("- Automatic rounds remaining in this window: {}", remaining),
         format!(
             "- Next actor after this turn: {} ({})",
             next_actor(actor, settings),
-            if is_implementer { "Reviewer" } else { "Implementer" }
+            if is_implementer {
+                "Reviewer"
+            } else {
+                "Implementer"
+            }
         ),
     ];
     if !repo_root.is_empty() {
@@ -415,8 +426,7 @@ pub fn runtime_settings_lines(
 pub fn select_recent_transcript(transcript: &[TranscriptRow], window: usize) -> Vec<TranscriptRow> {
     let split = transcript.len().saturating_sub(window);
     let mut recent: Vec<TranscriptRow> = transcript[split..].to_vec();
-    let mut recent_keys: std::collections::HashSet<String> =
-        recent.iter().map(row_key).collect();
+    let mut recent_keys: std::collections::HashSet<String> = recent.iter().map(row_key).collect();
     let earlier = &transcript[..split];
 
     for role in [
@@ -427,6 +437,7 @@ pub fn select_recent_transcript(transcript: &[TranscriptRow], window: usize) -> 
         ACTOR_AGY,
         ACTOR_OPENCODE,
         ACTOR_KIMI,
+        ACTOR_DSH,
         ACTOR_WECODE_CLAUDE,
         ACTOR_WECODE_CODEX,
         ACTOR_WECODE_OPENCODE,
@@ -475,7 +486,9 @@ pub fn detect_human_language(
 
     let cjk_count = text
         .chars()
-        .filter(|&ch| ('\u{4e00}'..='\u{9fff}').contains(&ch) || ('\u{3400}'..='\u{4dbf}').contains(&ch))
+        .filter(|&ch| {
+            ('\u{4e00}'..='\u{9fff}').contains(&ch) || ('\u{3400}'..='\u{4dbf}').contains(&ch)
+        })
         .count();
     let non_space = text.chars().filter(|ch| !ch.is_whitespace()).count();
     if non_space > 0 && (cjk_count as f64 / non_space as f64) > 0.1 {
@@ -528,6 +541,7 @@ pub fn actor_display_name(actor: &str) -> String {
         ACTOR_CLAUDE => "Claude Code".to_string(),
         ACTOR_OPENCODE => "OpenCode".to_string(),
         ACTOR_KIMI => "Kimi Code".to_string(),
+        ACTOR_DSH => "DeepSeek Harness".to_string(),
         ACTOR_CODEX => "Codex".to_string(),
         ACTOR_CURSOR => "Cursor".to_string(),
         ACTOR_AGY => "Antigravity".to_string(),

@@ -1,5 +1,5 @@
-//! Parsers for the streaming JSON output of the six actor CLIs
-//! (claude / codex / cursor / agy / opencode / kimi). Port of
+//! Parsers for the streaming JSON output of native actor CLIs
+//! (claude / codex / cursor / agy / opencode / kimi / dsh). Port of
 //! `src/main/buddy/parsers.ts` from the Electron edition.
 
 use regex::Regex;
@@ -154,7 +154,9 @@ pub fn parse_claude_stream_line(line: &str) -> serde_json::Result<ParsedActorLin
                 .iter()
                 .filter(|part| {
                     get(part, "type").and_then(Value::as_str) == Some("text")
-                        && get_text(part, "text").map(|t| !t.is_empty()).unwrap_or(false)
+                        && get_text(part, "text")
+                            .map(|t| !t.is_empty())
+                            .unwrap_or(false)
                 })
                 .filter_map(|part| get_text(part, "text"))
                 .collect::<Vec<_>>()
@@ -220,7 +222,8 @@ pub fn parse_codex_json_line(line: &str) -> serde_json::Result<ParsedActorLine> 
     Ok(ParsedActorLine {
         text,
         session_id: stable_session_id_from_event("codex", &json),
-        thread_id: stable_thread_id_from_event("codex", &json).or_else(|| get_text(&json, "thread_id")),
+        thread_id: stable_thread_id_from_event("codex", &json)
+            .or_else(|| get_text(&json, "thread_id")),
         raw_type: get_text(&json, "type"),
         ..Default::default()
     })
@@ -252,7 +255,11 @@ pub fn parse_cursor_stream_line(line: &str) -> serde_json::Result<ParsedActorLin
     if raw_type.as_deref() == Some("tool_call") {
         let detail = cursor_tool_call_detail(&json);
         return Ok(ParsedActorLine {
-            text: Some(detail.map(|d| format!("🔧 {d}")).unwrap_or_else(|| "🔧 tool".to_string())),
+            text: Some(
+                detail
+                    .map(|d| format!("🔧 {d}"))
+                    .unwrap_or_else(|| "🔧 tool".to_string()),
+            ),
             session_id,
             raw_type,
             stream_mode: Some(StreamMode::Line),
@@ -297,8 +304,12 @@ pub fn parse_cursor_stream_line(line: &str) -> serde_json::Result<ParsedActorLin
         // - timestamp_ms present, model_call_id absent → live delta (use)
         // - timestamp_ms + model_call_id → buffered copy before tool (skip)
         // - no timestamp_ms → final flush duplicate (skip)
-        let has_timestamp = get(&json, "timestamp_ms").map(json_present).unwrap_or(false);
-        let has_model_call_id = get(&json, "model_call_id").map(json_present).unwrap_or(false);
+        let has_timestamp = get(&json, "timestamp_ms")
+            .map(json_present)
+            .unwrap_or(false);
+        let has_model_call_id = get(&json, "model_call_id")
+            .map(json_present)
+            .unwrap_or(false);
         if !has_timestamp || has_model_call_id {
             return Ok(ParsedActorLine {
                 session_id,
@@ -405,9 +416,8 @@ pub fn parse_opencode_json_line(line: &str) -> serde_json::Result<ParsedActorLin
     let event_type = get(&json, "type").and_then(Value::as_str);
     let mut text: Option<String> = None;
 
-    let session_id = || {
-        stable_session_id_from_event("opencode", &json).or_else(|| get_text(&json, "sessionID"))
-    };
+    let session_id =
+        || stable_session_id_from_event("opencode", &json).or_else(|| get_text(&json, "sessionID"));
 
     match event_type {
         Some("text") => {
@@ -660,9 +670,7 @@ pub fn parse_agy_stream_line(line: &str) -> serde_json::Result<ParsedActorLine> 
                     .and_then(|s| s.get("tool_name"))
                     .and_then(text_value)
                     .unwrap_or_else(|| "tool".to_string());
-                let tool_info = step
-                    .and_then(|s| s.get("tool_info"))
-                    .and_then(object_value);
+                let tool_info = step.and_then(|s| s.get("tool_info")).and_then(object_value);
                 let params = tool_info
                     .and_then(|info| info.get("parameters"))
                     .and_then(object_value)
@@ -770,6 +778,46 @@ fn agy_tool_args_detail(args: &Map<String, Value>) -> Option<String> {
     None
 }
 
+pub fn parse_dsh_json_line(line: &str) -> serde_json::Result<ParsedActorLine> {
+    let json: Value = serde_json::from_str(line)?;
+    let raw_type = get_text(&json, "type");
+    let session_id = if raw_type.as_deref() == Some("session") {
+        get_text(&json, "sessionId")
+    } else {
+        None
+    };
+    let mut parsed = ParsedActorLine {
+        session_id,
+        raw_type: raw_type.clone(),
+        noise: true,
+        ..Default::default()
+    };
+    match raw_type.as_deref() {
+        Some("text") => {
+            parsed.text = get_text(&json, "text");
+            parsed.noise = false;
+        }
+        Some("tool_call") => {
+            let tool_name = get_text(&json, "tool").unwrap_or_else(|| "tool".to_string());
+            let detail =
+                get(&json, "input").and_then(|input| opencode_tool_detail(&tool_name, input));
+            parsed.text = Some(match detail {
+                Some(detail) => format!("🔧 {tool_name} {detail}"),
+                None => format!("🔧 {tool_name}"),
+            });
+            parsed.stream_mode = Some(StreamMode::Line);
+            parsed.noise = false;
+        }
+        Some("error") => {
+            parsed.text = Some(get_text(&json, "message").unwrap_or_else(|| "error".to_string()));
+            parsed.stream_mode = Some(StreamMode::Line);
+            parsed.noise = false;
+        }
+        _ => {}
+    }
+    Ok(parsed)
+}
+
 pub fn parse_actor_line(actor: &str, line: &str) -> serde_json::Result<ParsedActorLine> {
     match actor {
         "claude" => parse_claude_stream_line(line),
@@ -778,6 +826,7 @@ pub fn parse_actor_line(actor: &str, line: &str) -> serde_json::Result<ParsedAct
         "agy" => parse_agy_stream_line(line),
         "opencode" => parse_opencode_json_line(line),
         "kimi" => parse_kimi_json_line(line),
+        "dsh" => parse_dsh_json_line(line),
         _ => parse_codex_json_line(line),
     }
 }
@@ -806,6 +855,7 @@ pub fn extract_actor_output(actor: &str, raw_events: &str) -> String {
         "agy" => extract_agy_output(raw_events),
         "opencode" => extract_opencode_output(raw_events),
         "kimi" => extract_kimi_output(raw_events),
+        "dsh" => extract_dsh_output(raw_events),
         _ => extract_generic_json_output(raw_events),
     }
 }
@@ -831,7 +881,10 @@ pub fn parse_buddy_message(text: &str) -> BuddyMessage {
     }
 
     if fields.get("type").and_then(Value::as_str) == Some("break") {
-        let reason = fields.get("reason").and_then(Value::as_str).map(String::from);
+        let reason = fields
+            .get("reason")
+            .and_then(Value::as_str)
+            .map(String::from);
         return BuddyMessage::Break {
             content: reason.clone().unwrap_or_else(|| text.to_string()),
             reason,
@@ -1198,6 +1251,43 @@ fn extract_kimi_output(raw_events: &str) -> String {
     }
 }
 
+fn extract_dsh_output(raw_events: &str) -> String {
+    let mut final_text = String::new();
+    let mut streamed_text = String::new();
+    let mut tool_text = String::new();
+    for event in parse_jsonl_buffer(raw_events) {
+        match get(&event, "type").and_then(Value::as_str) {
+            Some("final") => {
+                if let Some(text) = get_text(&event, "text") {
+                    final_text = text;
+                }
+            }
+            Some("text") => {
+                if let Some(text) = get_text(&event, "text") {
+                    streamed_text.push_str(&text);
+                }
+            }
+            Some("tool_result") => {
+                if let Some(result) =
+                    get_text(&event, "result").filter(|result| buddy_json_re().is_match(result))
+                {
+                    tool_text = result.trim().to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+    (if !final_text.is_empty() {
+        final_text
+    } else if !streamed_text.is_empty() {
+        streamed_text
+    } else {
+        tool_text
+    })
+    .trim()
+    .to_string()
+}
+
 fn extract_generic_json_output(raw_events: &str) -> String {
     let mut chunks: Vec<String> = Vec::new();
     for event in parse_jsonl_buffer(raw_events) {
@@ -1293,13 +1383,15 @@ fn claude_session_id_from_event(event: &Value) -> Option<String> {
         if subtype == "init" {
             return Some(session_id);
         }
-        if subtype.starts_with("hook_")
-            || get(event, "hook_event").map(js_truthy).unwrap_or(false)
+        if subtype.starts_with("hook_") || get(event, "hook_event").map(js_truthy).unwrap_or(false)
         {
             return None;
         }
     }
-    if matches!(event_type, Some("result") | Some("assistant") | Some("user")) {
+    if matches!(
+        event_type,
+        Some("result") | Some("assistant") | Some("user")
+    ) {
         return Some(session_id);
     }
     if event_type != Some("system") {
@@ -1830,7 +1922,8 @@ mod tests {
     #[test]
     fn preserves_markdown_content_from_buddy_json_envelopes() {
         let markdown = "## Summary\n\n- Updated `src/main`\n- Kept transcript JSONL compatible\n";
-        let message = parse_buddy_message(&stringify(json!({ "type": "chat", "content": markdown })));
+        let message =
+            parse_buddy_message(&stringify(json!({ "type": "chat", "content": markdown })));
 
         assert_eq!(
             message,
@@ -2037,7 +2130,8 @@ mod tests {
 
     #[test]
     fn handles_valid_json_after_preamble_without_quotes_in_preamble() {
-        let text = "Done. Here is the summary.\\n\\n{\"type\": \"chat\", \"content\": \"Summary text.\"}";
+        let text =
+            "Done. Here is the summary.\\n\\n{\"type\": \"chat\", \"content\": \"Summary text.\"}";
         let message = parse_buddy_message(text);
 
         assert_eq!(
@@ -2306,7 +2400,8 @@ mod tests {
     fn extracts_buddy_json_from_fallback_parsed_text_with_raw_tool_result() {
         let broken_line1 = "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"content\":\"diff --git a/parsers.ts b/parsers.ts\"}";
         let broken_line2 = "more diff content with \"content\":\" keys inside";
-        let assistant_text = "Here is my analysis.\n{\"type\":\"chat\",\"content\":\"Fixed the parsing bug.\"}";
+        let assistant_text =
+            "Here is my analysis.\n{\"type\":\"chat\",\"content\":\"Fixed the parsing bug.\"}";
 
         let text = [broken_line1, broken_line2, assistant_text].join("\n");
         let message = parse_buddy_message(&text);
@@ -2511,5 +2606,35 @@ mod tests {
             run_command.text.as_deref(),
             Some("🔧 run_command pnpm test")
         );
+    }
+}
+
+#[cfg(test)]
+mod upstream_dsh_tests {
+    use super::*;
+
+    #[test]
+    fn parses_dsh_session_text_and_tools() {
+        let session = parse_dsh_json_line(r#"{"type":"session","sessionId":"s-1"}"#).unwrap();
+        assert_eq!(session.session_id.as_deref(), Some("s-1"));
+        assert!(session.noise);
+        let text = parse_dsh_json_line(r#"{"type":"text","text":"hello"}"#).unwrap();
+        assert_eq!(text.text.as_deref(), Some("hello"));
+        let tool =
+            parse_dsh_json_line(r#"{"type":"tool_call","tool":"read","input":{"path":"/tmp/a"}}"#)
+                .unwrap();
+        assert!(tool.text.unwrap_or_default().contains("read"));
+    }
+
+    #[test]
+    fn dsh_final_wins_and_tool_envelope_is_only_fallback() {
+        let events = concat!(
+            "{\"type\":\"text\",\"text\":\"streamed\"}\n",
+            "{\"type\":\"final\",\"text\":\"{\\\"type\\\":\\\"chat\\\",\\\"content\\\":\\\"done\\\"}\"}\n",
+            "{\"type\":\"tool_result\",\"result\":\"{\\\"type\\\":\\\"break\\\",\\\"content\\\":\\\"stop\\\"}\"}\n"
+        );
+        assert!(extract_actor_output("dsh", events).contains("done"));
+        let fallback = "{\"type\":\"tool_result\",\"result\":\"{\\\"type\\\":\\\"break\\\",\\\"content\\\":\\\"stop\\\"}\"}\n";
+        assert!(extract_actor_output("dsh", fallback).contains("break"));
     }
 }

@@ -7,12 +7,19 @@ export const DEFAULT_LAUNCHER_ORDER = [
   'agy',
   'opencode',
   'kimi',
+  'dsh',
   'wecode_claude',
   'wecode_codex',
   'wecode_opencode'
 ] as const
 
 export const DEFAULT_LAUNCHER_TIMEOUT_SECONDS = 7200
+
+/** The General settings timeout is shared by all managed CLI/ACP launchers. */
+export function globalLauncherTimeout(settings: GlobalSettings): number {
+  return DEFAULT_LAUNCHER_ORDER.map(id => settings.launchers?.[id]?.timeout_seconds)
+    .find(value => typeof value === 'number') ?? DEFAULT_LAUNCHER_TIMEOUT_SECONDS
+}
 
 export const KNOWN_ACP_PRESETS: AcpPreset[] = [
   {
@@ -80,6 +87,7 @@ const DEFAULT_LAUNCHER_COMMANDS: Record<string, string> = {
   agy: 'agy',
   opencode: 'opencode',
   kimi: 'kimi',
+  dsh: 'dsh',
   wecode_claude: 'wecode',
   wecode_codex: 'wecode codex',
   wecode_opencode: 'wecode opencode'
@@ -107,6 +115,7 @@ export function normalizeLauncher(actor: string, launcher?: Partial<Launcher> | 
         ? launcher.timeout_seconds
         : fallback.timeout_seconds
   }
+  if (Array.isArray(launcher?.args)) result.args = [...launcher.args]
   if (launcher?.protocol === 'acp') {
     result.protocol = 'acp'
     if (Array.isArray(launcher.args)) {
@@ -140,6 +149,7 @@ export function normalizeLaunchers(
 
 export function normalizeGlobalSettings(settings?: GlobalSettings | null): GlobalSettings {
   return {
+    agent_management: settings?.agent_management,
     protocol_version: settings?.protocol_version ?? '1',
     countdown_seconds: settings?.countdown_seconds ?? 30,
     max_rounds: settings?.max_rounds ?? 9999,
@@ -151,6 +161,7 @@ export function normalizeGlobalSettings(settings?: GlobalSettings | null): Globa
     seed_agy_session_id: settings?.seed_agy_session_id ?? '',
     seed_opencode_session_id: settings?.seed_opencode_session_id ?? '',
     seed_kimi_session_id: settings?.seed_kimi_session_id ?? '',
+    seed_dsh_session_id: settings?.seed_dsh_session_id ?? '',
     seed_wecode_claude_session_id: settings?.seed_wecode_claude_session_id ?? '',
     seed_wecode_codex_thread_id: settings?.seed_wecode_codex_thread_id ?? '',
     seed_wecode_opencode_session_id: settings?.seed_wecode_opencode_session_id ?? '',

@@ -3,13 +3,14 @@
 use crate::buddy::types::{AcpPreset, GlobalSettings, Launcher};
 use std::collections::HashMap;
 
-pub const DEFAULT_LAUNCHER_ORDER: [&str; 9] = [
+pub const DEFAULT_LAUNCHER_ORDER: [&str; 10] = [
     "claude",
     "codex",
     "cursor",
     "agy",
     "opencode",
     "kimi",
+    "dsh",
     "wecode_claude",
     "wecode_codex",
     "wecode_opencode",
@@ -41,7 +42,10 @@ pub fn known_acp_presets() -> Vec<AcpPreset> {
             name: "Codex ACP".to_string(),
             actor: "codex".to_string(),
             command: "npx".to_string(),
-            args: vec!["-y".to_string(), "@agentclientprotocol/codex-acp".to_string()],
+            args: vec![
+                "-y".to_string(),
+                "@agentclientprotocol/codex-acp".to_string(),
+            ],
             description: "Codex ACP adapter".to_string(),
         },
         AcpPreset {
@@ -79,7 +83,10 @@ pub fn known_acp_presets() -> Vec<AcpPreset> {
             name: "WeCode Codex ACP".to_string(),
             actor: "wecode_codex".to_string(),
             command: "npx".to_string(),
-            args: vec!["-y".to_string(), "@agentclientprotocol/codex-acp".to_string()],
+            args: vec![
+                "-y".to_string(),
+                "@agentclientprotocol/codex-acp".to_string(),
+            ],
             description: "WeCode Codex via ACP adapter".to_string(),
         },
     ]
@@ -93,6 +100,7 @@ pub fn default_launcher_command(actor: &str) -> &str {
         "agy" => "agy",
         "opencode" => "opencode",
         "kimi" => "kimi",
+        "dsh" => "dsh",
         "wecode_claude" => "wecode",
         "wecode_codex" => "wecode codex",
         "wecode_opencode" => "wecode opencode",
@@ -124,18 +132,15 @@ pub fn normalize_launcher(actor: &str, launcher: Option<&Launcher>) -> Launcher 
                 command = fallback.command.clone();
             }
             let mut result = Launcher {
-                protocol: None,
+                protocol: l.protocol.clone(),
                 command,
-                args: None,
+                args: l.args.clone(),
                 env: l.env.clone(),
                 timeout_seconds: l.timeout_seconds,
                 model: None,
             };
             if l.protocol.as_deref() == Some("acp") {
                 result.protocol = Some("acp".to_string());
-                if let Some(args) = &l.args {
-                    result.args = Some(args.clone());
-                }
             }
             if let Some(model) = l.model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
                 result.model = Some(model.to_string());
@@ -173,7 +178,12 @@ pub fn normalize_global_settings(settings: Option<&GlobalSettings>) -> GlobalSet
     let empty = GlobalSettings::default();
     let s = settings.unwrap_or(&empty);
     GlobalSettings {
-        protocol_version: Some(s.protocol_version.clone().unwrap_or_else(|| "1".to_string())),
+        agent_management: s.agent_management.clone(),
+        protocol_version: Some(
+            s.protocol_version
+                .clone()
+                .unwrap_or_else(|| "1".to_string()),
+        ),
         countdown_seconds: Some(s.countdown_seconds.unwrap_or(30)),
         max_rounds: Some(s.max_rounds.unwrap_or(9999)),
         max_consecutive_failures: Some(s.max_consecutive_failures.unwrap_or(10)),
@@ -184,6 +194,7 @@ pub fn normalize_global_settings(settings: Option<&GlobalSettings>) -> GlobalSet
         seed_agy_session_id: Some(s.seed_agy_session_id.clone().unwrap_or_default()),
         seed_opencode_session_id: Some(s.seed_opencode_session_id.clone().unwrap_or_default()),
         seed_kimi_session_id: Some(s.seed_kimi_session_id.clone().unwrap_or_default()),
+        seed_dsh_session_id: Some(s.seed_dsh_session_id.clone().unwrap_or_default()),
         seed_wecode_claude_session_id: Some(
             s.seed_wecode_claude_session_id.clone().unwrap_or_default(),
         ),
@@ -191,7 +202,9 @@ pub fn normalize_global_settings(settings: Option<&GlobalSettings>) -> GlobalSet
             s.seed_wecode_codex_thread_id.clone().unwrap_or_default(),
         ),
         seed_wecode_opencode_session_id: Some(
-            s.seed_wecode_opencode_session_id.clone().unwrap_or_default(),
+            s.seed_wecode_opencode_session_id
+                .clone()
+                .unwrap_or_default(),
         ),
         max_compact_retries: Some(s.max_compact_retries.unwrap_or(3)),
         auto_generate_commit_message: Some(s.auto_generate_commit_message.unwrap_or(true)),
